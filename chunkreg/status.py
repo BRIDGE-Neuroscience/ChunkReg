@@ -26,23 +26,42 @@ class LevelStatus:
     tasks_done: int
     has_template: bool
     fields_written: int
+    recorded: bool = False
+    """True when the pass left a completion record, which outlives the task
+    arrays that retention deletes."""
 
     @property
     def complete(self) -> bool:
+        if self.recorded:
+            return True
         return self.tasks_total > 0 and self.tasks_done == self.tasks_total
 
 
+def _iteration_of(path: Path) -> int:
+    digits = "".join(c for c in path.stem if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def _manifests(cfg: RunConfig):
+    """Every manifest on disk, ordered by level then pass.
+
+    Sorted numerically rather than lexicographically: with ten or more levels
+    or passes, ``L10`` sorts before ``L2`` as text, which put the wrong pass
+    last and so named the wrong outstanding task ids.
+    """
     root = cfg.root_path / "levels"
     if not root.exists():
         return
-    for level_dir in sorted(root.glob("L*")):
+    found = []
+    for level_dir in root.glob("L*"):
         try:
             level = int(level_dir.name[1:])
         except ValueError:
             continue
-        for path in sorted(level_dir.glob("manifest_it*.json")):
-            yield level, path
+        for path in level_dir.glob("manifest_it*.json"):
+            found.append((level, _iteration_of(path), path))
+    for level, _, path in sorted(found):
+        yield level, path
 
 
 def pending_tasks(cfg: RunConfig, level: int, iteration: int) -> list[int]:
@@ -50,6 +69,8 @@ def pending_tasks(cfg: RunConfig, level: int, iteration: int) -> list[int]:
     path = cfg.level_dir(level) / f"manifest_it{iteration}.json"
     if not Path(path).exists():
         return []
+    if cfg.pass_record_path(level, iteration).exists():
+        return []  # the pass finished; its task arrays were cleaned up
     manifest = Manifest.load(path)
     return [
         t.task_id
@@ -64,11 +85,18 @@ def collect(cfg: RunConfig) -> list[LevelStatus]:
     out: list[LevelStatus] = []
     for level, path in _manifests(cfg):
         manifest = Manifest.load(path)
-        done = sum(
-            1
-            for t in manifest.tasks
-            if TaskArray.is_complete(
-                cfg.task_path(level, manifest.iteration, t.task_id), cfg.backend
+        recorded = cfg.pass_record_path(level, manifest.iteration).exists()
+        # A recorded pass has already had its task arrays cleaned up, so there
+        # is nothing left to count and no reason to go looking.
+        done = (
+            manifest.n_tasks
+            if recorded
+            else sum(
+                1
+                for t in manifest.tasks
+                if TaskArray.is_complete(
+                    cfg.task_path(level, manifest.iteration, t.task_id), cfg.backend
+                )
             )
         )
         out.append(
@@ -77,10 +105,11 @@ def collect(cfg: RunConfig) -> list[LevelStatus]:
                 iteration=manifest.iteration,
                 tasks_total=manifest.n_tasks,
                 tasks_done=done,
+                recorded=recorded,
                 has_template=Volume.exists(cfg.template_path(level), cfg.backend),
                 fields_written=sum(
                     1
-                    for s in cfg.subject_ids
+                    for s in cfg.registered_ids
                     if Field.exists(cfg.field_path(level, s), cfg.backend)
                 ),
             )
@@ -92,8 +121,8 @@ def status(cfg: RunConfig) -> str:
     rows = collect(cfg)
     if not rows:
         return (
-            f"no levels started under {cfg.root_path}. Run 'chunkreg plan' to "
-            f"check the configuration, then 'chunkreg template' to begin."
+            f"no levels started under {cfg.root_path}. Run 'chunkreg setup' to "
+            f"check the configuration, then 'chunkreg run' to begin."
         )
     head = f"{'lvl':>3} {'pass':>5} {'tasks':>13} {'template':>9} {'fields':>7}"
     out = [head, "-" * len(head)]
@@ -102,7 +131,7 @@ def status(cfg: RunConfig) -> str:
         out.append(
             f"{r.level:>3} {r.iteration:>5} {bar:>13} "
             f"{'yes' if r.has_template else 'no':>9} "
-            f"{r.fields_written}/{cfg.n_subjects:>5}"
+            f"{r.fields_written}/{len(cfg.registered_ids)}".rjust(7)
         )
     incomplete = [r for r in rows if not r.complete]
     if incomplete:

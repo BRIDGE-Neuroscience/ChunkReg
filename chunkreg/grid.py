@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import product
 from typing import Iterable, Iterator, Literal, Sequence
 
@@ -33,6 +34,8 @@ __all__ = [
     "window",
     "chunks_touching",
     "shard_grid",
+    "axis_windows",
+    "window_on",
 ]
 
 
@@ -131,7 +134,7 @@ class Profile:
     features: str = "anatomix"
     r_f: int = 24
     """Feature-extractor receptive-field radius in voxels. Measured by
-    ``chunkreg calibrate``; the default is a conservative placeholder."""
+    ``chunkreg setup``; the default is a conservative placeholder."""
     k: int = 7
     """Local similarity (LNCC) kernel width, in voxels of the scale it runs at."""
     sigma_g: float = 1.0
@@ -372,6 +375,63 @@ def _axis_window(
     return w
 
 
+@lru_cache(maxsize=4096)
+def axis_windows(
+    chunk: Chunk,
+    grid: GridSpec,
+    profile: Profile,
+    kind: Literal["hann", "trapezoid"] = "hann",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The three 1D factors whose outer product is the chunk's blend window.
+
+    The window is separable, so the factors are what is worth computing and
+    keeping: three arrays of a few hundred floats instead of the padded cube,
+    which at the production profile is 174 MB and was being rebuilt once per
+    neighbour per subject.
+    """
+    taper = profile.taper_vox
+    off = chunk.core_offset_in_pad
+    axes = []
+    for d in range(3):
+        at_low = chunk.pad_origin[d] == 0 and chunk.core_origin[d] == 0
+        at_high = (
+            chunk.pad_origin[d] + chunk.pad_shape[d] >= grid.shape[d]
+            and chunk.core_origin[d] + chunk.core_shape[d] >= grid.shape[d]
+        )
+        w = _axis_window(
+            chunk.pad_shape[d],
+            off[d],
+            chunk.core_shape[d],
+            taper,
+            at_low,
+            at_high,
+            kind,
+        )
+        w.flags.writeable = False  # shared across callers via the cache
+        axes.append(w)
+    return tuple(axes)
+
+
+def window_on(
+    chunk: Chunk,
+    grid: GridSpec,
+    profile: Profile,
+    box: tuple[slice, slice, slice],
+    kind: Literal["hann", "trapezoid"] = "hann",
+) -> np.ndarray:
+    """The blend window over a sub-box of a chunk's padded box.
+
+    A blend task only ever weights the overlap between a neighbour's padded box
+    and its own core, so only that part of the window has to exist.
+    """
+    wz, wy, wx = axis_windows(chunk, grid, profile, kind)
+    return (
+        wz[box[0]][:, None, None]
+        * wy[box[1]][None, :, None]
+        * wx[box[2]][None, None, :]
+    ).astype(np.float32)
+
+
 def window(
     chunk: Chunk,
     grid: GridSpec,
@@ -385,26 +445,6 @@ def window(
     to sum to one: the blend divides by their analytic sum, which is at least 1
     everywhere because cores tile the grid exactly.
     """
-    taper = profile.taper_vox
-    off = chunk.core_offset_in_pad
-    axes = []
-    for d in range(3):
-        at_low = chunk.pad_origin[d] == 0 and chunk.core_origin[d] == 0
-        at_high = (
-            chunk.pad_origin[d] + chunk.pad_shape[d] >= grid.shape[d]
-            and chunk.core_origin[d] + chunk.core_shape[d] >= grid.shape[d]
-        )
-        axes.append(
-            _axis_window(
-                chunk.pad_shape[d],
-                off[d],
-                chunk.core_shape[d],
-                taper,
-                at_low,
-                at_high,
-                kind,
-            )
-        )
-    wz, wy, wx = axes
-    w = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
-    return w.astype(np.float32)
+    return window_on(
+        chunk, grid, profile, (slice(None), slice(None), slice(None)), kind
+    )

@@ -167,7 +167,7 @@ def build_manifest(
     """Enumerate the work for one template pass at one level."""
     p = cfg.profile
     chunks = tile(grid, p)
-    subs = tuple(subjects) if subjects is not None else cfg.subject_ids
+    subs = tuple(subjects) if subjects is not None else cfg.registered_ids
     per_task = max(1, cfg.slurm.register.chunks_per_task)
 
     entries = [

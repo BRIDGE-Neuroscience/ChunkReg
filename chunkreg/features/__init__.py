@@ -4,7 +4,7 @@ An extractor turns a normalised intensity chunk into the channels an engine
 registers. Its ``r_f`` is not decoration: it is the receptive-field radius that
 enters the halo budget, and therefore sets how much displacement a chunk is
 allowed to solve for. Getting it wrong under-sizes the halo silently, which is
-why ``chunkreg calibrate`` measures it rather than trusting the default.
+why ``chunkreg setup`` measures it rather than trusting the default.
 """
 
 from __future__ import annotations

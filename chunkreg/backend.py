@@ -31,7 +31,43 @@ __all__ = [
     "get_backend",
     "set_default_backend",
     "default_backend",
+    "shard_layout",
 ]
+
+
+def shard_layout(
+    shape: Sequence[int], inner: int, core: int
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Inner chunks and shards for a spatial array, as zarr will accept them.
+
+    A shard holds a whole number of inner chunks, so the shard edge is the core
+    clipped to the array and then rounded up to a multiple of the inner chunk.
+    """
+    chunks = tuple(max(1, min(int(inner), int(n))) for n in shape)
+    shards = tuple(
+        -(-min(int(core), int(n)) // c) * c for n, c in zip(shape, chunks)
+    )
+    return chunks, shards
+
+
+def _check_layout(shape, chunks, shards) -> None:
+    """Refuse a layout zarr would refuse, whichever backend is in use.
+
+    The memory backend enforcing the same rule is what lets the fast test
+    suite catch a bad layout before a cluster run does.
+    """
+    if len(chunks) != len(shape):
+        raise ValueError(f"chunks {tuple(chunks)} do not match shape {tuple(shape)}")
+    if shards is None:
+        return
+    if len(shards) != len(shape):
+        raise ValueError(f"shards {tuple(shards)} do not match shape {tuple(shape)}")
+    for d, (c, sh) in enumerate(zip(chunks, shards)):
+        if int(sh) % int(c):
+            raise ValueError(
+                f"Chunk edge length {sh} in dimension {d} is not divisible by "
+                f"the shard's inner chunk size {c}."
+            )
 
 
 @runtime_checkable
@@ -104,6 +140,7 @@ class ZarrBackend:
     ):
         import zarr
 
+        _check_layout(shape, chunks, shards)
         kwargs: dict[str, Any] = dict(
             shape=tuple(int(s) for s in shape),
             dtype=np.dtype(dtype),
@@ -136,6 +173,17 @@ class ZarrBackend:
         import shutil
 
         shutil.rmtree(path, ignore_errors=True)
+        # Field and TaskArray keep their metadata in a sibling file rather than
+        # inside the array directory, so rmtree does not reach it. Leaving it
+        # behind leaves a completion marker with no data under it, which reads
+        # back as "this task is done" for work that has just been deleted.
+        sidecar = Path(str(path) + _SIDECAR)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - permissions, races
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +258,7 @@ class MemoryBackend:
         overwrite: bool = False,
         compress: bool = True,
     ):
+        _check_layout(shape, chunks, shards)
         key = self._key(path)
         with self._lock:
             if key in self._arrays and not overwrite:
@@ -240,6 +289,7 @@ class MemoryBackend:
                 k for k in self._arrays if k == prefix or k.startswith(prefix + "/")
             ]:
                 del self._arrays[k]
+        _purge_json(prefix)
 
     def clear(self) -> None:
         with self._lock:
@@ -288,6 +338,24 @@ def default_backend() -> str:
 # Small JSON sidecars (group-level metadata)
 # --------------------------------------------------------------------------- #
 _MEM_JSON: dict[str, dict] = {}
+
+_SIDECAR = ".meta.json"
+"""Suffix of the metadata document a Field or TaskArray keeps beside itself."""
+
+
+def _purge_json(prefix: str) -> None:
+    """Drop in-memory metadata for an array that has just been removed.
+
+    Covers both conventions: the sibling document a Field or TaskArray writes
+    at ``<path>.meta.json``, and the one a Volume writes inside its own
+    directory.
+    """
+    for key in [
+        k
+        for k in _MEM_JSON
+        if k == prefix + _SIDECAR or k == prefix or k.startswith(prefix + "/")
+    ]:
+        del _MEM_JSON[key]
 
 
 def write_json(path, obj: dict, backend: Backend | None = None) -> None:

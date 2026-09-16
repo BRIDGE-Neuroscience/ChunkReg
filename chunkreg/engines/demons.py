@@ -167,7 +167,7 @@ class DemonsEngine:
             sub_shape = fs.shape[1:]
             sub_spacing = spacing_mm * scale
 
-            u = self._to_shape(total, sub_shape)
+            u = self._to_shape(total, sub_shape, scale)
             fgrad = self._gradients(fs, sub_spacing)
 
             prev = np.inf
@@ -217,7 +217,7 @@ class DemonsEngine:
             achieved.append(used)
             if used >= int(n_iter) and int(n_iter) > 3:
                 converged = False
-            total = self._to_shape(u, full_shape)
+            total = self._to_shape(u, full_shape, scale)
 
         return total.astype(np.float32, copy=False), curve, achieved, converged
 
@@ -239,25 +239,41 @@ class DemonsEngine:
 
     @staticmethod
     def _warp_stack(stack: np.ndarray, u: np.ndarray, spacing_mm: float) -> np.ndarray:
-        return np.stack(
-            [_fields.warp(stack[c], u, spacing_mm) for c in range(stack.shape[0])],
-            axis=0,
-        )
+        return _fields.warp_stack(stack, u, spacing_mm)
 
     @staticmethod
     def _limit(u: np.ndarray, max_mm: float) -> np.ndarray:
         return _fields.clamp(u, max_mm)
 
     @staticmethod
-    def _to_shape(u: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    def _to_shape(u: np.ndarray, shape: tuple[int, ...], scale: int = 1) -> np.ndarray:
         """Resample a field between in-chunk pyramid scales.
 
         Vectors are in millimetres, so only the lattice changes; this is the
         same property that makes promoting a seed between pyramid levels exact.
+
+        The lattice relation has to be the one :func:`_downsample` actually
+        uses. That takes ``a[::scale]``, so coarse sample ``j`` sits on fine
+        sample ``j * scale``. ``ndimage.zoom`` instead aligns the two corners,
+        which puts the coarse lattice up to half a scale away from where the
+        images were sampled and biases every seed handed between scales.
         """
-        if tuple(u.shape[1:]) == tuple(shape):
+        shape = tuple(int(n) for n in shape)
+        src = tuple(int(n) for n in u.shape[1:])
+        if src == shape:
             return u
-        zoom = [1.0] + [s / n for s, n in zip(shape, u.shape[1:])]
-        return ndimage.zoom(u, zoom, order=1, mode="nearest").astype(
-            np.float32, copy=False
-        )
+        f = max(int(scale), 1)
+        if shape[0] > src[0]:  # coarse -> fine: fine i reads coarse i / scale
+            axes = [np.arange(n, dtype=np.float32) / f for n in shape]
+        else:  # fine -> coarse: coarse j reads fine j * scale
+            axes = [np.arange(n, dtype=np.float32) * f for n in shape]
+        coords = np.stack(np.meshgrid(*axes, indexing="ij"), axis=0)
+        return np.stack(
+            [
+                ndimage.map_coordinates(
+                    u[d], coords, order=1, mode="nearest", prefilter=False
+                )
+                for d in range(3)
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)

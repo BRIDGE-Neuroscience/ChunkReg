@@ -270,3 +270,178 @@ def test_task_count_follows_chunks_per_task():
     p = plan(c, HIPCT)
     # 800 chunks x 10 subjects = 8000 pairs, 16 per task.
     assert p.levels[4].n_tasks == 500
+
+
+# --------------------------------------------------------------------------- #
+# Per-level stage parameters
+# --------------------------------------------------------------------------- #
+def test_level_params_patch_only_the_levels_they_name():
+    policy = LevelPolicy(
+        seeded_stages=(StageSpec(scales=(2, 1), iterations=(50, 30)),),
+        level_params={3: {"iterations": (80, 50), "smooth_warp_sigma": 0.25}},
+    )
+    assert policy.stages(2)[0].iterations == (50, 30)
+    assert policy.stages(2)[0].smooth_warp_sigma == 0.5
+    assert policy.stages(3)[0].iterations == (80, 50)
+    assert policy.stages(3)[0].smooth_warp_sigma == 0.25
+    assert policy.stages(3)[0].scales == (2, 1), "unnamed fields are untouched"
+
+
+def test_level_params_reach_every_deformable_stage_of_a_level():
+    policy = LevelPolicy(
+        level_stages={
+            1: (
+                StageSpec(kind="affine", scales=(2, 1), iterations=(10, 5)),
+                StageSpec(kind="greedy", scales=(2, 1), iterations=(10, 5)),
+            )
+        },
+        level_params={1: {"lr": 0.05}},
+    )
+    assert [s.lr for s in policy.stages(1)] == [0.05, 0.05]
+
+
+def test_a_moments_stage_ignores_a_schedule_patch():
+    """moments carries no schedule, so it must not be handed one."""
+    policy = LevelPolicy(
+        level_stages={
+            0: (StageSpec(kind="moments", scales=(), iterations=()),
+                StageSpec(kind="greedy", scales=(2, 1), iterations=(10, 5)))
+        },
+        level_params={0: {"iterations": (7, 7)}},
+    )
+    moments, greedy = policy.stages(0)
+    assert moments.iterations == ()
+    assert greedy.iterations == (7, 7)
+
+
+def test_level_stages_replace_the_whole_list():
+    policy = LevelPolicy(
+        level_stages={2: (StageSpec(kind="greedy", scales=(1,), iterations=(4,)),)}
+    )
+    assert len(policy.stages(2)) == 1
+    assert policy.stages(2)[0].iterations == (4,)
+    assert policy.stages(1) == LevelPolicy.seeded_stages
+
+
+def test_a_mistyped_tuning_key_names_the_level_and_the_alternatives():
+    policy = LevelPolicy(level_params={2: {"smooth_wrap_sigma": 0.3}})
+    with pytest.raises(ConfigError) as e:
+        policy.stages(2)
+    assert "level 2" in str(e.value)
+    assert "smooth_warp_sigma" in str(e.value)
+
+
+def test_a_tuned_level_is_validated_against_the_halo_budget():
+    """The check that guards seeded_stages must guard per-level overrides too."""
+    policy = LevelPolicy(
+        level_params={3: {"scales": (8, 4, 2, 1), "iterations": (4, 4, 4, 4)}}
+    )
+    with pytest.raises(ConfigError, match="level 3"):
+        cfg(levels=policy).validate()
+
+
+def test_a_bad_override_is_caught_at_load_not_mid_run():
+    with pytest.raises(ConfigError, match="unknown per-level stage parameter"):
+        load_config(
+            {
+                "root": ".",
+                "profile": "i1",
+                "subjects": [{"id": "s01"}],
+                "levels": {"level_params": {"1": {"nonsense": 1}}},
+            }
+        )
+
+
+def test_level_keys_may_be_strings_because_json_has_no_integer_keys():
+    cfg_json = load_config(
+        {
+            "root": ".",
+            "profile": "i1",
+            "subjects": [{"id": "s01"}],
+            "levels": {"level_params": {"2": {"lr": 0.2}}},
+        }
+    )
+    assert cfg_json.levels.level_params[2] == {"lr": 0.2}
+    assert cfg_json.levels.stages(2)[0].lr == 0.2
+
+
+def test_overrides_for_levels_the_pyramid_lacks_are_reported():
+    from chunkreg.config import unused_level_overrides
+
+    policy = LevelPolicy(level_params={1: {"lr": 0.2}, 7: {"lr": 0.2}})
+    assert unused_level_overrides(cfg(levels=policy), n_levels=5) == [7]
+
+
+def test_tuned_levels_lists_both_kinds_of_override():
+    policy = LevelPolicy(
+        level_stages={4: (StageSpec(scales=(1,), iterations=(2,)),)},
+        level_params={1: {"lr": 0.2}},
+    )
+    assert policy.tuned_levels() == (1, 4)
+
+
+# --------------------------------------------------------------------------- #
+# Loading
+# --------------------------------------------------------------------------- #
+def test_a_json_config_file_loads(tmp_path):
+    import json as _json
+
+    path = tmp_path / "run.json"
+    path.write_text(
+        _json.dumps(
+            {
+                "root": ".",
+                "profile": "i1",
+                "spacing_mm": 0.05,
+                "subjects": [{"id": "s01", "source": "raw/s01.tif"}],
+                "levels": {"level_params": {"1": {"lr": 0.3}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+    assert loaded.subjects[0].source == "raw/s01.tif"
+    assert loaded.levels.stages(1)[0].lr == 0.3
+
+
+def test_the_shipped_json_example_is_valid():
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "configs" / "example.json"
+    loaded = load_config(example)
+    assert loaded.profile_name == "a16"
+    assert loaded.levels.tuned_levels() == (1, 2, 3, 4)
+    assert loaded.levels.stages(4)[0].smooth_warp_sigma == 0.30
+
+
+def test_a_subject_path_defaults_to_the_conventional_location():
+    loaded = load_config(
+        {"root": "/run", "profile": "i1", "subjects": [{"id": "s01"}]}
+    )
+    assert loaded.subject_path("s01").as_posix().endswith("subjects/s01.zarr")
+
+
+def test_a_mistyped_nested_key_is_rejected():
+    """Top-level typos were already caught; nested ones were silently ignored."""
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(
+            {
+                "root": ".",
+                "profile": "i1",
+                "subjects": [{"id": "s01"}],
+                "levels": {"residual_frac": 0.5},
+            }
+        )
+
+
+def test_an_ingest_block_is_read():
+    loaded = load_config(
+        {
+            "root": ".",
+            "profile": "i1",
+            "subjects": [{"id": "s01"}],
+            "ingest": {"dtype": "uint8", "median_radius": 1.5},
+        }
+    )
+    assert loaded.ingest.dtype == "uint8"
+    assert loaded.ingest.median_radius == 1.5

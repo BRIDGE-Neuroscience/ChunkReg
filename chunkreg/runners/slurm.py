@@ -120,6 +120,31 @@ def _render(template_path: Path, keys: Mapping[str, Any]) -> str:
     return re.sub(r"\n[ \t]*\n(?=#SBATCH)", "\n", text)
 
 
+def _expand_range(spec: str) -> list[int]:
+    """Indices named by an sacct array range such as ``[4-9]`` or ``[1,3,5%2]``.
+
+    The ``%n`` throttle suffix is part of the job specification, not of the
+    index set, so it is stripped. An unparseable range yields nothing rather
+    than raising: a state report is not worth failing a run over.
+    """
+    body = spec.strip()
+    if not (body.startswith("[") and body.endswith("]")):
+        return []
+    body = body[1:-1].split("%", 1)[0]
+    out: list[int] = []
+    for part in body.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            if lo.isdigit() and hi.isdigit() and int(lo) <= int(hi):
+                out.extend(range(int(lo), int(hi) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+    return out
+
+
 def _parse_sacct(text: str) -> dict[int, str]:
     """Read ``JobID,State`` rows from ``sacct --parsable2`` into {index: state}.
 
@@ -127,11 +152,17 @@ def _parse_sacct(text: str) -> dict[int, str]:
     again as ``<job>_<index>.batch`` and ``.extern``. Only the element itself
     carries the state the report needs, and the sub-steps can disagree with it
     (a step killed for memory is not recorded the way its element is), so rows
-    with a dot in the JobID are dropped. Elements not yet expanded appear as a
-    range such as ``<job>_[4-9]`` and are dropped too: they have no state of
-    their own, and their absence is what keeps the poll loop waiting.
+    with a dot in the JobID are dropped.
+
+    Elements not yet expanded appear as a range such as ``<job>_[4-9]``. Those
+    rows carry a real state and it is sometimes the only state those elements
+    will ever have: an array cancelled or purged while still pending never
+    expands, so dropping the range row left the poll loop waiting for terminal
+    states that could not arrive. The range is expanded, and any concrete row
+    for the same index overrides it.
     """
     states: dict[int, str] = {}
+    ranged: dict[int, str] = {}
     for line in text.splitlines():
         row = line.strip()
         if not row:
@@ -143,11 +174,16 @@ def _parse_sacct(text: str) -> dict[int, str]:
         if "." in job_id or "_" not in job_id:
             continue
         index = job_id.split("_", 1)[1]
-        if not index.isdigit():
-            continue
         # "CANCELLED by 1001", and the "+" sacct appends to a truncated state,
         # are the same state as far as the report is concerned.
-        states[int(index)] = state.split()[0].rstrip("+") if state else ""
+        value = state.split()[0].rstrip("+") if state else ""
+        if index.isdigit():
+            states[int(index)] = value
+        else:
+            for i in _expand_range(index):
+                ranged[i] = value
+    for index, value in ranged.items():
+        states.setdefault(index, value)
     return states
 
 
@@ -389,9 +425,11 @@ class SlurmRunner:
                 and time.monotonic() - started > self.max_wait_s
             ):
                 stuck = [i for i in ids if states.get(i, "") in _ACTIVE_STATES]
+                missing = [i for i in ids if i not in states]
                 raise RuntimeError(
                     f"job {job_id} has not finished after {self.max_wait_s:.0f}s; "
-                    f"{len(stuck)} of {len(ids)} elements are still active. "
+                    f"{len(stuck)} of {len(ids)} elements are still active and "
+                    f"{len(missing)} have no state at all. "
                     f"Inspect it with: sacct -j {job_id}"
                 )
             time.sleep(self.poll_seconds)

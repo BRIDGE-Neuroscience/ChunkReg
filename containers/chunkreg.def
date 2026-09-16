@@ -1,0 +1,86 @@
+Bootstrap: docker
+From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+
+# chunkreg with the GPU path: torch, MONAI, anatomix (weights baked in) and the
+# pinned FireANTs fork with its fused CUDA ops.
+#
+# Build from the repo root, since the %files paths below are relative to it:
+#     bash containers/build.sh            # -> chunkreg.sif
+#
+# The devel base is deliberate: FireANTs' fused ops are compiled here, and that
+# needs nvcc. Everything lives in a venv under /opt/venv rather than a conda
+# prefix, and %post ends with a chmod, so the image runs for any uid; a
+# rapidsai-style /opt/conda owned by one uid is what broke the BRIDGE jobs.
+
+%labels
+    Name chunkreg
+    Description Hierarchical chunked co-registration, GPU build
+
+%files
+    pyproject.toml /opt/chunkreg-src/pyproject.toml
+    README.md      /opt/chunkreg-src/README.md
+    chunkreg       /opt/chunkreg-src/chunkreg
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+    # Weights were fetched at build time; compute nodes may have no internet.
+    export HF_HOME=/opt/hf
+    export HF_HUB_OFFLINE=1
+    # A ~/.local site-packages from the host must not shadow the image.
+    export PYTHONNOUSERSITE=1
+    export PYTHONUNBUFFERED=1
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-dev build-essential git ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    python3 -m venv /opt/venv
+    PIP="/opt/venv/bin/python -m pip"
+    $PIP install --no-cache-dir --upgrade pip setuptools wheel
+
+    # torch first and pinned to the image's CUDA, so nothing later swaps it.
+    $PIP install --no-cache-dir torch==2.7.1 \
+        --index-url https://download.pytorch.org/whl/cu126
+
+    $PIP install --no-cache-dir \
+        "/opt/chunkreg-src[store,io,gpu,qc,viz]" \
+        "git+https://github.com/neel-dey/anatomix.git"
+
+    # FireANTs, as anatomix's install_fireants.sh does it: the pinned fork,
+    # --no-deps to keep this torch, then the fused ops. There is no GPU at
+    # build time, so the architectures have to be named: 8.0 A100, 8.6 A40 and
+    # RTX 30xx, 8.9 L40S and RTX 40xx, 9.0 H100.
+    git clone https://github.com/neel-dey/FireANTs /opt/fireants
+    git -C /opt/fireants checkout --quiet c72d2ef485e8622e799deaa4bdd49dd93cee4d1b
+    $PIP install --no-cache-dir --no-deps /opt/fireants
+    $PIP install --no-cache-dir \
+        "SimpleITK>=2.2.1" nibabel scipy scikit-image matplotlib tqdm pandas hydra-core
+    export CUDA_HOME=/usr/local/cuda
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+    export MAX_JOBS=4
+    $PIP install --no-cache-dir --no-build-isolation /opt/fireants/fused_ops
+
+    # Only the backbone the profiles use is fetched; add others here if needed.
+    HF_HOME=/opt/hf /opt/venv/bin/python -c \
+        "from anatomix.model.load_from_hf import load_from_hf; load_from_hf('anatomix')"
+
+    chmod -R a+rX /opt
+
+%test
+    export PATH=/opt/venv/bin:$PATH HF_HOME=/opt/hf HF_HUB_OFFLINE=1
+    python - <<'EOF'
+import torch, monai, zarr, SimpleITK, fireants, fireants_fused_ops
+from anatomix.model.load_from_hf import load_from_hf
+import chunkreg
+load_from_hf("anatomix")
+print("chunkreg", chunkreg.__version__, "torch", torch.__version__,
+      "cuda", torch.version.cuda, "- imports and cached weights OK")
+EOF
+    chunkreg --version
+
+%runscript
+    exec chunkreg "$@"

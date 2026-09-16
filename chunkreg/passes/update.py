@@ -31,7 +31,7 @@ from ..grid import GridSpec
 from ..store import Field, Volume, read_padded, write_block
 from .manifest import Manifest
 
-__all__ = ["run_update_task", "ensure_recentre", "mean_displacement_norm"]
+__all__ = ["run_update_task", "ensure_recentre"]
 
 
 def ensure_recentre(cfg: RunConfig, manifest: Manifest) -> Field:
@@ -136,11 +136,3 @@ def _sharpen(img: np.ndarray, amount: float = 0.5, sigma: float = 1.0) -> np.nda
     blurred = ndimage.gaussian_filter(img, sigma, mode="nearest")
     return np.clip(img + amount * (img - blurred), 0.0, None).astype(np.float32)
 
-
-def mean_displacement_norm(cfg: RunConfig, manifest: Manifest, q: float = 99.9) -> float:
-    """``||u_bar||`` over the level, the template's convergence signal."""
-    b = _backend.get_backend(cfg.backend)
-    wsum = b.open(cfg.accumulator_path(manifest.level, manifest.iteration, "wsum"), "r")
-    n = max(len(manifest.subjects), 1)
-    mean = np.asarray(wsum[:], dtype=np.float32) / n
-    return _fields.percentile_magnitude(mean, q)

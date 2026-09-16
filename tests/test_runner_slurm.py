@@ -341,16 +341,41 @@ def test_a_missing_sbatch_is_an_actionable_error(tmp_path, cfg):
 # --------------------------------------------------------------------------- #
 # sacct parsing
 # --------------------------------------------------------------------------- #
-def test_sub_steps_and_unexpanded_ranges_are_not_elements():
+def test_sub_steps_and_the_job_row_are_not_elements():
+    """A step's state can disagree with its element's; only the element counts."""
     states = _parse_sacct(
         "12345_0|COMPLETED\n"
         "12345_0.batch|FAILED\n"
         "12345_0.extern|COMPLETED\n"
-        "12345_[1-9]|PENDING\n"
         "12345|RUNNING\n"
         "\n"
     )
     assert states == {0: "COMPLETED"}
+
+
+def test_an_unexpanded_range_still_carries_its_state():
+    """An array cancelled before it expands has only its range row.
+
+    Dropping that row left the poll loop waiting for terminal states that were
+    never going to arrive, so an array cancelled while pending hung the driver.
+    """
+    states = _parse_sacct("12345_[0-3]|CANCELLED by 1001\n")
+    assert states == {i: "CANCELLED" for i in range(4)}
+
+
+def test_a_concrete_row_beats_the_range_it_came_from():
+    states = _parse_sacct(
+        "12345_[0-3]|PENDING\n"
+        "12345_0|COMPLETED\n"
+        "12345_1|FAILED\n"
+    )
+    assert states == {0: "COMPLETED", 1: "FAILED", 2: "PENDING", 3: "PENDING"}
+
+
+def test_a_throttled_or_listed_range_expands():
+    assert set(_parse_sacct("9_[0-2%2]|PENDING\n")) == {0, 1, 2}
+    assert set(_parse_sacct("9_[1,4,6-7]|PENDING\n")) == {1, 4, 6, 7}
+    assert _parse_sacct("9_[bad]|PENDING\n") == {}
 
 
 def test_a_cancellation_reports_the_state_without_the_user_id():

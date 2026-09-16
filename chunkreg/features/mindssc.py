@@ -12,7 +12,7 @@ only multichannel extractor that runs on a CPU with no weights to download, so
 the feature-visualisation path can be exercised and judged without a GPU. And
 its receptive field is exactly ``dilation + patch radius``, a number that can be
 derived rather than measured, which makes it a known-answer test for
-``chunkreg calibrate``.
+``chunkreg setup``.
 
 The twelve channels are the twelve edges of the octahedron formed by the six
 axis neighbours: every pair of neighbours lying on different axes.

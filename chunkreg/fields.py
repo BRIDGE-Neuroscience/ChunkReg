@@ -37,6 +37,7 @@ from .grid import GridSpec
 __all__ = [
     "identity",
     "warp",
+    "warp_stack",
     "warp_offset",
     "required_margin",
     "compose",
@@ -105,6 +106,38 @@ def warp(
     coords = identity(img.shape) + u / float(spacing_mm)
     return ndimage.map_coordinates(
         img, coords, order=order, mode=_IMAGE_MODE, cval=cval, prefilter=False
+    ).astype(np.float32, copy=False)
+
+
+def warp_stack(
+    stack: np.ndarray,
+    disp_mm: np.ndarray,
+    spacing_mm: float,
+    order: int = 1,
+    cval: float = 0.0,
+) -> np.ndarray:
+    """Warp every channel of a ``(C, Z, Y, X)`` stack through one field.
+
+    The sampling coordinates depend only on the field, so they are built once
+    and reused across channels rather than rebuilt per channel.
+    """
+    a = _as_f32(stack)
+    u = _as_f32(disp_mm)
+    if a.ndim != 4:
+        raise ValueError(f"expected a (C, Z, Y, X) stack, got {a.shape}")
+    if u.shape[0] != 3 or u.shape[1:] != a.shape[1:]:
+        raise ValueError(
+            f"field {u.shape} does not match stack {a.shape} as (3, *stack.shape[1:])"
+        )
+    coords = identity(a.shape[1:]) + u / float(spacing_mm)
+    return np.stack(
+        [
+            ndimage.map_coordinates(
+                a[c], coords, order=order, mode=_IMAGE_MODE, cval=cval, prefilter=False
+            )
+            for c in range(a.shape[0])
+        ],
+        axis=0,
     ).astype(np.float32, copy=False)
 
 
@@ -197,6 +230,15 @@ def clamp(disp_mm: np.ndarray, max_mm: float | None) -> np.ndarray:
     return u.astype(np.float32, copy=False)
 
 
+def _grid_coords(src_grid: GridSpec, dst_grid: GridSpec) -> np.ndarray:
+    """Where each sample of ``dst_grid`` sits in ``src_grid``'s voxel frame."""
+    ident = identity(dst_grid.shape)
+    org_s = np.asarray(src_grid.origin_mm, dtype=np.float32).reshape(3, 1, 1, 1)
+    org_d = np.asarray(dst_grid.origin_mm, dtype=np.float32).reshape(3, 1, 1, 1)
+    world = ident * np.float32(dst_grid.spacing_mm) + org_d
+    return (world - org_s) / np.float32(src_grid.spacing_mm)
+
+
 def _sample_on(
     src: np.ndarray,
     src_grid: GridSpec,
@@ -206,13 +248,13 @@ def _sample_on(
     cval: float,
 ) -> np.ndarray:
     """Resample a single ``(Z, Y, X)`` volume from one grid onto another."""
-    ident = identity(dst_grid.shape)
-    org_s = np.asarray(src_grid.origin_mm, dtype=np.float32).reshape(3, 1, 1, 1)
-    org_d = np.asarray(dst_grid.origin_mm, dtype=np.float32).reshape(3, 1, 1, 1)
-    world = ident * np.float32(dst_grid.spacing_mm) + org_d
-    coords = (world - org_s) / np.float32(src_grid.spacing_mm)
     return ndimage.map_coordinates(
-        _as_f32(src), coords, order=order, mode=mode, cval=cval, prefilter=False
+        _as_f32(src),
+        _grid_coords(src_grid, dst_grid),
+        order=order,
+        mode=mode,
+        cval=cval,
+        prefilter=False,
     ).astype(np.float32, copy=False)
 
 
@@ -240,10 +282,18 @@ def resample_field(
     exact rather than approximate.
     """
     u = _as_f32(disp_mm)
+    # One coordinate array for all three components: the lattice change is the
+    # same for each, and this is the hottest resample in the pipeline.
+    coords = _grid_coords(src_grid, dst_grid)
     return np.stack(
-        [_sample_on(u[d], src_grid, dst_grid, _FIELD_MODE, 1, 0.0) for d in range(3)],
+        [
+            ndimage.map_coordinates(
+                u[d], coords, order=1, mode=_FIELD_MODE, prefilter=False
+            )
+            for d in range(3)
+        ],
         axis=0,
-    )
+    ).astype(np.float32, copy=False)
 
 
 def change_lattice(

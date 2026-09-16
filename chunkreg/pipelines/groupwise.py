@@ -35,6 +35,7 @@ from ..passes import register as _register
 from ..passes import update as _update
 from ..passes.manifest import Manifest, build_manifest
 from ..runners import LocalRunner
+from ..runners.base import RunReport
 from ..store import Field, Volume
 from .. import stats as _stats
 
@@ -130,6 +131,10 @@ def build_template(
     say = progress or (lambda _msg: None)
 
     volumes = {s: Volume.open(cfg.subject_path(s), cfg.backend) for s in cfg.subject_ids}
+    if not cfg.registered_ids:
+        raise ValueError(
+            "every subject is the fixed template, so there is nothing to register"
+        )
     native = next(iter(volumes.values())).native_grid
     for sid, v in volumes.items():
         if v.native_grid != native:
@@ -186,13 +191,20 @@ def build_template(
             )
             bl.raise_for_failures()
 
-            _update.ensure_recentre(cfg, manifest)
-            up = runner.run(
-                "update",
-                lambda cid: _update.run_update_task(cfg, manifest, cid),
-                range(len(manifest.chunks)),
-            )
-            up.raise_for_failures()
+            # A template held fixed is not estimated, so there is no intensity
+            # average to write and no shape bias to recentre away. Skipping the
+            # pass is what keeps the fixed volume actually fixed: the update
+            # would otherwise overwrite it with the warped moving subject.
+            if cfg.template_subject is None:
+                _update.ensure_recentre(cfg, manifest)
+                up = runner.run(
+                    "update",
+                    lambda cid: _update.run_update_task(cfg, manifest, cid),
+                    range(len(manifest.chunks)),
+                )
+                up.raise_for_failures()
+            else:
+                up = RunReport(pass_name="update")
 
             pr = _collect(
                 level,
@@ -212,6 +224,7 @@ def build_template(
                 f"step {pr.step_mm:.4f} mm, folds {pr.fold_frac:.2%}"
                 + (f" -> {reason}" if stopped else "")
             )
+            _record_pass(cfg, pr)
             _cleanup(cfg, manifest)
             if stopped:
                 break
@@ -222,11 +235,14 @@ def build_template(
             _promote.promote_level(cfg, level, grid, levels[level + 1])
 
     last = len(levels) - 1
+    # The last pass of the last level published a template motion that no
+    # promote will ever carry, so the fields on disk still point at where the
+    # template was before that move. Fold it in before handing them back.
+    say("settling the final fields")
+    fields = _promote.settle_fields(cfg, last, levels[last])
     return RunResult(
         template=Volume.open(cfg.template_path(last), cfg.backend),
-        fields={
-            s: Field.open(cfg.field_path(last, s), cfg.backend) for s in cfg.subject_ids
-        },
+        fields=fields,
         levels=reports,
     )
 
@@ -237,23 +253,38 @@ def register_pair(
     moving: str,
     runner=None,
     engine=None,
+    config_path: str | None = None,
 ) -> RunResult:
     """Pairwise registration: the same loop with the template held fixed.
 
-    The fixed volume *is* the template, so the recentring step is disabled and
-    the loop reduces to seeded refinement of one subject down the pyramid.
+    The fixed volume *is* the template at every level, so no template is
+    estimated, the unbiasing update pass does not run, and the loop reduces to
+    seeded refinement of one subject down the pyramid.
     """
     from dataclasses import replace
 
-    from ..config import SubjectSpec
+    known = set(cfg.subject_ids)
+    for role, sid in (("fixed", fixed), ("moving", moving)):
+        if sid not in known:
+            raise ValueError(
+                f"{role} subject {sid!r} is not in this run's subject list "
+                f"{sorted(known)}; both volumes have to be ingested and "
+                f"declared before they can be registered"
+            )
+    if fixed == moving:
+        raise ValueError(
+            f"fixed and moving are both {fixed!r}; registering a volume to "
+            f"itself has no meaning"
+        )
 
     paired = replace(
         cfg,
-        subjects=(SubjectSpec(id=moving, path=str(cfg.subject_path(moving))),),
-        levels=replace(cfg.levels, shape_update_step=1e-9),
+        subjects=tuple(s for s in cfg.subjects if s.id in (fixed, moving)),
+        template_subject=fixed,
     )
-    result = build_template(paired, runner=runner, engine=engine)
-    return result
+    return build_template(
+        paired, runner=runner, engine=engine, config_path=config_path
+    )
 
 
 def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float) -> PassReport:
@@ -292,6 +323,21 @@ def _should_stop(
     if iteration + 1 >= cap:
         return True, "cap reached"
     return False, ""
+
+
+def _record_pass(cfg: RunConfig, pr: PassReport) -> None:
+    """Record that a pass finished, before its transient objects are deleted.
+
+    Retention removes the task arrays as soon as the blend has consumed them,
+    so their completion markers cannot answer "did this pass run". This file
+    can, and it carries the pass's numbers for anyone reading progress later.
+    """
+    import json
+    from dataclasses import asdict
+
+    path = cfg.pass_record_path(pr.level, pr.iteration)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(pr), indent=1), encoding="utf-8")
 
 
 def _cleanup(cfg: RunConfig, manifest: Manifest) -> None:

@@ -135,7 +135,15 @@ def calibrate(cfg: RunConfig, engine: str | None = None) -> Calibration:
     )
     fixed = extractor(v, 0.05)
     moving = extractor(np.roll(v, 2, axis=0), 0.05)
-    stage = StageSpec(kind="greedy", scales=profile.scales, iterations=(20, 12)[: len(profile.scales)])
+    # One iteration count per scale, whatever the profile's pyramid depth. A
+    # fixed two-element schedule raised a length mismatch on every profile with
+    # three or more scales, which is exactly the deep-pyramid profile a user
+    # would reach for calibration to justify.
+    _SCHEDULE = (20, 12, 8, 6)
+    iterations = tuple(
+        _SCHEDULE[min(i, len(_SCHEDULE) - 1)] for i in range(len(profile.scales))
+    )
+    stage = StageSpec(kind="greedy", scales=profile.scales, iterations=iterations)
 
     t0 = time.perf_counter()
     eng.register(fixed, moving, 0.05, [stage])

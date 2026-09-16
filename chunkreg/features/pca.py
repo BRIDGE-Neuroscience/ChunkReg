@@ -80,7 +80,7 @@ class PCAFeatures:
         if self._basis is None:
             raise RuntimeError(
                 "the PCA projection has not been fitted. Run "
-                "'chunkreg calibrate' first, or load a saved basis with "
+                "'chunkreg setup' first, or load a saved basis with "
                 "PCAFeatures.load(); fitting per chunk would give every chunk "
                 "a different basis."
             )

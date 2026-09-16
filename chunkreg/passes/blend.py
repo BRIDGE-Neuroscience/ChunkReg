@@ -23,7 +23,7 @@ from scipy import ndimage
 from .. import backend as _backend
 from .. import fields as _fields
 from ..config import RunConfig
-from ..grid import window
+from ..grid import window_on
 from ..store import Field, TaskArray, Volume, read_padded, write_block
 from ._common import warped_subject_block
 from .manifest import Manifest
@@ -49,19 +49,15 @@ def ensure_accumulators(cfg: RunConfig, manifest: Manifest) -> tuple[Any, Any]:
 
     inner = max(1, p.inner_chunk // p.lattice_factor)
     core = max(inner, p.core // p.lattice_factor)
-    _create_if_absent(
-        b,
-        isum_path,
-        grid.shape,
-        chunks=[min(p.inner_chunk, n) for n in grid.shape],
-        shards=[min(p.core, n) for n in grid.shape],
-    )
+    i_chunks, i_shards = _backend.shard_layout(grid.shape, p.inner_chunk, p.core)
+    w_chunks, w_shards = _backend.shard_layout(lat_shape, inner, core)
+    _create_if_absent(b, isum_path, grid.shape, chunks=i_chunks, shards=i_shards)
     _create_if_absent(
         b,
         wsum_path,
         (3,) + tuple(lat_shape),
-        chunks=(3,) + tuple(min(inner, n) for n in lat_shape),
-        shards=(3,) + tuple(min(core, n) for n in lat_shape),
+        chunks=(3,) + w_chunks,
+        shards=(3,) + w_shards,
     )
     return b.open(isum_path, "r+"), b.open(wsum_path, "r+")
 
@@ -98,10 +94,6 @@ def blend_core(
             cache[task_id] = TaskArray.open(
                 cfg.task_path(manifest.level, manifest.iteration, task_id), cfg.backend
             )
-        lat = cache[task_id].read(index)
-        dense = _lattice_to_level(lat, other, cfg.profile.lattice_factor)
-        w = window(other, grid, cfg.profile)
-
         plo = np.asarray(other.pad_origin, dtype=np.int64)
         phi = plo + np.asarray(other.pad_shape, dtype=np.int64)
         a = np.maximum(lo, plo)
@@ -110,8 +102,13 @@ def blend_core(
             continue
         src = tuple(slice(int(s), int(e)) for s, e in zip(a - plo, bnd - plo))
         dst = tuple(slice(int(s), int(e)) for s, e in zip(a - lo, bnd - lo))
-        wq = w[src]
-        num[(slice(None),) + dst] += dense[(slice(None),) + src] * wq
+
+        # Only the overlap with this core is ever read, so neither the window
+        # nor the upsampled residual is built outside it.
+        lat = cache[task_id].read(index)
+        dense = _upsample_box(lat, cfg.profile.lattice_factor, src)
+        wq = window_on(other, grid, cfg.profile, src)
+        num[(slice(None),) + dst] += dense * wq
         den[dst] += wq
 
     if den.min() <= 0:
@@ -129,15 +126,30 @@ def blend_core(
     return out
 
 
-def _lattice_to_level(lat: np.ndarray, chunk, factor: int) -> np.ndarray:
-    """Upsample a chunk's stored residual back to level resolution."""
+def _upsample_box(
+    lat: np.ndarray, factor: int, box: tuple[slice, slice, slice]
+) -> np.ndarray:
+    """Upsample a chunk's stored residual over one sub-box of its padded box.
+
+    Level voxel ``i`` reads lattice voxel ``i // factor``, so only the lattice
+    range covering the box has to be expanded. Expanding the whole padded box
+    to pick one overlap out of it cost 522 MB per neighbour at the production
+    profile.
+    """
+    a = np.asarray(lat, dtype=np.float32)
     if factor == 1:
-        return np.asarray(lat, dtype=np.float32)
-    up = np.repeat(np.repeat(np.repeat(lat, factor, axis=1), factor, axis=2), factor, axis=3)
-    target = tuple(chunk.pad_shape)
-    return np.ascontiguousarray(
-        up[:, : target[0], : target[1], : target[2]].astype(np.float32)
+        return np.ascontiguousarray(a[(slice(None),) + box])
+    lo = [b.start // factor for b in box]
+    hi = [-(-b.stop // factor) for b in box]
+    sub = a[:, lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]]
+    up = np.repeat(
+        np.repeat(np.repeat(sub, factor, axis=1), factor, axis=2), factor, axis=3
     )
+    inner = (slice(None),) + tuple(
+        slice(b.start - lo[d] * factor, b.start - lo[d] * factor + (b.stop - b.start))
+        for d, b in enumerate(box)
+    )
+    return np.ascontiguousarray(up[inner])
 
 
 def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[str, Any]:

@@ -1,133 +1,162 @@
 # chunkreg
 
-Hierarchical co-registration of N volumes that are individually too large for a
-GPU. Produces an unbiased group template and one diffeomorphic displacement
-field per volume.
+Co-registers a cohort of 3D volumes that are too large for one GPU. The output
+is an unbiased group template and one displacement field per subject.
 
-The design note is [docs/PLAN.md](docs/PLAN.md). This file is how to run it.
-
-## The idea in one paragraph
-
-Work on a resolution pyramid with **one fixed chunk geometry at every level**.
-The coarsest level is by construction the level at which a whole volume fits
-inside a single chunk, so there is no separate whole-volume code path: one
-memory footprint, one scheduler resource request, top to bottom. Each finer
-level is seeded by the level above and solves only a residual, which is what
-keeps chunked registration honest. Chunk solutions are merged with a partition
-of unity. Similarity is computed on anatomix feature channels registered by
-FireANTs. Every volumetric object is a sharded zarr array, and every pass is a
-pure function of `(config, task id)`, so the same code runs on a laptop and on a
-thousand-node cluster.
+How it works is in [docs/PLAN.md](docs/PLAN.md). This page is how to use it.
 
 ## Install
 
 ```bash
-pip install -e ".[store,io,qc]"     # core plus zarr, format IO, QC tables
-pip install -e ".[gpu]"             # torch, MONAI, SimpleITK
+pip install -e ".[store,io]"        # core, zarr, TIFF/NIfTI readers
+pip install -e ".[gpu]"             # GPU path: torch, MONAI, SimpleITK
 pip install git+https://github.com/neel-dey/anatomix.git
 bash anatomix/registration/registration_backend/install_fireants.sh
 ```
 
-Only the core is needed to run the CPU reference engine and the whole test
-suite. The GPU extras are needed for the production path.
+The CPU reference engine needs only the first line. On Windows ARM64 there is
+no `numcodecs` wheel, so use an x64 Python for zarr.
 
-## Run
+## Quick start
+
+1. Copy [configs/example.json](configs/example.json) and list your subjects.
+2. Prepare everything and check the plan:
+
+   ```bash
+   chunkreg setup run.json
+   ```
+
+3. Run it:
+
+   ```bash
+   chunkreg run run.json
+   ```
+
+Both commands are safe to repeat. `setup` skips subjects already converted, and
+`run` resumes from the last finished pass. Use `chunkreg status run.json` to see
+progress.
+
+## Subjects
+
+Each subject needs an `id` and a `source`:
+
+```json
+"subjects": [
+  {"id": "s01", "source": "raw/s01.ome.zarr"},
+  {"id": "s02", "source": "raw/s02.zarr"}
+]
+```
+
+`setup` converts each source into a sharded zarr store at
+`<root>/subjects/<id>.zarr`, one chunk core at a time, so a subject never has to
+fit in memory. Set `path` to put the store somewhere else.
+
+Accepted sources:
+
+- **OME-Zarr**, v0.4 or v0.5. The full-resolution dataset is used, and the voxel
+  size is read from its metadata.
+- **Plain zarr**, either an array or a group holding one array.
+- **TIFF** stacks or folders of slices, and **NIfTI**. These are loaded whole.
+
+Every subject must be a single 3D volume with isotropic voxels. All subjects
+must share one shape and spacing, so pad or resample them first. `setup` stops
+with a clear message if any of this is not true, or if the config's
+`spacing_mm` disagrees with a file's own metadata.
+
+## Checking the plan
+
+`setup` ends by printing three things:
+
+- **The pyramid.** Levels halve in resolution from native until the volume fits
+  one chunk. The depth is worked out for you. A 2500³ volume at 50 µm gives
+  levels at 800, 400, 200, 100 and 50 µm, numbered 0 to 4.
+- **The stages per level.** These are the registration settings each level will
+  actually use.
+- **The cost.** This is the work per level and the estimated GPU-hours.
+
+While editing a config, skip the slow measurements:
 
 ```bash
-chunkreg ingest raw/s01.tif subjects/s01.zarr --spacing 0.05    # once per subject
-chunkreg selftest                                               # conventions
-chunkreg calibrate run.yaml                                     # r_f, memory, throughput
-chunkreg probe run.yaml                                         # how far apart the cohort is
-chunkreg plan run.yaml                                          # pyramid, clamps, cost
-chunkreg features run.yaml                                      # are the features worth it?
-chunkreg template run.yaml                                      # the run
-chunkreg status run.yaml                                        # progress, outstanding ids
+chunkreg setup run.json --no-calibrate --no-probe
 ```
 
-Run `plan` before committing to anything. It resolves the pyramid depth from
-the grid, the displacement clamp from the halo, and prints the work in padded
-channel-voxels with the levels ranked by cost.
+## Tuning each level
 
-## The four things worth knowing
+Coarse levels need stiff regularisation, and fine levels need freedom for
+detail such as cerebellar folia. `level_params` sets parameters per level,
+using the level numbers from the pyramid table:
 
-**The halo defines the clamp, not the other way round.** With the chunk
-geometry fixed, the halo bound
-
-```
-h >= D_max/spacing + s_max*[(k-1)/2 + 3*max(sigma)] + r_f
-```
-
-is solved for `D_max`. At the default profile that is 12 voxels at every level,
-so 4.8 mm at 400 um and 0.6 mm at 50 um. A configuration cannot ask for more
-than its halo can justify; `chunkreg plan` refuses one that tries.
-
-**The receptive field is measured, not assumed.** `r_f` is subtracted from the
-halo before anything is left for displacement, so a wrong value silently
-overdraws the budget. `chunkreg calibrate` measures it by perturbing a voxel and
-watching how far the change propagates, and warns when the profile understates
-it.
-
-**Levels stop on a measured condition.** A level keeps iterating until its
-residual fits comfortably inside the next level's clamp and the template has
-stopped moving by more than a voxel. Caps are a backstop, not the schedule.
-
-**Look at the features before paying for them.** `chunkreg features` renders the
-same physical box at every pyramid level, for several subjects, as intensity
-above and feature channels as RGB below, on one sheet. One projection is shared
-by every panel, so a colour means the same thing everywhere; `--basis per-level`
-trades that for per-level contrast when you want to know whether a level that
-renders flat has structure in its own subspace. Three numbers sit under each
-tile: contrast (is there structure at this scale), effective rank out of the
-channel count (has the descriptor collapsed), and the fraction of feature
-variance the picture actually shows. That is the evidence gate G2 needs.
-
-**Channel count is the cost lever.** Registration work is linear in channels.
-The `a16`, `a8`, `a4` and `i1` profiles are the same geometry at 16, 8, 4 and 1
-channels, spanning a 16x range in both cost and device class. `i1` also gets
-three times the clamp, because raw intensity has no receptive field to pay for.
-
-## Layout
-
-```
-chunkreg/
-  grid.py         GridSpec, Profile, Chunk, pyramid, tile, window
-  fields.py       displacement conventions, compose, warp, jacobian, engine bridge
-  store.py        Volume, Field, TaskArray, ingest
-  backend.py      zarr (production) and memory (tests)
-  stats.py        mergeable histograms for exact distributed percentiles
-  features/       intensity, anatomix, MIND-SSC, PCA projection
-  featureviz.py   feature-to-RGB projection, metrics, contact sheets
-  featurereport.py  samples the same world box at every level, per subject
-  engines/        demons (CPU reference), fireants (production)
-  passes/         manifest, register, blend, update, promote
-  pipelines/      the level loop and its stopping rule
-  runners/        local pool, SLURM arrays
-  planner.py probe.py calibrate.py status.py selftest.py cli.py
+```json
+"levels": {
+  "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [50, 30]}}],
+  "level_params": {
+    "1": {"iterations": [60, 40],  "lr": 0.5,  "smooth_grad_sigma": 1.2, "smooth_warp_sigma": 0.7},
+    "4": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.3, "cc_kernel": 5}
+  }
+}
 ```
 
-## Conventions
+You can set `scales`, `iterations`, `lr`, `translation_lr`,
+`smooth_grad_sigma`, `smooth_warp_sigma`, `cc_kernel`, `loss` and `tolerance`.
+A misspelt key is an error, and a level number the pyramid lacks is reported.
+To replace a level's stages entirely, use `level_stages` with the same keys.
 
-Arrays are `(Z, Y, X)`. Displacements are `(3, Z, Y, X)` float16 in
-**millimetres**, components in **array-axis order** `(z, y, x)`, mapping
-**template coordinates to subject coordinates**. Composition is
-`compose(inner, outer)` giving `inner(x) + outer(x + inner(x))`.
+Level 0 uses `level0_stages`, which by default are moments, rigid, affine and
+then greedy. Every other level starts from `seeded_stages`.
 
-Storing in millimetres is what makes promoting a seed between levels exact
-rather than approximate: resampling changes the lattice, never the vectors.
-Storing components in axis order rather than `grid_sample` order confines the
-reversal to one function, `fields.grid_to_disp_mm`, instead of spreading it
-through every block read.
+## Other config settings
 
-`chunkreg selftest` drives known shifts through all of this, whole-chunk and
-tiled, and is the first thing to run against a new engine build.
+| Key | Meaning |
+|---|---|
+| `root` | Where everything is written. |
+| `profile` | Chunk profile: `a16`, `a8`, `a4` (anatomix features) or `i1` (raw intensity). |
+| `spacing_mm` | Voxel size. Optional when the sources state it. |
+| `runner` | `local` or `slurm`. |
+| `levels.caps` | Maximum passes per level. Levels usually stop earlier on their own. |
+| `ingest.median_radius` | Optional median denoise at ingest. |
+| `template_subject` | Hold one subject fixed as the target instead of building a template. |
+| `slurm.*` | Partition and per-pass resources, plus `max_wait_s` to fail instead of waiting forever. |
 
-## Testing
+Configs can be JSON or YAML.
+
+## Outputs
+
+| What | Where |
+|---|---|
+| Final template | `<root>/levels/L<last>/template.zarr` |
+| Final fields | `<root>/fields/<id>.zarr` |
+| Per-pass records | `<root>/levels/L<k>/pass_it<n>.json` |
+
+Fields map template coordinates to subject coordinates, in millimetres. To use
+them:
 
 ```bash
-python -m pytest tests/ -q          # about 2.5 minutes
+chunkreg apply subjects/s01.zarr fields/s01.zarr s01_in_template.zarr
+chunkreg export levels/L4/template.zarr template.nii.gz
 ```
 
-The suite runs entirely on the CPU reference engine and the in-process memory
-backend, so it needs neither a GPU nor zarr. All block arithmetic, lattice
-conversion and sharding logic sits above the backend seam, so exercising it on
-the memory backend exercises the zarr path too.
+## Pairwise registration
+
+```bash
+chunkreg pair run.json --fixed s01 --moving s02
+```
+
+This registers one subject to another, using the same pipeline with the fixed
+subject as the template.
+
+## On a cluster
+
+Set `"runner": "slurm"` and run `chunkreg run run.json` on a login node. Each
+pass is submitted as a job array, and each element calls
+`chunkreg run-task`. Edit the templates in [slurm/](slurm/) to load your
+environment.
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+The full suite takes about 10 minutes, most of it in
+`tests/test_pipeline.py`. The zarr tests are skipped when zarr is not
+installed.

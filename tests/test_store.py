@@ -270,7 +270,8 @@ def test_task_entries_survive_a_json_round_trip(small_profile):
     level = GridSpec((96, 96, 96), 0.05)
     entries = make_entries(level, small_profile)
     TaskArray.create("t.zarr", entries, small_profile)
-    assert TaskArray.open("t.zarr").entries == entries
+    # Parsed once and held, so the property is a tuple rather than a fresh list.
+    assert list(TaskArray.open("t.zarr").entries) == list(entries)
 
 
 # --------------------------------------------------------------------------- #

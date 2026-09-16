@@ -25,7 +25,9 @@ from .grid import GridSpec, Profile
 
 __all__ = [
     "StageSpec",
+    "TUNABLE_STAGE_FIELDS",
     "LevelPolicy",
+    "IngestSpec",
     "RetryPolicy",
     "Retention",
     "Resources",
@@ -35,6 +37,7 @@ __all__ = [
     "PROFILES",
     "get_profile",
     "load_config",
+    "unused_level_overrides",
     "ConfigError",
 ]
 
@@ -93,7 +96,13 @@ class StageSpec:
     tolerance: float = 1e-6
     gradient_checkpointing: bool = True
 
+    KINDS = ("moments", "rigid", "affine", "greedy", "syn")
+
     def __post_init__(self) -> None:
+        if self.kind not in self.KINDS:
+            raise ConfigError(
+                f"unknown stage kind {self.kind!r}; known: {list(self.KINDS)}"
+            )
         object.__setattr__(self, "scales", tuple(int(s) for s in self.scales))
         object.__setattr__(self, "iterations", tuple(int(i) for i in self.iterations))
         if self.kind == "moments":
@@ -139,6 +148,56 @@ class StageSpec:
             )
         (kind, params), = obj.items()
         return cls(kind=kind, **(params or {}))  # type: ignore[arg-type]
+
+
+TUNABLE_STAGE_FIELDS: frozenset[str] = frozenset({
+    "scales",
+    "iterations",
+    "lr",
+    "translation_lr",
+    "smooth_grad_sigma",
+    "smooth_warp_sigma",
+    "cc_kernel",
+    "loss",
+    "tolerance",
+})
+"""Stage fields a per-level override may set.
+
+Deliberately not the whole of :class:`StageSpec`. ``kind`` is excluded because
+changing the kind of a stage is a different pipeline, not a retune, and the
+halo budget is validated against the stage list a level resolves to; letting a
+patch swap ``greedy`` for ``syn`` would move that check out from under itself.
+Use ``level_stages`` to replace a level's stage list outright.
+"""
+
+
+def _patch_stage(stage: StageSpec, patch: dict[str, Any]) -> StageSpec:
+    """Apply a per-level override to one stage.
+
+    ``moments`` carries no schedule, so it is returned untouched rather than
+    being handed iterations it would silently ignore.
+    """
+    if stage.kind == "moments":
+        return stage
+    unknown = set(patch) - TUNABLE_STAGE_FIELDS
+    if unknown:
+        raise ConfigError(
+            f"unknown per-level stage parameter(s) {sorted(unknown)}; "
+            f"settable: {sorted(TUNABLE_STAGE_FIELDS)}"
+        )
+    kw: dict[str, Any] = {}
+    for key, value in patch.items():
+        if key in ("scales", "iterations"):
+            kw[key] = tuple(int(v) for v in value)
+        elif key in ("cc_kernel",):
+            kw[key] = int(value)
+        elif key == "loss":
+            kw[key] = str(value)
+        elif key == "translation_lr":
+            kw[key] = None if value is None else float(value)
+        else:
+            kw[key] = float(value)
+    return replace(stage, **kw)
 
 
 DEFAULT_LEVEL0_STAGES: tuple[StageSpec, ...] = (
@@ -192,13 +251,55 @@ class LevelPolicy:
     aperture instead: a displacement approaching the size of the volume cannot
     be a real correspondence, whatever the similarity says."""
 
+    level_stages: dict[int, tuple[StageSpec, ...]] = field(default_factory=dict)
+    """Per-level replacement of the whole stage list, keyed by level index.
+
+    The escape hatch for a level that needs a different pipeline rather than a
+    different tuning: an extra affine stage at level 1, say. Overrides
+    ``level0_stages`` and ``seeded_stages`` for the levels it names."""
+
+    level_params: dict[int, dict[str, Any]] = field(default_factory=dict)
+    """Per-level tuning applied on top of whichever stage list a level
+    resolves to, keyed by level index.
+
+    This is the knob for structures that need different regularisation at
+    different resolutions: weaker smoothing and more iterations at the fine
+    levels where cerebellar foliation lives, stiffer at the coarse levels that
+    carry the global shape. Only :data:`TUNABLE_STAGE_FIELDS` may be set, and
+    the patch reaches every non-moments stage of that level."""
+
     def cap(self, level: int) -> int:
         if not self.caps:
             return 1
         return int(self.caps[min(level, len(self.caps) - 1)])
 
+    def base_stages(self, level: int) -> tuple[StageSpec, ...]:
+        """The stage list for a level, before per-level tuning is applied."""
+        override = self.level_stages.get(int(level))
+        if override:
+            return tuple(override)
+        return self.level0_stages if int(level) == 0 else self.seeded_stages
+
     def stages(self, level: int) -> tuple[StageSpec, ...]:
-        return self.level0_stages if level == 0 else self.seeded_stages
+        """The stage list a level actually runs.
+
+        Resolution order is ``level_stages[level]``, else ``level0_stages`` at
+        level 0 or ``seeded_stages`` below it, with ``level_params[level]``
+        patched over the result.
+        """
+        k = int(level)
+        base = self.base_stages(k)
+        patch = self.level_params.get(k)
+        if not patch:
+            return base
+        try:
+            return tuple(_patch_stage(s, patch) for s in base)
+        except ConfigError as exc:
+            raise ConfigError(f"level {k}: {exc}") from None
+
+    def tuned_levels(self) -> tuple[int, ...]:
+        """Levels named by a per-level override, in order."""
+        return tuple(sorted(set(self.level_stages) | set(self.level_params)))
 
 
 @dataclass(frozen=True)
@@ -237,6 +338,13 @@ class Resources:
 class SlurmConfig:
     partition: str = "gpu"
     account: str | None = None
+    poll_seconds: float = 30.0
+    """How often the driver asks sacct for array state."""
+    max_wait_s: float | None = None
+    """Give up waiting for a pass after this many seconds. ``None`` waits
+    indefinitely, which is right for a queue that can hold a job for days but
+    wrong for an array that will never reach a terminal state; set it when a
+    run should fail rather than hang."""
     register: Resources = Resources(gpus=1, cpus=8, mem_gb=64, time="04:00:00")
     blend: Resources = Resources(gpus=0, cpus=8, mem_gb=32, time="02:00:00")
     update: Resources = Resources(gpus=0, cpus=8, mem_gb=32, time="01:00:00")
@@ -246,6 +354,25 @@ class SlurmConfig:
 class SubjectSpec:
     id: str
     path: str
+    source: str | None = None
+    """Foreign-format file or slice directory to ingest from.
+
+    Present so that ingest is part of the run configuration rather than a
+    hand-typed command per subject: ``chunkreg setup`` ingests every subject
+    that names a source and has no store yet."""
+
+
+@dataclass(frozen=True)
+class IngestSpec:
+    """How ``chunkreg setup`` turns a source file into a store."""
+
+    dtype: str = "auto"
+    """Storage dtype. ``auto`` keeps an integer source's type and stores a
+    floating source as float32."""
+    median_radius: float | None = None
+    """Radius of an optional median denoise, in voxels. ``None`` disables it."""
+    percentiles: tuple[float, float] = (0.5, 99.5)
+    """Intensity window, measured once at the coarsest level of each subject."""
 
 
 # --------------------------------------------------------------------------- #
@@ -261,15 +388,25 @@ class RunConfig:
     runner: Literal["local", "slurm"] = "local"
     backend: Literal["zarr", "memory"] = "zarr"
     levels: LevelPolicy = LevelPolicy()
+    ingest: IngestSpec = IngestSpec()
     retry: RetryPolicy = RetryPolicy()
     retention: Retention = Retention()
     slurm: SlurmConfig = SlurmConfig()
+    template_subject: str | None = None
+    """Hold this subject fixed as the template instead of estimating one.
+
+    Pairwise registration is the groupwise loop with the template held fixed,
+    so it is a setting rather than a separate pipeline. The named subject gets
+    no field of its own, its volume is the template at every level, and the
+    unbiasing update pass is skipped: there is nothing to unbias when the
+    target is one particular anatomy rather than a population mean."""
+
     gpu_mem_gb: float = 80.0
     bytes_per_voxel_channel: float = 90.0
-    """Measured by ``chunkreg calibrate``; 90 is anatomix-on-FireANTs with
+    """Measured during ``chunkreg setup``; 90 is anatomix-on-FireANTs with
     LNCC, 75 with gradient checkpointing."""
     throughput_ch_vox_per_s: float = 1.5e6
-    """Also measured by ``calibrate``. The default is a placeholder equal to a
+    """Also measured during ``setup``. The default is a placeholder equal to a
     576-cubed single-channel chunk in 60 seconds."""
     seed: int = 0
 
@@ -287,9 +424,26 @@ class RunConfig:
     def field_path(self, level: int, subject: str) -> Path:
         return self.level_dir(level) / "fields" / f"{subject}.zarr"
 
+    def final_field_path(self, subject: str) -> Path:
+        """Where a finished run leaves a subject's field.
+
+        Distinct from ``field_path`` at the last level because the deliverable
+        has the final template motion folded in and the level store does not.
+        """
+        return self.root_path / "fields" / f"{subject}.zarr"
+
     def recentre_path(self, level: int) -> Path:
         """Where a pass records the template motion the next pass must undo."""
         return self.level_dir(level) / "recentre.zarr"
+
+    def pass_record_path(self, level: int, iteration: int) -> Path:
+        """Where a finished pass records that it finished, and how it went.
+
+        Task arrays are transient and retention deletes them as soon as the
+        blend that consumed them has verified, so they cannot be the evidence
+        that a pass completed. This record is durable and small.
+        """
+        return self.level_dir(level) / f"pass_it{iteration}.json"
 
     def scratch_dir(self, level: int, iteration: int) -> Path:
         return self.root_path / "scratch" / f"L{level}_it{iteration}"
@@ -309,6 +463,15 @@ class RunConfig:
     @property
     def n_subjects(self) -> int:
         return len(self.subjects)
+
+    @property
+    def registered_ids(self) -> tuple[str, ...]:
+        """Subjects that get a field of their own.
+
+        Everything in the cohort except a subject being held fixed as the
+        template, which is a target rather than a member of the group.
+        """
+        return tuple(s for s in self.subject_ids if s != self.template_subject)
 
     def subject_path(self, subject: str) -> Path:
         for s in self.subjects:
@@ -336,7 +499,12 @@ class RunConfig:
                 f"field."
             )
 
-        for level, stages in ((0, self.levels.level0_stages), (1, self.levels.seeded_stages)):
+        # Level 0 and a generic seeded level always exist; every level named by
+        # a per-level override is resolved here too, so a bad patch fails at
+        # load time rather than part way through a run.
+        to_check = [0, 1, *self.levels.tuned_levels()]
+        for level in sorted(set(to_check)):
+            stages = self.levels.stages(level)  # raises on a bad override
             if not stages:
                 raise ConfigError(f"level {level} has no stages")
             if not any(s.is_deformable for s in stages):
@@ -344,20 +512,41 @@ class RunConfig:
                     f"level {level} has no deformable stage; it can only "
                     f"produce a linear alignment"
                 )
-            if level > 0:
-                for s in stages:
-                    if s.is_deformable and s.s_max > p.s_max:
-                        raise ConfigError(
-                            f"seeded stage {s.kind!r} uses scales up to "
-                            f"{s.s_max} but the profile budgets its halo for "
-                            f"s_max={p.s_max}. Either set profile scales to "
-                            f"{s.scales} (which would leave a clamp of "
-                            f"{p.halo - p.support_vox(s.s_max) - p.r_f:.1f} "
-                            f"voxels) or lower the stage scales."
-                        )
+            if level == 0:
+                continue
+            for s in stages:
+                if s.is_deformable and s.s_max > p.s_max:
+                    raise ConfigError(
+                        f"level {level}: stage {s.kind!r} uses scales up to "
+                        f"{s.s_max} but the profile budgets its halo for "
+                        f"s_max={p.s_max}. Either set profile scales to "
+                        f"{s.scales} (which would leave a clamp of "
+                        f"{p.halo - p.support_vox(s.s_max) - p.r_f:.1f} "
+                        f"voxels) or lower the stage scales."
+                    )
+
+        for level, spec in sorted(self.levels.level_stages.items()):
+            if level < 0:
+                raise ConfigError(f"level_stages has a negative level {level}")
+            if not spec:
+                raise ConfigError(f"level_stages[{level}] is empty")
+        for level in sorted(self.levels.level_params):
+            if level < 0:
+                raise ConfigError(f"level_params has a negative level {level}")
 
         if not self.subjects:
             raise ConfigError("a run needs at least one subject")
+        if self.template_subject is not None:
+            if self.template_subject not in self.subject_ids:
+                raise ConfigError(
+                    f"template_subject {self.template_subject!r} is not in the "
+                    f"subject list {list(self.subject_ids)}"
+                )
+            if not self.registered_ids:
+                raise ConfigError(
+                    f"template_subject {self.template_subject!r} is the only "
+                    f"subject, so there is nothing left to register against it"
+                )
         ids = [s.id for s in self.subjects]
         if len(set(ids)) != len(ids):
             dupes = sorted({i for i in ids if ids.count(i) > 1})
@@ -382,6 +571,26 @@ class RunConfig:
             )
         if self.levels.residual_frac <= 0:
             raise ConfigError("residual_frac must be positive")
+        if not 0.0 < self.levels.stop_percentile <= 100.0:
+            raise ConfigError(
+                f"levels.stop.percentile must be in (0, 100], got "
+                f"{self.levels.stop_percentile}"
+            )
+        if any(c < 1 for c in self.levels.caps):
+            raise ConfigError(
+                f"every cap must allow at least one pass, got {list(self.levels.caps)}"
+            )
+        if not 0.0 <= self.levels.min_tissue_fraction <= 1.0:
+            raise ConfigError(
+                f"min_tissue_fraction must be a fraction, got "
+                f"{self.levels.min_tissue_fraction}"
+            )
+        if not 0.0 <= self.retry.fold_frac <= 1.0:
+            raise ConfigError(
+                f"retry.fold_frac must be a fraction, got {self.retry.fold_frac}"
+            )
+        if self.spacing_mm is not None and self.spacing_mm <= 0:
+            raise ConfigError(f"spacing_mm must be positive, got {self.spacing_mm}")
 
         return warnings
 
@@ -408,6 +617,17 @@ class RunConfig:
         return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def unused_level_overrides(cfg: "RunConfig", n_levels: int) -> list[int]:
+    """Per-level keys naming a level this run does not have.
+
+    The pyramid depth follows from the grid and the chunk core, so it is not
+    known until a subject has been ingested. A key for level 7 of a five-level
+    run is silently inert, which is exactly the kind of tuning mistake that
+    looks like the tuning simply not working, so the CLI reports it.
+    """
+    return [k for k in cfg.levels.tuned_levels() if k >= int(n_levels)]
+
+
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
@@ -417,20 +637,69 @@ def _stages(obj, default: tuple[StageSpec, ...]) -> tuple[StageSpec, ...]:
     return tuple(StageSpec.from_obj(o) for o in obj)
 
 
-def load_config(source: str | Path | dict) -> RunConfig:
-    """Read a run configuration from a YAML file or an equivalent mapping."""
-    if isinstance(source, (str, Path)):
-        import yaml
+def _level_key(key, what: str) -> int:
+    """Read a level index from a mapping key.
 
-        raw = yaml.safe_load(Path(source).read_text(encoding="utf-8")) or {}
-    else:
-        raw = dict(source)
+    JSON has no integer keys, so ``{"3": {...}}`` is the only spelling
+    available there and has to mean the same as YAML's ``{3: {...}}``.
+    """
+    try:
+        level = int(key)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"{what} is keyed by level index; {key!r} is not one"
+        ) from None
+    if level < 0:
+        raise ConfigError(f"{what} has a negative level {level}")
+    return level
+
+
+def _check_keys(obj: dict, allowed: set[str], where: str) -> None:
+    """Reject unknown keys in a nested block.
+
+    A mistyped tuning key that is silently ignored is indistinguishable from
+    tuning that had no effect, which is the most expensive kind of mistake to
+    diagnose in a run that takes GPU-days.
+    """
+    unknown = set(obj) - allowed
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) {sorted(unknown)} in {where}; "
+            f"known: {sorted(allowed)}"
+        )
+
+
+def _read_raw(source: str | Path) -> dict:
+    """Read a config file. JSON by extension, YAML otherwise."""
+    path = Path(source)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"cannot read config {path}: {exc}") from None
+    if path.suffix.lower() == ".json":
+        try:
+            return json.loads(text) or {}
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"{path} is not valid JSON: {exc}") from None
+    import yaml
+
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path} is not valid YAML: {exc}") from None
+
+
+def load_config(source: str | Path | dict) -> RunConfig:
+    """Read a run configuration from a JSON or YAML file, or a mapping."""
+    raw = _read_raw(source) if isinstance(source, (str, Path)) else dict(source)
+    if not isinstance(raw, dict):
+        raise ConfigError("a configuration must be a mapping at the top level")
 
     unknown = set(raw) - {
         "root", "subjects", "profile", "profile_overrides", "spacing_mm", "grid",
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
-        "backbone",
+        "backbone", "ingest", "template_subject",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -450,15 +719,69 @@ def load_config(source: str | Path | dict) -> RunConfig:
             profile_name = name
         else:
             overrides["channels"] = int(ch)
-    profile = get_profile(profile_name, **overrides)
+    try:
+        profile = get_profile(profile_name, **overrides)
+    except TypeError as exc:
+        raise ConfigError(
+            f"bad profile_overrides for profile {profile_name!r}: {exc}"
+        ) from None
 
-    subjects = tuple(
-        SubjectSpec(id=str(s["id"]), path=str(s["path"]))
-        for s in (raw.get("subjects") or [])
-    )
+    runner_name = raw.get("runner", "local")
+    if runner_name not in ("local", "slurm"):
+        raise ConfigError(
+            f"unknown runner {runner_name!r}; use 'local' or 'slurm'"
+        )
+    backend_name = raw.get("backend", "zarr")
+    if backend_name not in ("zarr", "memory"):
+        raise ConfigError(
+            f"unknown backend {backend_name!r}; use 'zarr' or 'memory'"
+        )
+
+    subjects = []
+    for entry in raw.get("subjects") or []:
+        if not isinstance(entry, dict) or "id" not in entry:
+            raise ConfigError(
+                f"each subject must be a mapping with an 'id', got {entry!r}"
+            )
+        _check_keys(entry, {"id", "path", "source"}, f"subject {entry.get('id')!r}")
+        sid = str(entry["id"])
+        src = entry.get("source")
+        subjects.append(
+            SubjectSpec(
+                id=sid,
+                path=str(entry.get("path") or f"subjects/{sid}.zarr"),
+                source=None if src is None else str(src),
+            )
+        )
+    subjects = tuple(subjects)
 
     lv = dict(raw.get("levels") or {})
     stop = dict(lv.pop("stop", None) or {})
+    _check_keys(
+        lv,
+        {
+            "caps", "level0_stages", "seeded_stages", "level_stages",
+            "level_params", "shape_update_step", "sharpen_laplacian_levels",
+            "min_tissue_fraction", "level0_max_disp_frac",
+        },
+        "the 'levels' block",
+    )
+    _check_keys(stop, {"residual_frac", "ubar_vox", "percentile"}, "'levels.stop'")
+
+    level_stages = {
+        _level_key(k, "levels.level_stages"): _stages(v, ())
+        for k, v in (lv.get("level_stages") or {}).items()
+    }
+    level_params = {}
+    for k, v in (lv.get("level_params") or {}).items():
+        level = _level_key(k, "levels.level_params")
+        if not isinstance(v, dict):
+            raise ConfigError(
+                f"levels.level_params[{level}] must be a mapping of stage "
+                f"parameters, got {v!r}"
+            )
+        level_params[level] = dict(v)
+
     policy = LevelPolicy(
         caps=tuple(lv.get("caps", LevelPolicy.caps)),
         level0_stages=_stages(lv.get("level0_stages"), DEFAULT_LEVEL0_STAGES),
@@ -474,6 +797,22 @@ def load_config(source: str | Path | dict) -> RunConfig:
         ),
         min_tissue_fraction=float(
             lv.get("min_tissue_fraction", LevelPolicy.min_tissue_fraction)
+        ),
+        level0_max_disp_frac=float(
+            lv.get("level0_max_disp_frac", LevelPolicy.level0_max_disp_frac)
+        ),
+        level_stages=level_stages,
+        level_params=level_params,
+    )
+
+    ing = dict(raw.get("ingest") or {})
+    _check_keys(ing, {"dtype", "median_radius", "percentiles"}, "the 'ingest' block")
+    median = ing.get("median_radius", IngestSpec.median_radius)
+    ingest = IngestSpec(
+        dtype=str(ing.get("dtype", IngestSpec.dtype)),
+        median_radius=None if median is None else float(median),
+        percentiles=tuple(
+            float(v) for v in ing.get("percentiles", IngestSpec.percentiles)
         ),
     )
 
@@ -508,9 +847,12 @@ def load_config(source: str | Path | dict) -> RunConfig:
             chunks_per_task=int(d.get("chunks_per_task", default.chunks_per_task)),
         )
 
+    _wait = sl.get("max_wait_s", SlurmConfig.max_wait_s)
     slurm = SlurmConfig(
         partition=str(sl.get("partition", SlurmConfig.partition)),
         account=sl.get("account"),
+        poll_seconds=float(sl.get("poll_seconds", SlurmConfig.poll_seconds)),
+        max_wait_s=None if _wait is None else float(_wait),
         register=res("register", SlurmConfig.register),
         blend=res("blend", SlurmConfig.blend),
         update=res("update", SlurmConfig.update),
@@ -526,9 +868,14 @@ def load_config(source: str | Path | dict) -> RunConfig:
         profile=profile,
         profile_name=profile_name,
         spacing_mm=None if spacing is None else float(spacing),
-        runner=raw.get("runner", "local"),
-        backend=raw.get("backend", "zarr"),
+        template_subject=(
+            None if raw.get("template_subject") is None
+            else str(raw["template_subject"])
+        ),
+        runner=runner_name,
+        backend=backend_name,
         levels=policy,
+        ingest=ingest,
         retry=retry,
         retention=retention,
         slurm=slurm,

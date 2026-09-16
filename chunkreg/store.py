@@ -41,6 +41,8 @@ __all__ = [
     "read_padded",
     "lattice_box",
     "ingest_array",
+    "ingest_source",
+    "check_volume",
 ]
 
 _META = "meta.json"
@@ -146,7 +148,7 @@ class Volume:
         self.path = Path(path)
         self.meta = meta
         self._backend = _backend.get_backend(backend)
-        self._cache: dict[int, Any] = {}
+        self._cache: dict[tuple[int, str], Any] = {}
 
     # -- construction ------------------------------------------------------- #
     @classmethod
@@ -243,10 +245,17 @@ class Volume:
         return k
 
     def array(self, level: int, mode: str = "r"):
+        """Open a level, caching one handle per (level, mode).
+
+        The mode is passed through rather than ignored: a caller that asks for
+        a read-only handle gets one, so a pass that is supposed to be reading
+        cannot quietly write through it.
+        """
         k = self._check_level(level)
-        if k not in self._cache:
-            self._cache[k] = self._backend.open(self.path / f"s{k}", mode="r+")
-        return self._cache[k]
+        key = (k, str(mode))
+        if key not in self._cache:
+            self._cache[key] = self._backend.open(self.path / f"s{k}", mode=mode)
+        return self._cache[key]
 
     # -- normalisation ------------------------------------------------------ #
     def set_normalisation(self, lo: float, hi: float) -> None:
@@ -433,17 +442,6 @@ class Field:
             self._array = self._backend.open(self.path, mode="r+")
         return self._array
 
-    def shards(self) -> list[tuple[int, int, int]]:
-        """Lattice shard indices, one per chunk core of the level."""
-        lat = self.lattice_grid
-        per = max(1, 256 // self.factor)
-        return [
-            (i, j, k)
-            for i in range(int(math.ceil(lat.shape[0] / per)))
-            for j in range(int(math.ceil(lat.shape[1] / per)))
-            for k in range(int(math.ceil(lat.shape[2] / per)))
-        ]
-
     # -- reads and writes --------------------------------------------------- #
     def read_lattice(self, origin, shape) -> np.ndarray:
         """Raw lattice samples, edge-replicated outside."""
@@ -599,6 +597,9 @@ class TaskArray:
         self.meta = meta
         self._backend = _backend.get_backend(backend)
         self._array = None
+        # Parsed once. Every read and write indexes into this list, so rebuilding
+        # it per access made a task quadratic in the number of entries it holds.
+        self._entries = tuple(TaskEntry.from_json(d) for d in meta["entries"])
 
     @classmethod
     def create(
@@ -645,10 +646,16 @@ class TaskArray:
 
     @classmethod
     def is_complete(cls, path, backend=None) -> bool:
-        """True when a finished task array exists, so the task can be skipped."""
+        """True when a finished task array exists, so the task can be skipped.
+
+        The array itself has to be there, not just the marker. Retention
+        deletes finished task arrays, and a marker that outlived its data would
+        otherwise let a re-run skip work whose output is gone and fail in the
+        blend that went looking for it.
+        """
         b = _backend.get_backend(backend)
         p = Path(str(path) + ".meta.json")
-        if not _backend.json_exists(p, b):
+        if not _backend.json_exists(p, b) or not b.exists(path):
             return False
         try:
             return bool(_backend.read_json(p, b).get("complete", False))
@@ -656,8 +663,8 @@ class TaskArray:
             return False
 
     @property
-    def entries(self) -> list[TaskEntry]:
-        return [TaskEntry.from_json(d) for d in self.meta["entries"]]
+    def entries(self) -> tuple[TaskEntry, ...]:
+        return self._entries
 
     @property
     def factor(self) -> int:
@@ -706,13 +713,105 @@ class TaskArray:
 # --------------------------------------------------------------------------- #
 # Ingest
 # --------------------------------------------------------------------------- #
+def _output_dtype(requested: str, source_dtype) -> np.dtype:
+    """Resolve ``"auto"`` to a storage dtype that loses nothing.
+
+    Integer sources keep their type. Floating sources are stored as float32,
+    which is what every pass reads anyway. A fixed request is honoured.
+    """
+    if str(requested) != "auto":
+        return np.dtype(requested)
+    src = np.dtype(source_dtype)
+    if src == np.bool_:
+        return np.dtype(np.uint8)
+    if np.issubdtype(src, np.integer):
+        return src
+    return np.dtype(np.float32)
+
+
+def _cast(block: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Cast for storage, clipping rather than wrapping into an integer type."""
+    if np.issubdtype(dtype, np.integer) and not np.issubdtype(block.dtype, np.integer):
+        info = np.iinfo(dtype)
+        block = np.clip(np.rint(block), info.min, info.max)
+    return block.astype(dtype, copy=False)
+
+
+def ingest_source(
+    source,
+    path,
+    spacing_mm: float,
+    profile: Profile,
+    origin_mm: Sequence[float] = (0.0, 0.0, 0.0),
+    dtype: str = "auto",
+    backend=None,
+    overwrite: bool = False,
+    percentiles=(0.5, 99.5),
+    provenance: dict | None = None,
+    median_radius: float | None = None,
+) -> Volume:
+    """Write a volume as a sharded multiscale store, one chunk core at a time.
+
+    ``source`` is anything with a 3D ``shape``, a ``dtype`` and ``(z, y, x)``
+    slicing: a numpy array, a zarr array, or an
+    :class:`chunkreg.io_formats.VolumeSource`. Only one core-sized block, plus
+    the median margin, is in memory at once, and each write fills exactly one
+    shard of the native level.
+
+    The optional median denoise is applied blockwise with a margin of half its
+    width read from the neighbours, so the result is identical to filtering
+    the whole volume at once.
+    """
+    shape = tuple(int(n) for n in source.shape)
+    if len(shape) != 3:
+        raise ValueError(f"expected a 3D volume, got shape {shape}")
+    out_dtype = _output_dtype(dtype, source.dtype)
+    native = GridSpec(shape, spacing_mm, tuple(origin_mm))
+    vol = Volume.create(
+        path,
+        native,
+        profile,
+        dtype=str(out_dtype),
+        backend=backend,
+        overwrite=overwrite,
+        provenance=provenance,
+    )
+    level = vol.n_levels - 1
+
+    size = int(2 * median_radius + 1) if median_radius else 0
+    margin = size // 2
+    step = int(profile.core)
+    for z0 in range(0, shape[0], step):
+        for y0 in range(0, shape[1], step):
+            for x0 in range(0, shape[2], step):
+                origin = (z0, y0, x0)
+                lo = [max(o - margin, 0) for o in origin]
+                hi = [min(o + step + margin, n) for o, n in zip(origin, shape)]
+                block = np.asarray(
+                    source[tuple(slice(a, b) for a, b in zip(lo, hi))]
+                )
+                if size > 1:
+                    from scipy import ndimage
+
+                    block = ndimage.median_filter(block, size=size)
+                core = tuple(
+                    slice(o - a, min(o + step, n) - a)
+                    for o, a, n in zip(origin, lo, shape)
+                )
+                vol.write_block(level, origin, _cast(block[core], out_dtype))
+
+    vol.build_pyramid()
+    vol.compute_normalisation(level=0, percentiles=percentiles)
+    return vol
+
+
 def ingest_array(
     data: np.ndarray,
     path,
     spacing_mm: float,
     profile: Profile,
     origin_mm: Sequence[float] = (0.0, 0.0, 0.0),
-    dtype: str = "uint16",
+    dtype: str = "auto",
     backend=None,
     overwrite: bool = False,
     percentiles=(0.5, 99.5),
@@ -720,24 +819,62 @@ def ingest_array(
 ) -> Volume:
     """Write an in-memory volume as a multiscale store and derive its window.
 
-    The format-reading front end (``chunkreg ingest``) streams TIFF or NIfTI
-    into this same layout; this entry point is what the tests and small runs
-    use, and what keeps the pyramid and normalisation logic in one place.
+    A thin wrapper over :func:`ingest_source`, kept because tests and small
+    runs have an array in hand rather than a file.
     """
     arr = np.asarray(data)
     if arr.ndim != 3:
         raise ValueError(f"expected a 3D volume, got shape {arr.shape}")
-    native = GridSpec(arr.shape, spacing_mm, tuple(origin_mm))
-    vol = Volume.create(
+    return ingest_source(
+        arr,
         path,
-        native,
+        spacing_mm,
         profile,
+        origin_mm=origin_mm,
         dtype=dtype,
         backend=backend,
         overwrite=overwrite,
+        percentiles=percentiles,
         provenance=provenance,
     )
-    vol.write_block(vol.n_levels - 1, (0, 0, 0), arr)
-    vol.build_pyramid()
-    vol.compute_normalisation(level=0, percentiles=percentiles)
-    return vol
+
+
+def check_volume(vol: Volume, profile: Profile) -> tuple[list[str], list[str]]:
+    """Check a subject store against the profile a run will use.
+
+    Returns ``(errors, warnings)``. A pyramid of the wrong depth is an error,
+    because level ``k`` of the run would read the wrong resolution. Sharding
+    that does not match the chunk core is a warning: the run still works, but
+    tasks no longer map one to one onto files, which is what keeps IO and
+    file counts bounded on a cluster.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    grids = pyramid(vol.native_grid, profile)
+    if vol.n_levels != len(grids):
+        errors.append(
+            f"has {vol.n_levels} levels but this profile needs {len(grids)} "
+            f"(core {profile.core}); it was ingested with a different profile"
+        )
+        return errors, warnings
+    for k, g in enumerate(grids):
+        arr = vol.array(k)
+        chunks = tuple(getattr(arr, "chunks", ()) or ())
+        shards = getattr(arr, "shards", None)
+        want_chunk = tuple(min(profile.inner_chunk, n) for n in g.shape)
+        want_shard = tuple(
+            int(math.ceil(min(profile.core, n) / c) * c)
+            for n, c in zip(g.shape, want_chunk)
+        )
+        if shards is None:
+            warnings.append(f"level s{k} is not sharded")
+        elif tuple(shards) != want_shard:
+            warnings.append(
+                f"level s{k} has shards {tuple(shards)}, expected {want_shard} "
+                f"(one shard per {profile.core}-voxel chunk core)"
+            )
+        if chunks and chunks != want_chunk:
+            warnings.append(
+                f"level s{k} has inner chunks {chunks}, expected {want_chunk}"
+            )
+    return errors, warnings

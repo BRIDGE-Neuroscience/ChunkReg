@@ -1,0 +1,77 @@
+{
+  "root": "/scratch/proj/hipct-cohort",
+  "runner": "slurm",
+  "backend": "zarr",
+  "profile": "a16",
+  "gpu_mem_gb": 80,
+
+  "spacing_mm": 0.05,
+
+  "bytes_per_voxel_channel": 90,
+  "throughput_ch_vox_per_s": 1.5e6,
+
+  "ingest": {
+    "dtype": "auto",
+    "median_radius": null,
+    "percentiles": [0.5, 99.5]
+  },
+
+  "subjects": [
+    {"id": "s01", "source": "raw/s01.ome.zarr"},
+    {"id": "s02", "source": "raw/s02.ome.zarr"},
+    {"id": "s03", "source": "raw/s03.ome.zarr"},
+    {"id": "s04", "source": "raw/s04.ome.zarr"},
+    {"id": "s05", "source": "raw/s05.ome.zarr"}
+  ],
+
+  "levels": {
+    "caps": [8, 6, 4, 3, 2],
+
+    "level0_stages": [
+      "moments",
+      {"rigid":  {"scales": [4, 2, 1], "iterations": [200, 100, 50], "lr": 0.01}},
+      {"affine": {"scales": [4, 2, 1], "iterations": [200, 100, 50], "lr": 0.01}},
+      {"greedy": {"scales": [8, 4, 2, 1], "iterations": [120, 80, 50, 30]}}
+    ],
+
+    "seeded_stages": [
+      {"greedy": {"scales": [2, 1], "iterations": [50, 30]}}
+    ],
+
+    "level_params": {
+      "1": {"iterations": [60, 40], "lr": 0.50, "smooth_grad_sigma": 1.2, "smooth_warp_sigma": 0.70, "cc_kernel": 7},
+      "2": {"iterations": [60, 40], "lr": 0.40, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.50, "cc_kernel": 7},
+      "3": {"iterations": [80, 50], "lr": 0.30, "smooth_grad_sigma": 0.8, "smooth_warp_sigma": 0.40, "cc_kernel": 5},
+      "4": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.30, "cc_kernel": 5}
+    },
+
+    "stop": {
+      "residual_frac": 0.5,
+      "ubar_vox": 1.0,
+      "percentile": 99.0
+    },
+
+    "shape_update_step": 0.25,
+    "sharpen_laplacian_levels": [0, 1],
+    "min_tissue_fraction": 0.02,
+    "level0_max_disp_frac": 0.25
+  },
+
+  "retry": {
+    "fold_frac": 0.001,
+    "ladder": ["sigma_w_x2", "clamp_x0.5", "emit_seed"]
+  },
+
+  "retention": {
+    "keep_history_levels": [0, 1],
+    "delete_task_arrays": true,
+    "delete_accumulators": true
+  },
+
+  "slurm": {
+    "partition": "gpu",
+    "register": {"gpus": 1, "cpus": 8, "mem_gb": 64, "time": "04:00:00", "chunks_per_task": 16},
+    "blend":    {"gpus": 0, "cpus": 8, "mem_gb": 32, "time": "02:00:00"},
+    "update":   {"gpus": 0, "cpus": 8, "mem_gb": 32, "time": "01:00:00"}
+  }
+}

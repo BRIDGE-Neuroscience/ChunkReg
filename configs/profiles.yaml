@@ -13,7 +13,7 @@
 #  a4     256    48     352         4   24           12    15 GB         24 GB
 #  i1     256    48     352         1    0           36     4 GB           any
 #
-# Memory assumes 90 bytes per voxel-channel; run `chunkreg calibrate` to
+# Memory assumes 90 bytes per voxel-channel; run `chunkreg setup` to
 # replace that with a measured figure for your backbone and hardware.
 
 a16:

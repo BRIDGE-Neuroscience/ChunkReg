@@ -482,12 +482,9 @@ shard = core; channel count fits the GPU class; stage lists well-formed.
 ## 10. CLI
 
 ```
-chunkreg ingest    SRC DST --spacing 0.05 [--median 1.5]        # any format → multiscale sharded zarr
+chunkreg setup     CONFIG         # ingest, conventions, calibration, cohort spread, plan
 chunkreg selftest  CONFIG
-chunkreg calibrate CONFIG          # r_f, capture range, bytes/voxel-channel, throughput → calibration.json
-chunkreg probe     CONFIG          # d99 at level 0 for 3 pairs; expected passes per level
-chunkreg plan      CONFIG          # pyramid, chunks per level, D_max per level, work and GPU-hours
-chunkreg template  CONFIG [--from-level k]
+chunkreg run       CONFIG [--from-level k]      # the run itself
 chunkreg pair      CONFIG
 chunkreg run-task  CONFIG --level k --iter i --pass P --id T      # what sbatch invokes
 chunkreg status    CONFIG [--retry]
@@ -636,7 +633,7 @@ scheduler or one at a time in a pool.
 
 **`r_f` is measured, not declared.** The halo budget subtracts the feature
 receptive field before anything is left for displacement, so a wrong value
-overdraws the budget silently. `chunkreg calibrate` measures it directly by
+overdraws the budget silently. `chunkreg setup` measures it directly by
 perturbing one voxel and finding how far the feature response changes, and warns
 when the profile understates it.
 
@@ -684,7 +681,7 @@ contrast, effective rank and shown-variance printed per tile. MIND-SSC was
 implemented alongside it (twelve channels, pure numpy) so the multichannel path
 can be judged on a machine with no GPU, and because its receptive field is
 exactly dilation plus patch radius it doubles as a known-answer test for
-`chunkreg calibrate`.
+`chunkreg setup`.
 
 Building it found two defects worth recording. The report originally derived the
 pyramid from the config profile rather than from the store, so a volume ingested
