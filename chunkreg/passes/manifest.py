@@ -5,10 +5,12 @@ exist, how they are grouped into tasks, and which task array holds each result.
 Tasks then need no coordination: a register task reads its own slice of the
 list, and a blend task looks up the results that touch its shard by index.
 
-Grouping is subject-major and follows the chunk ordering, which is
-lexicographic in the chunk lattice. That keeps the chunks inside one task
-spatially adjacent, so the padded reads of consecutive chunks overlap in the
-page cache instead of walking the whole volume.
+Grouping is chunk-major: a task holds every subject of one chunk before moving
+to the next chunk, in the chunk lattice's lexicographic order. Every subject in
+a chunk is registered against the same template chunk, so a task extracts that
+chunk's template features once and reuses them for all subjects instead of
+once per subject. With anatomix features that is most of a chunk's feature
+cost at four subjects.
 """
 
 from __future__ import annotations
@@ -178,8 +180,8 @@ def build_manifest(
             pad_origin=c.pad_origin,
             pad_shape=c.pad_shape,
         )
-        for s in subs
         for c in chunks
+        for s in subs
     ]
     tasks = tuple(
         TaskPlan(task_id=i, entries=tuple(entries[o : o + per_task]))

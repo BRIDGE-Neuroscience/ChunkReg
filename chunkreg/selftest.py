@@ -17,6 +17,7 @@ import numpy as np
 from scipy import ndimage
 
 from . import fields as _fields
+from . import xp
 from .config import StageSpec
 from .engines import get_engine
 from .features import get_extractor
@@ -26,11 +27,34 @@ __all__ = ["run_selftest"]
 _STAGE = StageSpec(kind="greedy", scales=(4, 2, 1), iterations=(60, 40, 25))
 
 
-def _blob(shape=(48, 48, 48), seed=0) -> np.ndarray:
+def _blob(shape=(48, 48, 48), seed=0):
     rng = np.random.default_rng(seed)
+    if xp.uses_torch():
+        v = _fields.smooth(xp.put(rng.random(shape)), 2.0)
+        v = v - v.min()
+        return v / max(float(v.max()), 1e-8)
     v = ndimage.gaussian_filter(rng.random(shape).astype(np.float32), 2.0)
     v -= v.min()
     return (v / max(v.max(), 1e-8)).astype(np.float32)
+
+
+def _roll(a, shift: int, axis: int):
+    if xp.is_tensor(a):
+        import torch
+
+        return torch.roll(a, shifts=shift, dims=axis)
+    return np.roll(a, shift, axis=axis)
+
+
+def _median(a) -> np.ndarray:
+    """Per-component median of a ``(3, ...)`` block, as host numbers."""
+    if xp.is_tensor(a):
+        flat = a.reshape(a.shape[0], -1).double()
+        # np.median averages the two middle values of an even count.
+        lo = flat.kthvalue((flat.shape[1] + 1) // 2, dim=1).values
+        hi = flat.kthvalue(flat.shape[1] // 2 + 1, dim=1).values
+        return xp.get((lo + hi) / 2)
+    return np.median(np.asarray(a).reshape(a.shape[0], -1), axis=1)
 
 
 def _check(name, got, want, tol, failures, verbose) -> None:
@@ -59,19 +83,19 @@ def run_selftest(
 
     # 1. The engine bridge, with no registration involved.
     shape = (12, 14, 16)
-    ident = _fields.disp_mm_to_grid(np.zeros((3,) + shape, np.float32), spacing_mm)
+    ident = _fields.disp_mm_to_grid(xp.zeros((3,) + shape), spacing_mm)
     back = _fields.grid_to_disp_mm(ident, shape, spacing_mm)
-    _check("bridge identity", float(np.abs(back).max()), 0.0, 1e-3, failures, verbose)
+    _check("bridge identity", float(abs(back).max()), 0.0, 1e-3, failures, verbose)
 
     for axis in range(3):
-        u = np.zeros((3,) + shape, np.float32)
+        u = xp.zeros((3,) + shape)
         u[axis] = 3 * spacing_mm
         rt = _fields.grid_to_disp_mm(
             _fields.disp_mm_to_grid(u, spacing_mm), shape, spacing_mm
         )
         _check(
             f"bridge round trip axis {axis}",
-            float(np.median(rt[axis])),
+            float(_median(rt)[axis]),
             3 * spacing_mm,
             1e-4,
             failures,
@@ -79,23 +103,23 @@ def run_selftest(
         )
 
     # 2. Composition: applying two shifts equals composing them.
-    a = np.zeros((3, 16, 16, 16), np.float32)
+    a = xp.zeros((3, 16, 16, 16))
     a[0] = 0.10
-    b = np.zeros_like(a)
+    b = xp.zeros_like(a)
     b[1] = -0.05
-    comp = _fields.compose(a, b, spacing_mm)
-    _check("compose axis 0", float(np.median(comp[0])), 0.10, 1e-4, failures, verbose)
-    _check("compose axis 1", float(np.median(comp[1])), -0.05, 1e-4, failures, verbose)
+    comp = _median(_fields.compose(a, b, spacing_mm))
+    _check("compose axis 0", float(comp[0]), 0.10, 1e-4, failures, verbose)
+    _check("compose axis 1", float(comp[1]), -0.05, 1e-4, failures, verbose)
 
     # 3. A registration that must recover a known shift on a known axis.
     vol = _blob(seed=1)
     for axis, shift in ((0, 3), (1, -2), (2, 2)):
-        moving = np.roll(vol, shift, axis=axis)
+        moving = _roll(vol, shift, axis)
         res = eng.register(
             ex(vol, spacing_mm), ex(moving, spacing_mm), spacing_mm, [_STAGE]
         )
         inner = (slice(None),) + tuple(slice(12, -12) for _ in range(3))
-        median = np.median(res.disp_mm[inner].reshape(3, -1), axis=1)
+        median = _median(res.disp_mm[inner])
         for d in range(3):
             want = shift * spacing_mm if d == axis else 0.0
             _check(
@@ -115,22 +139,22 @@ def run_selftest(
         features="intensity", r_f=0, k=3, sigma_g=0.5, sigma_w=0.5, scales=(2, 1),
     )
     grid = GridSpec(vol.shape, spacing_mm)
-    moving = np.roll(vol, 2, axis=0)
-    num = np.zeros((3,) + vol.shape, np.float64)
-    den = np.zeros(vol.shape, np.float64)
+    moving = _roll(vol, 2, 0)
+    num = xp.zeros((3,) + tuple(vol.shape), np.float64)
+    den = xp.zeros(tuple(vol.shape), np.float64)
     for chunk in tile(grid, profile):
         sl = chunk.pad_slices()
         res = eng.register(
             ex(vol[sl], spacing_mm), ex(moving[sl], spacing_mm), spacing_mm, [_STAGE]
         )
-        w = window(chunk, grid, profile)
+        w = xp.put(window(chunk, grid, profile))
         num[(slice(None),) + sl] += res.disp_mm * w
         den[sl] += w
-    blended = (num / np.maximum(den, 1e-9)).astype(np.float32)
+    blended = num / xp.clip(den, 1e-9, None)
     inner = (slice(None),) + tuple(slice(12, -12) for _ in range(3))
     _check(
         "tiled and blended recovers the same shift",
-        float(np.median(blended[inner].reshape(3, -1), axis=1)[0]),
+        float(_median(blended[inner])[0]),
         2 * spacing_mm,
         0.6 * spacing_mm,
         failures,

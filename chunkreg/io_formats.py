@@ -54,14 +54,25 @@ class VolumeSource:
     """A 3D volume, indexed in ``(Z, Y, X)`` order, read on demand.
 
     ``spacing_mm`` is what the file itself says the voxel size is, or ``None``
-    when the format does not say or says it without units.
+    when the format does not say or says it without units. It is a single
+    number for isotropic voxels and a ``(z, y, x)`` triple otherwise;
+    :attr:`voxel_mm` always gives the triple.
     """
 
     shape: tuple[int, int, int]
     dtype: np.dtype
-    spacing_mm: float | None
+    spacing_mm: float | tuple[float, float, float] | None
     description: str
     _read: Callable[[tuple], Any]
+
+    @property
+    def voxel_mm(self) -> tuple[float, float, float] | None:
+        """The file's voxel size as ``(z, y, x)`` millimetres, if it states one."""
+        if self.spacing_mm is None:
+            return None
+        if isinstance(self.spacing_mm, (int, float)):
+            return (float(self.spacing_mm),) * 3
+        return tuple(float(v) for v in self.spacing_mm)
 
     def __getitem__(self, key) -> np.ndarray:
         return np.asarray(self._read(key))
@@ -128,8 +139,10 @@ def is_zarr(path) -> bool:
     )
 
 
-def _ome_spacing(multiscale: dict, dataset: dict, axes: list) -> float | None:
-    """Isotropic voxel size in mm from OME-NGFF scale transforms."""
+def _ome_spacing(
+    multiscale: dict, dataset: dict, axes: list
+) -> float | tuple[float, float, float] | None:
+    """Voxel size in mm from OME-NGFF scale transforms, ordered ``(z, y, x)``."""
     scale = [1.0] * len(axes)
     transforms = list(dataset.get("coordinateTransformations") or [])
     transforms += list(multiscale.get("coordinateTransformations") or [])
@@ -140,9 +153,10 @@ def _ome_spacing(multiscale: dict, dataset: dict, axes: list) -> float | None:
             found = True
     if not found:
         return None
-    sizes = []
+    sizes = {}
     for i, ax in enumerate(axes):
-        if not isinstance(ax, dict) or str(ax.get("name", "")).lower() not in _SPATIAL:
+        name = str(ax.get("name", "")).lower() if isinstance(ax, dict) else ""
+        if name not in _SPATIAL:
             continue
         unit = ax.get("unit")
         if unit is None:
@@ -150,16 +164,24 @@ def _ome_spacing(multiscale: dict, dataset: dict, axes: list) -> float | None:
         factor = _UNIT_TO_MM.get(str(unit).lower())
         if factor is None:
             raise ValueError(f"unrecognised OME unit {unit!r} on axis {ax['name']!r}")
-        sizes.append(scale[i] * factor)
+        sizes[name] = scale[i] * factor
     if len(sizes) != 3:
         return None
-    if max(sizes) > min(sizes) * (1 + 1e-3):
-        raise ValueError(
-            f"voxel size is anisotropic ({', '.join(f'{s:g}' for s in sizes)} mm "
-            f"for z, y, x). The pipeline needs isotropic voxels; resample the "
-            f"subject before ingest"
-        )
-    return float(sum(sizes) / 3.0)
+    return _spacing(tuple(sizes[a] for a in _SPATIAL))
+
+
+def _spacing(zyx: Sequence[float]) -> float | tuple[float, float, float]:
+    """One number for isotropic voxels, the ``(z, y, x)`` triple otherwise.
+
+    Anisotropic scans are accepted: ingest resamples every scan onto the run
+    grid, which is isotropic, so the triple is what it needs to do that.
+    """
+    # Seven significant digits is what a float32 header holds; beyond that is
+    # noise that would otherwise leak into the run grid's spacing.
+    v = tuple(float(f"{float(x):.7g}") for x in zyx)
+    if max(v) <= min(v) * (1 + 1e-3):
+        return float(sum(v) / 3.0)
+    return v
 
 
 def _open_zarr(p: Path) -> VolumeSource:
@@ -271,8 +293,9 @@ def _open_nifti(p: Path) -> VolumeSource:
         zooms = [float(z) for z in img.header.get_zooms()[:3]]
         unit = img.header.get_xyzt_units()[0] or "mm"
         factor = _UNIT_TO_MM.get(unit, 1.0) if unit != "unknown" else 1.0
-        if zooms and max(zooms) <= min(zooms) * (1 + 1e-3):
-            spacing = sum(zooms) / 3.0 * factor
+        if len(zooms) == 3 and min(zooms) > 0:
+            # NIfTI zooms are (x, y, z); the pipeline is (z, y, x).
+            spacing = _spacing([z * factor for z in zooms[::-1]])
     except Exception:  # noqa: BLE001 - spacing is advisory; the config can set it
         spacing = None
     return VolumeSource(shape, np.dtype(proxy.dtype), spacing, f"NIfTI {p}", read)
@@ -324,5 +347,8 @@ def write_volume(path, data: np.ndarray, grid: GridSpec | None = None) -> None:
     )
 
 
-def spacing_agrees(a: float, b: float, rel: float = 1e-3) -> bool:
-    return math.isclose(float(a), float(b), rel_tol=rel)
+def spacing_agrees(a, b, rel: float = 1e-3) -> bool:
+    """Do two voxel sizes agree? Each is a number or a ``(z, y, x)`` triple."""
+    ta = (float(a),) * 3 if isinstance(a, (int, float)) else tuple(map(float, a))
+    tb = (float(b),) * 3 if isinstance(b, (int, float)) else tuple(map(float, b))
+    return all(math.isclose(x, y, rel_tol=rel) for x, y in zip(ta, tb))

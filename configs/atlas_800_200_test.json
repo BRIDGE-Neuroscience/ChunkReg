@@ -1,0 +1,85 @@
+{
+  "root": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_800_200_test",
+  "runner": "local",
+  "device": "cuda",
+  "engine": "fireants",
+  "backend": "zarr",
+  "profile": "a16",
+  "gpu_mem_gb": 80,
+
+  "spacing_mm": 0.05,
+  "grid": {"spacing_mm": "finest", "align": "centre"},
+
+  "bytes_per_voxel_channel": 90,
+  "throughput_ch_vox_per_s": 1.5e6,
+
+  "ingest": {
+    "dtype": "auto",
+    "median_radius": null,
+    "percentiles": [0.5, 99.5]
+  },
+
+  "subjects": [
+    {"id": "AUMC_2025_044",
+     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr",
+     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/AUMC_2025_044.zarr"},
+    {"id": "LADAF_2020_27",
+     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr",
+     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2020_27.zarr"},
+    {"id": "LADAF_2021_17",
+     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr",
+     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2021_17.zarr"},
+    {"id": "S_21_46",
+     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr",
+     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/S_21_46.zarr"}
+  ],
+
+  "levels": {
+    "stop_at": "200um",
+    "caps": [1, 1, 1, 1],
+
+    "level0_stages": [
+      "moments",
+      {"rigid":  {"scales": [4, 2, 1], "iterations": [300, 150, 75], "lr": 0.01}},
+      {"affine": {"scales": [4, 2, 1], "iterations": [300, 150, 75], "lr": 0.01}},
+      {"greedy": {"scales": [8, 4, 2, 1], "iterations": [200, 120, 80, 40],
+                  "lr": 0.5, "cc_kernel": 9,
+                  "smooth_grad_sigma": 2.0, "smooth_warp_sigma": 1.0}}
+    ],
+
+    "seeded_stages": [
+      {"greedy": {"scales": [2, 1], "iterations": [80, 50]}}
+    ],
+
+    "level_params": {
+      "1": {"iterations": [120, 80], "lr": 0.5, "cc_kernel": 7,
+            "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0},
+      "2": {"iterations": [100, 60], "lr": 0.5, "cc_kernel": 7,
+            "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0},
+      "3": {"iterations": [80, 50], "lr": 0.4, "cc_kernel": 7,
+            "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0}
+    },
+
+    "stop": {
+      "residual_frac": 0.5,
+      "ubar_vox": 1.0,
+      "percentile": 99.0
+    },
+
+    "shape_update_step": 0.25,
+    "sharpen_laplacian_levels": [0, 1],
+    "min_tissue_fraction": 0.02,
+    "level0_max_disp_frac": 0.25
+  },
+
+  "retry": {
+    "fold_frac": 0.001,
+    "ladder": ["sigma_w_x2", "clamp_x0.5", "emit_seed"]
+  },
+
+  "retention": {
+    "keep_history_levels": [0, 1, 2, 3],
+    "delete_task_arrays": true,
+    "delete_accumulators": true
+  }
+}

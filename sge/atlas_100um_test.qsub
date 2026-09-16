@@ -1,12 +1,11 @@
 #!/bin/bash
 # chunkreg on a Grid Engine cluster (UCL CS), inside chunkreg.sif.
+# 100 um TEST of the atlas cohort, config configs/atlas_100um_test.json. The
+# 50 um scans are pooled to 100 um at ingest (grid.spacing_mm 0.1), so the
+# pyramid ends at 100 um and the stores are an eighth of the 50 um size.
 #
-#   1. build the image once, on a Linux machine:  bash containers/build.sh --help
-#   2. edit SETTINGS below and the resource lines in the #$ block
-#   3. qsub sge/chunkreg.qsub
-#
-# Settings can also be overridden at submit time without editing:
-#   qsub -v STAGES=run,STOP_AT=200um sge/chunkreg.qsub
+#   qsub sge/atlas_100um_test.qsub
+#   qsub -v STOP_AT=200um sge/atlas_100um_test.qsub   # quicker first look
 #
 # Grid Engine has no chunkreg runner, so the whole run happens inside this one
 # job: the config must say "runner": "local". With "device": "cuda" the run
@@ -19,13 +18,13 @@
 # redoing anything.
 
 # ---- Grid Engine resources ------------------------------------------------
-#$ -N chunkreg
+#$ -N chunkreg_atlas_100um_test
 #$ -l h_rt=48:00:00                  # walltime
 #$ -l gpu=true,gpu_type=h100
 #$ -pe gpu 6                         # GPUs; one chunkreg worker on each
 #$ -l tmem=48G                       # PER SLOT: multiplied by the slot count above.
 #$ -R y
-#$ -o /SAN/CHANGE_ME/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
+#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
 #$ -S /bin/bash
 #$ -cwd
 #$ -j y
@@ -34,12 +33,12 @@ set -euo pipefail
 
 # ---- SETTINGS -------------------------------------------------------------
 # The image built by containers/build.sh. Keep it on shared storage.
-SIF="${SIF:-/SAN/CHANGE_ME/images/chunkreg.sif}"
+SIF="${SIF:-/home/akeenlys/storage_main/images/chunkreg.sif}"
 # The run config. Its root and every subject source must be under BINDS.
-CONFIG="${CONFIG:-/SAN/CHANGE_ME/chunkreg/run.json}"
+CONFIG="${CONFIG:-/home/akeenlys/storage_main/bridge_project_data/chunkreg/configs/atlas_100um_test.json}"
 # Host directories visible inside the container, comma separated. $HOME and
 # the submit directory are bound automatically.
-BINDS="${BINDS:-/SAN/CHANGE_ME}"
+BINDS="${BINDS:-/home/akeenlys/storage_main}"
 # Which commands to run, in order: any of setup, run, status.
 STAGES="${STAGES:-setup run status}"
 # The finest level to run: a spacing such as 200um or a level index. Empty runs

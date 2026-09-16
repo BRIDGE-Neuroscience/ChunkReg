@@ -32,7 +32,14 @@ from typing import Literal, Sequence
 import numpy as np
 from scipy import ndimage
 
+from . import xp as _xp
 from .grid import GridSpec
+
+
+def _gpu():
+    from . import gpu_ops
+
+    return gpu_ops
 
 __all__ = [
     "identity",
@@ -51,6 +58,8 @@ __all__ = [
     "percentile_magnitude",
     "grid_to_disp_mm",
     "disp_mm_to_grid",
+    "pool_field",
+    "smooth",
     "DISP_DTYPE",
 ]
 
@@ -75,12 +84,16 @@ def identity(shape: Sequence[int]) -> np.ndarray:
 
 def magnitude(disp_mm: np.ndarray) -> np.ndarray:
     """Per-voxel displacement magnitude in millimetres, shape ``(Z, Y, X)``."""
+    if _xp.is_tensor(disp_mm):
+        return _gpu().magnitude(disp_mm)
     d = np.asarray(disp_mm, dtype=np.float32)
     return np.sqrt(np.sum(d * d, axis=0, dtype=np.float32))
 
 
 def percentile_magnitude(disp_mm: np.ndarray, q: float = 99.9) -> float:
     """A percentile of displacement magnitude, the ``d99`` of the stopping rule."""
+    if _xp.is_tensor(disp_mm):
+        return _gpu().percentile(_gpu().magnitude(disp_mm), q)
     return float(np.percentile(magnitude(disp_mm), q))
 
 
@@ -97,6 +110,8 @@ def warp(
     ``cval``, so a subject that does not cover the template's field of view
     contributes zero rather than a wrapped or clamped intensity.
     """
+    if _xp.is_tensor(image):
+        return _gpu().warp(image, disp_mm, spacing_mm, order, cval)
     img = _as_f32(image)
     u = _as_f32(disp_mm)
     if u.shape[0] != 3 or u.shape[1:] != img.shape:
@@ -121,6 +136,8 @@ def warp_stack(
     The sampling coordinates depend only on the field, so they are built once
     and reused across channels rather than rebuilt per channel.
     """
+    if _xp.is_tensor(stack):
+        return _gpu().warp_stack(stack, disp_mm, spacing_mm, order, cval)
     a = _as_f32(stack)
     u = _as_f32(disp_mm)
     if a.ndim != 4:
@@ -161,6 +178,8 @@ def warp_offset(
     chunk, is what keeps the pre-warp exact instead of fading to zero at the
     chunk edge.
     """
+    if _xp.is_tensor(source):
+        return _gpu().warp_offset(source, offset, disp_mm, spacing_mm, cval, order)
     src = _as_f32(source)
     u = _as_f32(disp_mm)
     shape = tuple(u.shape[1:])
@@ -174,6 +193,8 @@ def warp_offset(
 def required_margin(disp_mm: np.ndarray, spacing_mm: float, extra: int = 2) -> int:
     """Voxels of source margin needed to warp through this field without
     sampling outside the block that was read."""
+    if _xp.is_tensor(disp_mm):
+        return _gpu().required_margin(disp_mm, spacing_mm, extra)
     if disp_mm.size == 0:
         return extra
     peak = float(np.max(np.abs(np.asarray(disp_mm, dtype=np.float32))))
@@ -194,6 +215,8 @@ def compose(inner: np.ndarray, outer: np.ndarray, spacing_mm: float) -> np.ndarr
     engine solves a residual in that frame, giving
     ``compose(inner=residual, outer=seed)``.
     """
+    if _xp.is_tensor(inner):
+        return _gpu().compose(inner, _xp.put(outer), spacing_mm)
     ui = _as_f32(inner)
     uo = _as_f32(outer)
     if ui.shape != uo.shape:
@@ -218,6 +241,8 @@ def clamp(disp_mm: np.ndarray, max_mm: float | None) -> np.ndarray:
     physically cannot move a feature further than its halo allows. ``None`` or
     a non-positive limit disables the clamp.
     """
+    if _xp.is_tensor(disp_mm):
+        return _gpu().clamp(disp_mm, max_mm)
     u = _as_f32(disp_mm)
     if max_mm is None or max_mm <= 0:
         return u
@@ -266,6 +291,8 @@ def resample_scalar(
     cval: float = 0.0,
 ) -> np.ndarray:
     """Resample a scalar volume between grids that share a world frame."""
+    if _xp.is_tensor(image):
+        return _gpu().resample(image, src_grid, dst_grid, cval)
     return _sample_on(image, src_grid, dst_grid, _FIELD_MODE, order, cval)
 
 
@@ -281,6 +308,8 @@ def resample_field(
     exactly what makes promoting a seed from one pyramid level to the next
     exact rather than approximate.
     """
+    if _xp.is_tensor(disp_mm):
+        return _gpu().resample_field(disp_mm, src_grid, dst_grid)
     u = _as_f32(disp_mm)
     # One coordinate array for all three components: the lattice change is the
     # same for each, and this is the hottest resample in the pipeline.
@@ -316,6 +345,8 @@ def jacobian_determinant(disp_mm: np.ndarray, spacing_mm: float) -> np.ndarray:
     diffeomorphism. Central differences are used inside and one-sided at the
     boundary, so the result is defined everywhere.
     """
+    if _xp.is_tensor(disp_mm):
+        return _gpu().jacobian_determinant(disp_mm, spacing_mm)
     u = _as_f32(disp_mm)
     s = float(spacing_mm)
     # grad[d][e] = d u_d / d x_e, with x in millimetres.
@@ -336,6 +367,8 @@ def jacobian_determinant(disp_mm: np.ndarray, spacing_mm: float) -> np.ndarray:
 
 def fold_fraction(disp_mm: np.ndarray, spacing_mm: float) -> float:
     """Fraction of voxels where the map folds. A QC gate and a retry trigger."""
+    if _xp.is_tensor(disp_mm):
+        return _gpu().fold_fraction(disp_mm, spacing_mm)
     det = jacobian_determinant(disp_mm, spacing_mm)
     return float(np.mean(det <= 0.0))
 
@@ -357,6 +390,8 @@ def grid_to_disp_mm(
     Both the ``[-1, 1]`` normalisation and the reversed component order are
     undone here, so everything downstream sees millimetres in axis order.
     """
+    if _xp.is_tensor(grid_norm):
+        return _gpu().grid_to_disp_mm(grid_norm, shape, spacing_mm)
     g = np.asarray(grid_norm, dtype=np.float32)
     if g.ndim == 5:
         if g.shape[0] != 1:
@@ -381,6 +416,8 @@ def disp_mm_to_grid(disp_mm: np.ndarray, spacing_mm: float) -> np.ndarray:
 
     Used to hand a seed back to an engine that wants an initial sampling grid.
     """
+    if _xp.is_tensor(disp_mm):
+        return _gpu().disp_mm_to_grid(disp_mm, spacing_mm)
     u = _as_f32(disp_mm)
     shape = u.shape[1:]
     vox = identity(shape) + u / np.float32(spacing_mm)
@@ -389,3 +426,48 @@ def disp_mm_to_grid(disp_mm: np.ndarray, spacing_mm: float) -> np.ndarray:
         n = max(shape[d] - 1, 1)
         g[..., 2 - d] = vox[d] / n * 2.0 - 1.0
     return g[None]
+
+
+def pool_field(u, factor: int, target: Sequence[int] | None = None):
+    """Mean-pool a ``(C, Z, Y, X)`` block onto a lattice ``factor`` times coarser.
+
+    A ragged end is edge-padded to a whole lattice voxel. ``target`` fixes the
+    lattice extent, cropping or edge-padding the block to fit it first, which is
+    what a padded chunk stored on its lattice box needs.
+    """
+    if _xp.is_tensor(u):
+        return _gpu().pool_field(u, factor, target)
+    a = np.asarray(u, dtype=np.float32)
+    f = int(factor)
+    if target is not None:
+        need = tuple(int(n) * f for n in target)
+        grow = [(0, 0)] * (a.ndim - 3) + [
+            (0, max(0, n - s)) for n, s in zip(need, a.shape[-3:])
+        ]
+        if any(g[1] for g in grow):
+            a = np.pad(a, grow, mode="edge")
+        a = a[..., : need[0], : need[1], : need[2]]
+    if f == 1:
+        return a
+    extra = [(-int(n)) % f for n in a.shape[-3:]]
+    if any(extra):
+        a = np.pad(a, [(0, 0)] * (a.ndim - 3) + [(0, e) for e in extra], mode="edge")
+    n = [int(x) // f for x in a.shape[-3:]]
+    lead = a.shape[:-3]
+    return a.reshape(lead + (n[0], f, n[1], f, n[2], f)).mean(axis=(-5, -3, -1))
+
+
+def smooth(a, sigma: float, mode: str = "nearest"):
+    """Gaussian smoothing over the spatial axes, channel by channel.
+
+    ``a`` is ``(Z, Y, X)`` or ``(C, Z, Y, X)``. Each component of a field is
+    smoothed on its own, never across components.
+    """
+    if _xp.is_tensor(a):
+        return _gpu().gaussian(a, sigma, mode)
+    x = np.asarray(a, dtype=np.float32)
+    if x.ndim == 3:
+        return ndimage.gaussian_filter(x, sigma, mode=mode).astype(np.float32, copy=False)
+    return np.stack(
+        [ndimage.gaussian_filter(x[c], sigma, mode=mode) for c in range(x.shape[0])]
+    ).astype(np.float32, copy=False)

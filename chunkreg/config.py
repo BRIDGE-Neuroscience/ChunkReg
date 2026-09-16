@@ -16,7 +16,9 @@ run.
 from __future__ import annotations
 
 import dataclasses
+import math
 import json
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -33,11 +35,13 @@ __all__ = [
     "Resources",
     "SlurmConfig",
     "SubjectSpec",
+    "GridRequest",
     "RunConfig",
     "PROFILES",
     "get_profile",
     "load_config",
     "unused_level_overrides",
+    "skipped_level_overrides",
     "ConfigError",
 ]
 
@@ -268,6 +272,48 @@ class LevelPolicy:
     carry the global shape. Only :data:`TUNABLE_STAGE_FIELDS` may be set, and
     the patch reaches every non-moments stage of that level."""
 
+    run: tuple[int | float, ...] | str | None = None
+    """Which levels to run. ``None`` or ``"all"`` runs every level.
+
+    A tuple names levels: an ``int`` is a level index and a ``float`` is a
+    spacing in millimetres, matched against the pyramid when it is known.
+    ``"listed"`` runs level 0 plus every level named in ``level_params`` or
+    ``level_stages``. Leaving out the finest levels stops the run early;
+    leaving out a middle level hands the solution straight to the next level
+    that does run. Level 0 always has to run, because the global alignment is
+    estimated there and nothing finer can recover it."""
+
+    stop_at: int | float | None = None
+    """The finest level to run, as a level index or a spacing in millimetres.
+
+    Early stopping without listing every level: ``"200um"`` runs every level
+    ``run`` selects down to 200 um and stops there, writing the final fields
+    at that resolution. A later run with a finer ``stop_at`` carries on from
+    where this one stopped."""
+
+    def run_levels(self, grids: Sequence[GridSpec]) -> tuple[int, ...]:
+        """Resolve ``run`` and ``stop_at`` against a pyramid into level indices."""
+        source = "levels.run"
+        if self.run is None or self.run == "all":
+            chosen = set(range(len(grids)))
+        else:
+            entries: tuple = tuple(self.run)
+            if self.run == "listed":
+                entries = (0, *self.tuned_levels())
+                source = "levels.run 'listed' (level 0 plus the tuned levels)"
+            chosen = {_find_level(grids, e, source) for e in entries}
+        if self.stop_at is not None:
+            last = _find_level(grids, self.stop_at, "levels.stop_at")
+            chosen = {k for k in chosen if k <= last}
+        if 0 not in chosen:
+            raise ConfigError(
+                f"{source} leaves out level 0 ({grids[0].spacing_mm * 1000:g} um). "
+                f"Level 0 is where the whole-volume alignment is estimated, so "
+                f"every run starts there. A run that stopped part way resumes "
+                f"on its own when started again."
+            )
+        return tuple(sorted(chosen))
+
     def cap(self, level: int) -> int:
         if not self.caps:
             return 1
@@ -360,6 +406,22 @@ class SubjectSpec:
     Present so that ingest is part of the run configuration rather than a
     hand-typed command per subject: ``chunkreg setup`` ingests every subject
     that names a source and has no store yet."""
+    spacing_mm: tuple[float, float, float] | None = None
+    """This scan's voxel size as ``(z, y, x)`` millimetres, for a source that
+    does not state one or states it wrongly. Overrides the top-level
+    ``spacing_mm`` for this subject."""
+
+
+@dataclass(frozen=True)
+class GridRequest:
+    """How the run grid is chosen. See :mod:`chunkreg.cohort`."""
+
+    spacing_mm: float | str = "finest"
+    """The finest level's spacing: a number, ``finest`` or ``coarsest``."""
+    shape: tuple[int, int, int] | None = None
+    """The run grid's shape. ``None`` fits every scan."""
+    align: str = "centre"
+    """``centre`` or ``corner``: how each scan is placed on the grid."""
 
 
 @dataclass(frozen=True)
@@ -385,6 +447,9 @@ class RunConfig:
     profile: Profile
     profile_name: str = "a16"
     spacing_mm: float | None = None
+    """Voxel size of any source that does not state its own. Individual
+    subjects can override it; the run grid itself is set by ``grid``."""
+    grid: GridRequest = GridRequest()
     runner: Literal["local", "slurm"] = "local"
     backend: Literal["zarr", "memory"] = "zarr"
     levels: LevelPolicy = LevelPolicy()
@@ -409,6 +474,23 @@ class RunConfig:
     """Also measured during ``setup``. The default is a placeholder equal to a
     576-cubed single-channel chunk in 60 seconds."""
     seed: int = 0
+    device: str = "auto"
+    """Where the arithmetic runs. ``cuda`` (or ``cuda:N``) keeps every pass on
+    the GPU and refuses to start without one; ``cpu`` runs the NumPy reference
+    path; ``auto`` picks ``cuda`` when a GPU is visible. ``torch-cpu`` runs the
+    GPU code on the CPU and exists for testing."""
+    engine: str = "auto"
+    """Registration engine. ``auto`` is FireANTs on a GPU device and the demons
+    reference on the CPU."""
+    gpus: int | str = "all"
+    """How many GPUs a local run uses at once, one worker process each.
+    ``all`` uses every GPU the job can see."""
+
+    def engine_for(self, device: str) -> str:
+        """The engine to use once the device is known."""
+        if self.engine != "auto":
+            return self.engine
+        return "fireants" if str(device).startswith("cuda") else "demons"
 
     # -- paths -------------------------------------------------------------- #
     @property
@@ -444,6 +526,20 @@ class RunConfig:
         that a pass completed. This record is durable and small.
         """
         return self.level_dir(level) / f"pass_it{iteration}.json"
+
+    def seed_marker_path(self, level: int) -> Path:
+        """Written once a level has its starting template and fields.
+
+        Seeding level 0 and promoting into a finer level both overwrite the
+        level's fields, so a resumed run must never do either twice. This is
+        how it knows.
+        """
+        return self.level_dir(level) / "seeded.json"
+
+    @property
+    def grid_record_path(self) -> Path:
+        """The run grid and each scan's placement on it, written at ingest."""
+        return self.root_path / "grid.json"
 
     def scratch_dir(self, level: int, iteration: int) -> Path:
         return self.root_path / "scratch" / f"L{level}_it{iteration}"
@@ -524,6 +620,52 @@ class RunConfig:
                         f"{p.halo - p.support_vox(s.s_max) - p.r_f:.1f} "
                         f"voxels) or lower the stage scales."
                     )
+                if not s.is_deformable:
+                    continue
+                # The halo is budgeted from the profile's kernel and sigmas. A
+                # stage that asks for a wider kernel or more smoothing reaches
+                # further than that budget, and the clamp, which is computed
+                # from the profile, then promises more displacement than the
+                # halo can really support.
+                need = s.s_max * (
+                    (s.cc_kernel - 1) / 2.0
+                    + 3.0 * max(s.smooth_grad_sigma, s.smooth_warp_sigma)
+                )
+                budget = p.support_vox()
+                if need > budget + 1e-9:
+                    left = p.halo - need - p.r_f
+                    msg = (
+                        f"level {level}: stage {s.kind!r} (cc_kernel "
+                        f"{s.cc_kernel}, sigmas {s.smooth_grad_sigma:g}/"
+                        f"{s.smooth_warp_sigma:g}, scales up to {s.s_max}) needs "
+                        f"{need:.1f} voxels of halo for its kernel and smoothing, "
+                        f"but the profile budgets {budget:.1f}. The clamp of "
+                        f"{p.d_max_vox():.1f} voxels is overstated; only about "
+                        f"{left:.1f} are really covered. Lower the kernel or "
+                        f"sigmas, or raise the profile's k, sigma_g, sigma_w and "
+                        f"halo to match."
+                    )
+                    if left < MIN_D_MAX_VOX:
+                        raise ConfigError(msg)
+                    warnings.append(msg)
+
+        run = self.levels.run
+        if isinstance(run, str) and run not in ("all", "listed"):
+            raise ConfigError(
+                f"levels.run must be 'all', 'listed' or a list of levels, got {run!r}"
+            )
+        if isinstance(run, tuple):
+            if not run:
+                raise ConfigError("levels.run is empty; leave it out to run every level")
+            if any(isinstance(e, int) and e < 0 for e in run):
+                raise ConfigError(f"levels.run has a negative level: {list(run)}")
+            if all(isinstance(e, int) for e in run) and 0 not in run:
+                raise ConfigError(
+                    f"levels.run {list(run)} leaves out level 0. Level 0 is where "
+                    f"the whole-volume alignment is estimated, so every run "
+                    f"starts there. A run that stopped part way resumes on its "
+                    f"own when started again."
+                )
 
         for level, spec in sorted(self.levels.level_stages.items()):
             if level < 0:
@@ -591,6 +733,44 @@ class RunConfig:
             )
         if self.spacing_mm is not None and self.spacing_mm <= 0:
             raise ConfigError(f"spacing_mm must be positive, got {self.spacing_mm}")
+        g = self.grid
+        if isinstance(g.spacing_mm, str):
+            if g.spacing_mm not in ("finest", "coarsest"):
+                raise ConfigError(
+                    f"grid.spacing_mm must be a number, 'finest' or 'coarsest', "
+                    f"got {g.spacing_mm!r}"
+                )
+        elif not g.spacing_mm > 0:
+            raise ConfigError(f"grid.spacing_mm must be positive, got {g.spacing_mm}")
+        if g.shape is not None and (len(g.shape) != 3 or min(g.shape) < 1):
+            raise ConfigError(f"grid.shape must be three positive integers, got {g.shape}")
+        if g.align not in ("centre", "corner"):
+            raise ConfigError(f"grid.align must be 'centre' or 'corner', got {g.align!r}")
+        if isinstance(self.levels.stop_at, int) and self.levels.stop_at < 0:
+            raise ConfigError(f"levels.stop_at is negative: {self.levels.stop_at}")
+
+        dev = str(self.device).lower()
+        if dev not in ("auto", "cpu", "cuda", "torch-cpu") and not (
+            dev.startswith("cuda:") and dev[5:].isdigit()
+        ):
+            raise ConfigError(
+                f"device must be 'auto', 'cuda', 'cuda:N', 'cpu' or 'torch-cpu', "
+                f"got {self.device!r}"
+            )
+        from .engines import _REGISTRY as _ENGINES
+
+        if self.engine != "auto" and self.engine not in _ENGINES:
+            raise ConfigError(
+                f"unknown engine {self.engine!r}; use 'auto' or one of "
+                f"{sorted(_ENGINES)}"
+            )
+        if dev.startswith("cuda") and self.engine == "demons":
+            raise ConfigError(
+                "engine 'demons' is the CPU reference and cannot run on a GPU "
+                "device; use 'fireants' or leave engine as 'auto'"
+            )
+        if not (self.gpus == "all" or (isinstance(self.gpus, int) and self.gpus >= 1)):
+            raise ConfigError(f"gpus must be 'all' or a positive integer, got {self.gpus!r}")
 
         return warnings
 
@@ -615,6 +795,11 @@ class RunConfig:
 
         blob = json.dumps(self.to_json(), sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def skipped_level_overrides(cfg: "RunConfig", run_levels: Sequence[int]) -> list[int]:
+    """Per-level keys for levels that exist but ``levels.run`` leaves out."""
+    return [k for k in cfg.levels.tuned_levels() if k not in set(run_levels)]
 
 
 def unused_level_overrides(cfg: "RunConfig", n_levels: int) -> list[int]:
@@ -652,6 +837,85 @@ def _level_key(key, what: str) -> int:
     if level < 0:
         raise ConfigError(f"{what} has a negative level {level}")
     return level
+
+
+_SPACING_UNITS = {"um": 1e-3, "µm": 1e-3, "micron": 1e-3, "microns": 1e-3, "mm": 1.0}
+_SPACING_RE = re.compile(r"^([0-9]*\.?[0-9]+(?:e-?[0-9]+)?)\s*(um|µm|microns?|mm)$")
+
+
+def parse_level_ref(e, where: str = "levels.run") -> int | float:
+    """Read one level reference: an index (``2``) or a spacing (``"200um"``).
+
+    A spacing comes back as millimetres in a ``float``, an index as an
+    ``int``. A bare decimal is refused: ``0.2`` could be a spacing or a typo for
+    a level, and guessing wrong silently runs the wrong resolution.
+    """
+    if isinstance(e, bool):
+        raise ConfigError(f"{where} entry {e!r} is not a level")
+    if isinstance(e, int):
+        return int(e)
+    if isinstance(e, float):
+        if e.is_integer():
+            return int(e)
+        raise ConfigError(
+            f"{where} entry {e!r} is ambiguous; write a level index such "
+            f"as 2, or a spacing with its unit such as \"200um\""
+        )
+    if isinstance(e, str):
+        text = e.strip().lower()
+        if text.isdigit():
+            return int(text)
+        m = _SPACING_RE.match(text)
+        if m and float(m.group(1)) > 0:
+            return float(m.group(1)) * _SPACING_UNITS[m.group(2)]
+        raise ConfigError(
+            f"{where} entry {e!r} is not a level; use an index such "
+            f"as 2 or a spacing such as \"200um\" or \"0.2mm\""
+        )
+    raise ConfigError(f"{where} entry {e!r} is not a level")
+
+
+def _find_level(grids: Sequence[GridSpec], ref: int | float, where: str) -> int:
+    """The pyramid index a level reference names."""
+    ladder = ", ".join(f"{k} = {g.spacing_mm * 1000:g} um" for k, g in enumerate(grids))
+    if isinstance(ref, float):
+        for k, g in enumerate(grids):
+            if math.isclose(g.spacing_mm, ref, rel_tol=1e-3):
+                return k
+        raise ConfigError(
+            f"{where} asks for {ref * 1000:g} um, but this pyramid has levels {ladder}"
+        )
+    k = int(ref)
+    if not 0 <= k < len(grids):
+        raise ConfigError(
+            f"{where} names level {k}, but this pyramid only has levels {ladder}"
+        )
+    return k
+
+
+def _run_spec(obj) -> tuple[int | float, ...] | str | None:
+    """Read ``levels.run``: ``"all"``, ``"listed"``, or a list of levels."""
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        if obj not in ("all", "listed"):
+            raise ConfigError(
+                f"levels.run must be 'all', 'listed' or a list of levels, got {obj!r}"
+            )
+        return obj
+    if not isinstance(obj, (list, tuple)):
+        raise ConfigError(f"levels.run must be a list of levels, got {obj!r}")
+    return tuple(parse_level_ref(e) for e in obj)
+
+
+def _voxel(value, where: str) -> tuple[float, float, float] | None:
+    """A voxel size from a number or a ``[z, y, x]`` list."""
+    from .cohort import as_voxel_mm
+
+    try:
+        return as_voxel_mm(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where}: {exc}") from None
 
 
 def _check_keys(obj: dict, allowed: set[str], where: str) -> None:
@@ -699,7 +963,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         "root", "subjects", "profile", "profile_overrides", "spacing_mm", "grid",
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
-        "backbone", "ingest", "template_subject",
+        "backbone", "ingest", "template_subject", "device", "engine", "gpus",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -743,7 +1007,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
             raise ConfigError(
                 f"each subject must be a mapping with an 'id', got {entry!r}"
             )
-        _check_keys(entry, {"id", "path", "source"}, f"subject {entry.get('id')!r}")
+        _check_keys(
+            entry, {"id", "path", "source", "spacing_mm"}, f"subject {entry.get('id')!r}"
+        )
         sid = str(entry["id"])
         src = entry.get("source")
         subjects.append(
@@ -751,6 +1017,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
                 id=sid,
                 path=str(entry.get("path") or f"subjects/{sid}.zarr"),
                 source=None if src is None else str(src),
+                spacing_mm=_voxel(entry.get("spacing_mm"), f"subject {sid!r} spacing_mm"),
             )
         )
     subjects = tuple(subjects)
@@ -762,7 +1029,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         {
             "caps", "level0_stages", "seeded_stages", "level_stages",
             "level_params", "shape_update_step", "sharpen_laplacian_levels",
-            "min_tissue_fraction", "level0_max_disp_frac",
+            "min_tissue_fraction", "level0_max_disp_frac", "run", "stop_at",
         },
         "the 'levels' block",
     )
@@ -803,6 +1070,11 @@ def load_config(source: str | Path | dict) -> RunConfig:
         ),
         level_stages=level_stages,
         level_params=level_params,
+        run=_run_spec(lv.get("run")),
+        stop_at=(
+            None if lv.get("stop_at") is None
+            else parse_level_ref(lv["stop_at"], "levels.stop_at")
+        ),
     )
 
     ing = dict(raw.get("ingest") or {})
@@ -858,9 +1130,17 @@ def load_config(source: str | Path | dict) -> RunConfig:
         update=res("update", SlurmConfig.update),
     )
 
+    gr = dict(raw.get("grid") or {})
+    _check_keys(gr, {"spacing_mm", "shape", "align"}, "the 'grid' block")
+    grid_spacing = gr.get("spacing_mm", GridRequest.spacing_mm)
+    if not isinstance(grid_spacing, str):
+        grid_spacing = float(grid_spacing)
+    grid = GridRequest(
+        spacing_mm=grid_spacing,
+        shape=None if gr.get("shape") is None else tuple(int(n) for n in gr["shape"]),
+        align=str(gr.get("align", GridRequest.align)),
+    )
     spacing = raw.get("spacing_mm")
-    if spacing is None:
-        spacing = (raw.get("grid") or {}).get("spacing_mm")
 
     cfg = RunConfig(
         root=str(raw.get("root", ".")),
@@ -868,6 +1148,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         profile=profile,
         profile_name=profile_name,
         spacing_mm=None if spacing is None else float(spacing),
+        grid=grid,
         template_subject=(
             None if raw.get("template_subject") is None
             else str(raw["template_subject"])
@@ -883,6 +1164,23 @@ def load_config(source: str | Path | dict) -> RunConfig:
         bytes_per_voxel_channel=float(raw.get("bytes_per_voxel_channel", 90.0)),
         throughput_ch_vox_per_s=float(raw.get("throughput_ch_vox_per_s", 1.5e6)),
         seed=int(raw.get("seed", 0)),
+        device=str(raw.get("device", "auto")),
+        engine=str(raw.get("engine", "auto")),
+        gpus=_gpus(raw.get("gpus", "all")),
     )
     cfg.validate()
     return cfg
+
+
+def _gpus(value) -> int | str:
+    if value == "all":
+        return "all"
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError(f"gpus must be 'all' or a positive integer, got {value!r}")
+    try:
+        n = int(value)
+    except ValueError:
+        raise ConfigError(f"gpus must be 'all' or a positive integer, got {value!r}") from None
+    if n < 1:
+        raise ConfigError(f"gpus must be 'all' or a positive integer, got {value!r}")
+    return n

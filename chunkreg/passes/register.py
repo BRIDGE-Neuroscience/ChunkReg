@@ -26,6 +26,7 @@ import numpy as np
 
 from .. import fields as _fields
 from .. import stats as _stats
+from .. import xp as _xp
 from ..config import RunConfig
 from ..engines import get_engine
 from ..features import get_extractor
@@ -51,7 +52,7 @@ def _seed_block(
     level = manifest.level
     path = cfg.field_path(level, entry.subject)
     if not Field.exists(path, cfg.backend):
-        return np.zeros((3,) + tuple(shape), dtype=np.float32)
+        return _xp.zeros((3,) + tuple(shape))
     seed = Field.open(path, cfg.backend).read_dense(entry.pad_origin, shape)
 
     recentre = cfg.recentre_path(level)
@@ -70,8 +71,15 @@ def register_chunk(
     engine,
     extractor,
     seed: np.ndarray | None = None,
+    fixed_cache: dict | None = None,
 ) -> dict[str, Any]:
-    """Solve one chunk. Returns the total field and a QC record."""
+    """Solve one chunk. Returns the total field and a QC record.
+
+    ``fixed_cache`` carries the template chunk's tissue fraction and features
+    between calls. Every subject of a chunk registers against the same
+    template chunk, so a task that holds several subjects of one chunk
+    extracts those features once. Only the most recent chunk is kept.
+    """
     level = manifest.level
     spacing = manifest.grid.spacing_mm
     shape = tuple(entry.pad_shape)
@@ -80,12 +88,26 @@ def register_chunk(
     if seed is None:
         seed = _seed_block(cfg, manifest, entry, shape)
 
-    fixed_img = template.read_padded(0, entry.pad_origin, shape, normalise=True)
+    key = (entry.chunk_id, tuple(entry.pad_origin), shape)
+    cached = None if fixed_cache is None else fixed_cache.get(key)
+    if cached is None:
+        fixed_img = template.read_padded(0, entry.pad_origin, shape, normalise=True)
+        frac = tissue_fraction(fixed_img)
+        fixed = (
+            extractor(fixed_img, spacing)
+            if frac >= cfg.levels.min_tissue_fraction
+            else None
+        )
+        del fixed_img
+        cached = (frac, fixed)
+        if fixed_cache is not None:
+            fixed_cache.clear()  # one chunk's features at a time
+            fixed_cache[key] = cached
+    frac, fixed = cached
 
-    frac = tissue_fraction(fixed_img)
     if frac < cfg.levels.min_tissue_fraction:
         return {
-            "field": seed.astype(np.float32, copy=False),
+            "field": _xp.to_float32(seed),
             "skipped": True,
             "reason": "tissue",
             "tissue_fraction": frac,
@@ -99,8 +121,8 @@ def register_chunk(
         subject, level, entry.pad_origin, shape, seed, spacing, normalise=True
     )
 
-    fixed = extractor(fixed_img, spacing)
     moving = extractor(moving_img, spacing)
+    del moving_img
 
     d_max = manifest.d_max_mm
     retries = 0
@@ -123,7 +145,7 @@ def register_chunk(
             limit = None if d_max is None else d_max * 0.5
         elif step == "emit_seed":
             return {
-                "field": seed.astype(np.float32, copy=False),
+                "field": _xp.to_float32(seed),
                 "skipped": True,
                 "reason": "folds",
                 "tissue_fraction": frac,
@@ -175,10 +197,22 @@ def run_register_task(
     path = cfg.task_path(manifest.level, manifest.iteration, task_id)
 
     if TaskArray.is_complete(path, cfg.backend):
-        return {"task_id": task_id, "skipped": True, "entries": len(plan)}
+        # The records are what the level's stopping rule reads, so a task
+        # finished before a restart still has to report them.
+        done = TaskArray.open(path, cfg.backend)
+        # Only if it holds this task's entries: a task array written under a
+        # manifest that grouped the work differently has the same path but
+        # different contents, and taking it as done would lose that work.
+        if [e.to_json() for e in done.entries] == [e.to_json() for e in plan.entries]:
+            return {
+                "task_id": task_id,
+                "skipped": True,
+                "entries": len(plan),
+                "records": done.meta.get("records") or [],
+            }
 
     t0 = time.perf_counter()
-    engine = engine or get_engine("demons")
+    engine = engine or get_engine(cfg.engine_for(_xp.device_name()))
     extractor = extractor or get_extractor(cfg.profile.features)
     extractor.setup()
 
@@ -195,6 +229,7 @@ def run_register_task(
     )
 
     records = []
+    fixed_cache: dict = {}
     for i, entry in enumerate(plan.entries):
         if entry.subject not in subjects:
             subjects[entry.subject] = Volume.open(
@@ -208,6 +243,7 @@ def run_register_task(
             subjects[entry.subject],
             engine,
             extractor,
+            fixed_cache=fixed_cache,
         )
         lat_origin, lat_shape = entry.lattice(cfg.profile.lattice_factor)
         array.write(i, _to_lattice(rec.pop("field"), lat_shape, cfg.profile.lattice_factor))
@@ -224,15 +260,6 @@ def run_register_task(
     }
 
 
-def _to_lattice(u: np.ndarray, lat_shape, factor: int) -> np.ndarray:
+def _to_lattice(u, lat_shape, factor: int):
     """Mean-pool a level-resolution field onto its storage lattice."""
-    a = np.asarray(u, dtype=np.float32)
-    target = tuple(int(n) for n in lat_shape)
-    need = tuple(n * factor for n in target)
-    pad = [(0, 0)] + [(0, max(0, n - s)) for n, s in zip(need, a.shape[1:])]
-    if any(p[1] for p in pad):
-        a = np.pad(a, pad, mode="edge")
-    a = a[:, : need[0], : need[1], : need[2]]
-    return a.reshape(
-        3, target[0], factor, target[1], factor, target[2], factor
-    ).mean(axis=(2, 4, 6))
+    return _fields.pool_field(u, factor, tuple(int(n) for n in lat_shape))

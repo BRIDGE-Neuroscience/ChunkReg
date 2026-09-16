@@ -30,6 +30,7 @@ import numpy as np
 from scipy import ndimage
 
 from .. import fields as _fields
+from .. import xp as _xp
 from .base import RegResult, check_inputs, check_stages
 
 __all__ = ["DemonsEngine"]
@@ -82,6 +83,20 @@ class DemonsEngine:
         init_affine: np.ndarray | None = None,
         device: str | None = None,
     ) -> RegResult:
+        if _xp.on_gpu():
+            raise RuntimeError(
+                "the demons engine is the CPU reference and does not run on a "
+                "GPU device; use engine 'fireants' (or set device to 'cpu' to "
+                "run the reference path deliberately)"
+            )
+        if _xp.is_tensor(fixed) or _xp.is_tensor(moving):
+            # Only reachable on the 'torch-cpu' test device: run the NumPy
+            # reference and hand the answer back as a tensor.
+            result = self.register(
+                _xp.get(fixed), _xp.get(moving), spacing_mm, stages, init_affine
+            )
+            result.disp_mm = _xp.put(result.disp_mm)
+            return result
         f, m = check_inputs(fixed, moving)
         check_stages(stages, self.supports, self.name)
         if init_affine is not None:

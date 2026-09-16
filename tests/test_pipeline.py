@@ -320,6 +320,11 @@ def test_parallel_workers_give_the_same_answer(cohort, small_profile):
 
     _backend.get_backend("memory").clear()
     _backend._MEM_JSON.clear()
+    # Pass records and seed markers are real files, and a run that finds them
+    # resumes instead of starting over; this comparison needs a fresh run.
+    import shutil
+
+    shutil.rmtree(cfg.root_path / "levels")
     truth_vol, warps = cohort  # re-ingest into the cleared store
     for sid, w in warps.items():
         data = fields.warp(truth_vol, w, SPACING)

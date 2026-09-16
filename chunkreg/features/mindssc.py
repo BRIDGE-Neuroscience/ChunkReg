@@ -96,6 +96,11 @@ class MindSSCFeatures:
         return None
 
     def __call__(self, patch, spacing_mm: float, mask=None) -> np.ndarray:
+        if type(patch).__module__.split(".", 1)[0] == "torch":
+            raise NotImplementedError(
+                "MIND-SSC has no GPU implementation; on a GPU run use the "
+                "anatomix or intensity features"
+            )
         a = np.asarray(patch, dtype=np.float32)
         if a.ndim != 3:
             raise ValueError(f"expected a (Z, Y, X) patch, got {a.shape}")

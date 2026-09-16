@@ -70,10 +70,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GPU counts to cost the run at")
     p.add_argument("--engine", default=None)
     p.add_argument("--out", default=None, help="where to write calibration.json")
+    p.add_argument(
+        "--stop-at", default=None, metavar="LEVEL",
+        help="plan as if the run stops at this level: an index such as 3 or a "
+             "spacing such as 200um (overrides levels.stop_at)",
+    )
 
     p = sub.add_parser("run", help="stage two: build the unbiased group template")
     p.add_argument("config")
-    p.add_argument("--from-level", type=int, default=0)
+    p.add_argument(
+        "--stop-at", default=None, metavar="LEVEL",
+        help="finest level to run: an index such as 3 or a spacing such as "
+             "200um (overrides levels.stop_at). Running again with a finer "
+             "level carries on from here",
+    )
+    p.add_argument(
+        "--from-level", type=int, default=None, metavar="N",
+        help="redo the run from level N, discarding progress at N and finer. "
+             "Without it a run resumes from wherever it stopped",
+    )
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--engine", default=None)
 
@@ -141,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="volume level to read (default: the one matching the field's grid)",
     )
     p.add_argument("--profile", default="a16", help="profile for the output store")
+    p.add_argument(
+        "--device", default="auto",
+        help="where to warp: auto, cuda, cuda:N or cpu (default: a GPU if there is one)",
+    )
 
     p = sub.add_parser("export", help="store -> nifti or tiff")
     p.add_argument("store")
@@ -157,10 +176,52 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-def _load(path):
-    from .config import load_config
+def _load(path, stop_at=None):
+    """Load a config, with a ``--stop-at`` from the command line applied."""
+    from dataclasses import replace
 
-    return load_config(path)
+    from .config import load_config, parse_level_ref
+
+    cfg = load_config(path)
+    if stop_at is not None:
+        ref = parse_level_ref(stop_at, "--stop-at")
+        cfg = replace(cfg, levels=replace(cfg.levels, stop_at=ref))
+    return cfg
+
+
+def _configure(cfg) -> str:
+    """Pick where this process computes, from the config, and say so."""
+    from . import xp
+
+    device = xp.configure(cfg.device)
+    where = {
+        "cpu": "NumPy on the CPU (reference path)",
+        "torch-cpu": "PyTorch on the CPU (testing only)",
+    }.get(device, f"PyTorch on {device}")
+    print(f"  compute: {where}, engine {cfg.engine_for(device)}")
+    return device
+
+
+def _gpu_slots(cfg, device: str) -> list[str]:
+    """The GPUs a local run spreads over, one worker each.
+
+    Only a plain ``cuda`` device spreads: ``cuda:N`` asks for one card, and a
+    CPU device has none.
+    """
+    if device != "cuda":
+        return []
+    from .runners.multigpu import visible_gpus
+
+    ids = visible_gpus()
+    if cfg.gpus == "all":
+        return ids
+    want = int(cfg.gpus)
+    if want > len(ids):
+        print(
+            f"  warning: gpus is {want} but this job can see {len(ids)} GPU(s) "
+            f"({', '.join(ids) or 'none'}); using those"
+        )
+    return ids[:want]
 
 
 def _native_grid(cfg):
@@ -198,11 +259,13 @@ def _fmt_stage(st) -> str:
 
 
 def _ladder(cfg, levels) -> str:
-    """The resolved pyramid: what each level index actually means."""
+    """The resolved pyramid: what each level index means, and whether it runs."""
     from .grid import tile
 
+    run = set(cfg.levels.run_levels(levels))
     rows = [
-        f"  {'level':>5} {'spacing':>12} {'shape':>22} {'chunks':>8} {'clamp':>12}"
+        f"  {'level':>5} {'spacing':>12} {'shape':>22} {'chunks':>8} "
+        f"{'clamp':>12}  run"
     ]
     for k, g in enumerate(levels):
         n = len(tile(g, cfg.profile))
@@ -214,15 +277,16 @@ def _ladder(cfg, levels) -> str:
         shape = "x".join(str(v) for v in g.shape)
         rows.append(
             f"  {k:>5} {g.spacing_mm * 1000:>9.1f} um {shape:>22} {n:>8} "
-            f"{clamp * 1000:>9.1f} um"
+            f"{clamp * 1000:>9.1f} um  {'yes' if k in run else 'skip'}"
         )
     return "\n".join(rows)
 
 
-def _stage_table(cfg, n_levels: int) -> str:
-    """Stages as each level will actually run them, per-level tuning applied."""
+def _stage_table(cfg, levels) -> str:
+    """Stages as each level that runs will use them, per-level tuning applied."""
+    run = cfg.levels.run_levels(levels)
     rows = []
-    for k in range(n_levels):
+    for k in run:
         marks = []
         if k in cfg.levels.level_stages:
             marks.append("level_stages")
@@ -232,12 +296,16 @@ def _stage_table(cfg, n_levels: int) -> str:
         rows.append(f"  level {k} (cap {cfg.levels.cap(k)}){tag}")
         for st in cfg.levels.stages(k):
             rows.append(f"      {_fmt_stage(st)}")
+    skipped = [k for k in range(len(levels)) if k not in set(run)]
+    if skipped:
+        rows.append(f"  levels skipped by levels.run: {skipped}")
     return "\n".join(rows)
 
 
-def _report_stray_overrides(cfg, n_levels: int) -> None:
-    from .config import unused_level_overrides
+def _report_stray_overrides(cfg, levels) -> None:
+    from .config import skipped_level_overrides, unused_level_overrides
 
+    n_levels = len(levels)
     stray = unused_level_overrides(cfg, n_levels)
     if stray:
         print(
@@ -245,24 +313,99 @@ def _report_stray_overrides(cfg, n_levels: int) -> None:
             f"run; this pyramid has levels 0..{n_levels - 1}. The depth "
             f"follows from the grid and the chunk core, not the config."
         )
+    skipped = [
+        k for k in skipped_level_overrides(cfg, cfg.levels.run_levels(levels))
+        if k < n_levels
+    ]
+    if skipped:
+        print(
+            f"  warning: per-level override(s) for level(s) {skipped} will not "
+            f"run, because levels.run leaves those levels out."
+        )
+
+
+def _fmt_voxel(v) -> str:
+    v = tuple(float(x) for x in v)
+    if max(v) <= min(v) * (1 + 1e-6):
+        return f"{v[0]:g} mm"
+    return " x ".join(f"{x:g}" for x in v) + " mm (z, y, x)"
+
+
+def _scan_voxel(cfg, spec, source) -> tuple[float, float, float]:
+    """A scan's voxel size, from the subject entry, the file or the config.
+
+    A subject's own ``spacing_mm`` is taken over the file, since the point of
+    setting it is a file that is wrong or silent. The top-level value is a
+    cohort-wide default, so it has to agree with any file that states a size.
+    """
+    from .io_formats import spacing_agrees
+
+    stated = source.voxel_mm
+    if spec.spacing_mm is not None:
+        if stated is not None and not spacing_agrees(spec.spacing_mm, stated):
+            print(
+                f"  note: {spec.id}: using the subject's spacing_mm "
+                f"{_fmt_voxel(spec.spacing_mm)} over the file's {_fmt_voxel(stated)}"
+            )
+        return spec.spacing_mm
+    if cfg.spacing_mm is not None:
+        if stated is not None and not spacing_agrees(cfg.spacing_mm, stated):
+            raise SystemExit(
+                f"subject {spec.id!r}: the config says {cfg.spacing_mm:g} mm but "
+                f"{source.description} says {_fmt_voxel(stated)}. Fix one, or set "
+                f"spacing_mm on the subject to overrule the file; the pipeline "
+                f"will not guess which is right."
+            )
+        return (cfg.spacing_mm,) * 3
+    if stated is not None:
+        return stated
+    if not isinstance(cfg.grid.spacing_mm, str):
+        # Configs written before the grid block chose the run resolution used
+        # grid.spacing_mm to mean the sources' voxel size.
+        return (cfg.grid.spacing_mm,) * 3
+    raise SystemExit(
+        f"subject {spec.id!r}: {source.description} does not state its voxel "
+        f"size; set 'spacing_mm' on the subject or at the top level of the config."
+    )
+
+
+def _same_grid(a, b) -> bool:
+    import math
+
+    return (
+        a.shape == b.shape
+        and math.isclose(a.spacing_mm, b.spacing_mm, rel_tol=1e-9)
+        and all(
+            math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-9 * a.spacing_mm)
+            for x, y in zip(a.origin_mm, b.origin_mm)
+        )
+    )
+
+
+def _fmt_grid(g) -> str:
+    return f"{'x'.join(str(n) for n in g.shape)} @ {g.spacing_mm:g} mm"
 
 
 def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
-    """Ingest every subject that names a source and has no store yet."""
-    from .io_formats import is_zarr, open_source, spacing_agrees
+    """Ingest every subject that names a source and has no store yet.
+
+    Scans may differ in shape and voxel size. The run grid is resolved from the
+    whole cohort (see :mod:`chunkreg.cohort`) and each scan is resampled onto
+    it, so every store ends up on one grid.
+    """
+    from . import backend as _backend
+    from .cohort import Placement, ResampledSource, placement_notes, resolve_run_grid
+    from .io_formats import is_zarr, open_source
     from .store import Volume, ingest_source
 
-    done, kept = [], []
+    todo, kept = [], []
     for spec in cfg.subjects:
         dst = cfg.subject_path(spec.id)
         present = Volume.exists(dst, cfg.backend)
-        if present and not reingest:
+        if present and not (reingest and spec.source is not None):
             kept.append(spec.id)
             continue
         if spec.source is None:
-            if present:
-                kept.append(spec.id)
-                continue
             if is_zarr(dst):
                 raise SystemExit(
                     f"subject {spec.id!r}: {dst} is a zarr but not a chunkreg "
@@ -273,51 +416,107 @@ def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
                 f"subject {spec.id!r} has no store at {dst} and no 'source' to "
                 f"ingest from. Add a 'source' to the subject entry."
             )
+        todo.append(spec)
+    if not todo:
+        return [], kept
 
-        src_path = _resolve(cfg, spec.source)
-        if src_path.resolve() == Path(dst).resolve():
-            raise SystemExit(
-                f"subject {spec.id!r}: 'source' and 'path' are both {dst}; the "
-                f"store has to be written somewhere else"
-            )
-        source = open_source(src_path)
+    # The run grid depends on every scan, so the ones already ingested count
+    # too. Their stores record the scan they came from, which saves opening
+    # sources that may have been moved since.
+    scans, sources = {}, {}
+    for spec in cfg.subjects:
+        if spec in todo:
+            src_path = _resolve(cfg, spec.source)
+            dst = cfg.subject_path(spec.id)
+            if src_path.resolve() == Path(dst).resolve():
+                raise SystemExit(
+                    f"subject {spec.id!r}: 'source' and 'path' are both {dst}; "
+                    f"the store has to be written somewhere else"
+                )
+            source = open_source(src_path)
+            sources[spec.id] = (src_path, source)
+            scans[spec.id] = (source.shape, _scan_voxel(cfg, spec, source))
+            continue
+        vol = Volume.open(cfg.subject_path(spec.id), cfg.backend)
+        recorded = (vol.meta.get("provenance") or {}).get("placement")
+        if recorded:
+            pl = Placement.from_json(recorded)
+            scans[spec.id] = (pl.shape, pl.voxel_mm)
+        else:
+            g = vol.native_grid
+            scans[spec.id] = (g.shape, (g.spacing_mm,) * 3)
 
-        spacing = cfg.spacing_mm
-        if spacing is None:
-            spacing = source.spacing_mm
-        elif source.spacing_mm is not None and not spacing_agrees(
-            spacing, source.spacing_mm
-        ):
-            raise SystemExit(
-                f"subject {spec.id!r}: the config says {spacing} mm but "
-                f"{source.description} says {source.spacing_mm:g} mm. Fix one; "
-                f"the pipeline will not guess which is right."
-            )
-        if spacing is None:
-            raise SystemExit(
-                f"subject {spec.id!r}: {source.description} does not state its "
-                f"voxel size; set 'spacing_mm' at the top level of the config."
-            )
+    try:
+        grid, placements = resolve_run_grid(
+            scans, cfg.grid.spacing_mm, cfg.grid.shape, cfg.grid.align
+        )
+    except ValueError as exc:
+        raise SystemExit(f"cannot choose a run grid: {exc}") from None
+    moved = {
+        sid: Volume.open(cfg.subject_path(sid), cfg.backend).native_grid
+        for sid in kept
+    }
+    moved = {sid: g for sid, g in moved.items() if not _same_grid(g, grid)}
+    if moved:
+        detail = ", ".join(f"{sid} {_fmt_grid(g)}" for sid, g in moved.items())
+        raise SystemExit(
+            f"with these scans and grid settings the run grid is "
+            f"{_fmt_grid(grid)}, but existing stores are on another grid "
+            f"({detail}). The grid follows from every scan, so adding a larger "
+            f"or finer scan, or changing the grid block, moves it. Run "
+            f"'chunkreg setup --reingest' to put every scan on the new grid."
+        )
 
+    print(
+        f"  run grid {_fmt_grid(grid)} (grid.spacing_mm {cfg.grid.spacing_mm}, "
+        f"align {cfg.grid.align})"
+    )
+    _backend.write_json(
+        cfg.grid_record_path,
+        {
+            "shape": list(grid.shape),
+            "spacing_mm": grid.spacing_mm,
+            "origin_mm": list(grid.origin_mm),
+            "align": cfg.grid.align,
+            "placements": {sid: p.to_json() for sid, p in placements.items()},
+        },
+        cfg.backend,
+    )
+
+    done = []
+    for spec in todo:
+        dst = cfg.subject_path(spec.id)
+        src_path, source = sources[spec.id]
+        placement = placements[spec.id]
+        how, notes = placement_notes(grid, placement)
         vol = ingest_source(
-            source,
+            ResampledSource(source, placement, grid),
             dst,
-            spacing,
+            grid.spacing_mm,
             cfg.profile,
+            origin_mm=grid.origin_mm,
             dtype=cfg.ingest.dtype,
             backend=cfg.backend,
             overwrite=True,
             percentiles=cfg.ingest.percentiles,
             median_radius=cfg.ingest.median_radius,
-            provenance={"source": str(src_path), "config": cfg.fingerprint()},
+            provenance={
+                "source": str(src_path),
+                "config": cfg.fingerprint(),
+                "placement": placement.to_json(),
+            },
         )
         lo, hi = vol.normalisation
         print(
             f"  {spec.id}: {source.description} -> {dst}\n"
-            f"      {vol.native_grid.shape} @ {spacing:g} mm, {vol.n_levels} "
-            f"levels, {vol.array(vol.n_levels - 1).dtype}, "
+            f"      scan {'x'.join(str(n) for n in source.shape)} @ "
+            f"{_fmt_voxel(placement.voxel_mm)}, {how}\n"
+            f"      {vol.native_grid.shape} @ {grid.spacing_mm:g} mm, "
+            f"{vol.n_levels} levels, {vol.array(vol.n_levels - 1).dtype}, "
             f"window [{lo:.4g}, {hi:.4g}]"
         )
+        for note in notes:
+            print(f"      warning: {note}")
         done.append(spec.id)
     return done, kept
 
@@ -338,14 +537,14 @@ def _check_subjects(cfg) -> None:
         failures += [f"{spec.id}: {e}" for e in errors]
         for w in warnings:
             print(f"  warning: {spec.id}: {w}")
-        g = vol.native_grid
-        grids[spec.id] = (g.shape, round(g.spacing_mm, 9))
-    shapes = set(grids.values())
-    if len(shapes) > 1:
-        detail = ", ".join(f"{k} {v[0]} @ {v[1]:g} mm" for k, v in grids.items())
+        grids[spec.id] = vol.native_grid
+    first = next(iter(grids.values()), None)
+    if first is not None and not all(_same_grid(g, first) for g in grids.values()):
+        detail = ", ".join(f"{k} {_fmt_grid(g)}" for k, g in grids.items())
         failures.append(
-            f"subjects are on different grids ({detail}). Every subject has to "
-            f"share one shape and spacing; pad or resample them before ingest"
+            f"subjects are on different grids ({detail}). Every store has to be "
+            f"on the one run grid; 'chunkreg setup --reingest' resamples every "
+            f"scan onto it"
         )
     if failures:
         raise SystemExit(
@@ -360,7 +559,7 @@ def cmd_setup(args) -> int:
     """Stage one: ingest, check conventions, measure, and plan."""
     from .grid import pyramid
 
-    cfg = _load(args.config)
+    cfg = _load(args.config, args.stop_at)
     print(
         f"config {args.config}\n"
         f"  root {cfg.root_path}, profile {cfg.profile_name!r} "
@@ -369,6 +568,8 @@ def cmd_setup(args) -> int:
     )
     for w in cfg.validate():
         print(f"  warning: {w}")
+    device = _configure(cfg)
+    engine_name = args.engine or cfg.engine_for(device)
 
     print("\ningest")
     if args.no_ingest:
@@ -386,7 +587,6 @@ def cmd_setup(args) -> int:
     else:
         from .selftest import run_selftest
 
-        engine_name = args.engine or "demons"
         if not run_selftest(engine=engine_name, verbose=False):
             print(
                 "  FAILED: the engine does not honour the displacement "
@@ -408,7 +608,10 @@ def cmd_setup(args) -> int:
     else:
         from .calibrate import calibrate
 
-        cal = calibrate(cfg, engine=args.engine)
+        run_levels = cfg.levels.run_levels(levels)
+        cal = calibrate(
+            cfg, engine=engine_name, stages=cfg.levels.stages(run_levels[-1])
+        )
         out = Path(args.out or (cfg.root_path / "calibration.json"))
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(cal.to_json(), indent=2), encoding="utf-8")
@@ -421,13 +624,13 @@ def cmd_setup(args) -> int:
     else:
         from .probe import probe
 
-        print(probe(cfg, pairs=args.pairs, engine=args.engine).format())
+        print(probe(cfg, pairs=args.pairs, engine=engine_name).format())
 
     print("\nresolved pyramid")
     print(_ladder(cfg, levels))
-    _report_stray_overrides(cfg, len(levels))
+    _report_stray_overrides(cfg, levels)
     print("\nstages per level")
-    print(_stage_table(cfg, len(levels)))
+    print(_stage_table(cfg, levels))
 
     print()
     from .planner import plan
@@ -444,7 +647,7 @@ def cmd_run(args) -> int:
     from .pipelines import build_template
     from .runners import LocalRunner, get_runner
 
-    cfg = _load(args.config)
+    cfg = _load(args.config, args.stop_at)
     _check_subjects(cfg)
     native = _native_grid(cfg)
     levels = pyramid(native, cfg.profile)
@@ -453,32 +656,60 @@ def cmd_run(args) -> int:
         f"{cfg.n_subjects} subject(s), {len(levels)} levels, profile "
         f"{cfg.profile_name!r}, runner {cfg.runner}"
     )
+    device = _configure(cfg)
+    engine_name = args.engine or cfg.engine_for(device)
     print(_ladder(cfg, levels))
-    _report_stray_overrides(cfg, len(levels))
-    tuned = [k for k in cfg.levels.tuned_levels() if k < len(levels)]
+    _report_stray_overrides(cfg, levels)
+    run_levels = cfg.levels.run_levels(levels)
+    if len(run_levels) < len(levels):
+        print(f"  running levels {list(run_levels)} of 0..{len(levels) - 1}")
+    tuned = [k for k in cfg.levels.tuned_levels() if k in set(run_levels)]
     if tuned:
         print(f"  per-level tuning active on level(s) {tuned}")
     print()
 
-    engine = get_engine(args.engine) if args.engine else None
-    runner = (
-        get_runner(
+    engine = None
+    if cfg.runner == "slurm":
+        runner = get_runner(
             "slurm",
             cfg=cfg,
             poll_seconds=cfg.slurm.poll_seconds,
             max_wait_s=cfg.slurm.max_wait_s,
         )
-        if cfg.runner == "slurm"
-        else LocalRunner(workers=args.workers)
-    )
-    result = build_template(
-        cfg,
-        runner=runner,
-        engine=engine,
-        from_level=args.from_level,
-        progress=print,
-        config_path=args.config if cfg.runner == "slurm" else None,
-    )
+    else:
+        gpus = _gpu_slots(cfg, device)
+        if len(gpus) > 1:
+            print(f"  running on {len(gpus)} GPUs ({', '.join(gpus)}), one worker each")
+            # Bound to the config file up front: a resumed run can promote
+            # a level on the workers before it runs any pass.
+            runner = get_runner(
+                "multigpu", cfg=cfg, gpus=gpus, engine=engine_name, device="cuda",
+                config_path=args.config,
+            )
+        else:
+            workers = args.workers
+            if device.startswith("cuda") and workers > 1:
+                # Threads would share one card, and one registration can
+                # already fill it. Parallelism on a GPU comes from more GPUs.
+                print(
+                    f"  note: --workers {workers} ignored on a single GPU; "
+                    f"tasks run one at a time"
+                )
+                workers = 1
+            runner = LocalRunner(workers=workers)
+            engine = get_engine(engine_name)
+    try:
+        result = build_template(
+            cfg,
+            runner=runner,
+            engine=engine,
+            from_level=args.from_level,
+            progress=print,
+            config_path=args.config,
+        )
+    finally:
+        if hasattr(runner, "close"):
+            runner.close()
     print()
     print(result.summary())
     return 0
@@ -495,6 +726,7 @@ def cmd_features(args) -> int:
     from .featurereport import build_feature_report, write_feature_report
 
     cfg = _load(args.config)
+    _configure(cfg)
     centre = None
     if args.at:
         parts = [float(v) for v in args.at.replace(",", " ").split()]
@@ -542,12 +774,15 @@ def cmd_pair(args) -> int:
     from .engines import get_engine
 
     cfg = _load(args.config)
+    device = _configure(cfg)
+    # In process on one device: the paired config exists only here, so worker
+    # processes reading the config file would register the wrong pair.
     result = register_pair(
         cfg,
         args.fixed,
         args.moving,
         runner=LocalRunner(workers=args.workers),
-        engine=get_engine(args.engine) if args.engine else None,
+        engine=get_engine(args.engine or cfg.engine_for(device)),
     )
     print(result.summary())
     return 0
@@ -568,9 +803,12 @@ def cmd_run_task(args) -> int:
             f"a pass; run 'chunkreg run' rather than invoking run-task by hand."
         )
     manifest = Manifest.load(path)
+    from . import xp
+
+    device = xp.configure(cfg.device)
 
     if args.pass_name == "register":
-        engine = get_engine(args.engine) if args.engine else None
+        engine = get_engine(args.engine or cfg.engine_for(device))
         out = run_register_task(cfg, manifest, args.task_id, engine=engine)
     elif args.pass_name == "blend":
         out = run_blend_task(cfg, manifest, args.task_id)
@@ -588,10 +826,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_apply(args) -> int:
-    """Warp a volume through a field, on the field's own grid."""
-    from . import fields as _fields
+    """Warp a volume through a field, on the field's own grid, block by block."""
+    from . import xp
     from .config import get_profile
-    from .store import Field, Volume, ingest_array
+    from .passes._common import warped_subject_block
+    from .store import Field, Volume, ingest_source
+
+    device = xp.configure(args.device)
+    print(f"  compute: {'NumPy on the CPU' if device == 'cpu' else 'PyTorch on ' + device}")
 
     vol = Volume.open(args.volume)
     field = Field.open(args.field)
@@ -618,14 +860,32 @@ def cmd_apply(args) -> int:
             f"field is on {grid.shape}; omit --level to match them automatically"
         )
 
-    u = field.read_dense((0, 0, 0), grid.shape)
-    block = vol.read_padded(level, (0, 0, 0), grid.shape)
-    out = _fields.warp(block, u, grid.spacing_mm)
-    ingest_array(
-        out,
+    class _Warped:
+        """The warped volume, computed one requested box at a time.
+
+        Each box reads its source with a margin sized from the field, so the
+        result is exact at box edges and never holds the whole volume.
+        """
+
+        shape = tuple(grid.shape)
+        dtype = np.dtype(np.float32)
+
+        def __getitem__(self, key):
+            origin = tuple(int(k.start) for k in key)
+            size = tuple(int(k.stop) - int(k.start) for k in key)
+            u = field.read_dense(origin, size)
+            return xp.get(
+                warped_subject_block(
+                    vol, level, origin, size, u, grid.spacing_mm, normalise=False
+                )
+            )
+
+    ingest_source(
+        _Warped(),
         args.out,
         grid.spacing_mm,
         get_profile(args.profile),
+        origin_mm=grid.origin_mm,
         dtype="float32",
         overwrite=True,
     )
@@ -639,7 +899,10 @@ def cmd_export(args) -> int:
 
     vol = Volume.open(args.store)
     grid = vol.grid(vol.n_levels - 1)
-    write_volume(args.out, vol.read_padded(vol.n_levels - 1, (0, 0, 0), grid.shape), grid)
+    from . import xp
+
+    block = xp.get(vol.read_padded(vol.n_levels - 1, (0, 0, 0), grid.shape))
+    write_volume(args.out, block, grid)
     print(f"wrote {args.out}")
     return 0
 

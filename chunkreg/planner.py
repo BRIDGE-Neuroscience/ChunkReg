@@ -65,6 +65,9 @@ class Plan:
     throughput_ch_vox_per_s: float
     warnings: tuple[str, ...] = ()
 
+    pyramid_levels: int = 0
+    """Levels in the whole pyramid, including any that ``levels.run`` skips."""
+
     @property
     def depth(self) -> int:
         return len(self.levels) - 1
@@ -108,8 +111,13 @@ class Plan:
             f"chunk overhead {self.overhead:.2f}x"
         )
         out.append(
-            f"  {self.n_subjects} subject(s), {self.depth + 1} level(s), "
-            f"native {self.native.shape} @ {self.native.spacing_mm} mm"
+            f"  {self.n_subjects} subject(s), {self.depth + 1} level(s) run"
+            + (
+                f" of {self.pyramid_levels} in the pyramid"
+                if self.pyramid_levels > len(self.levels)
+                else ""
+            )
+            + f", native {self.native.shape} @ {self.native.spacing_mm:g} mm"
         )
         out.append("")
         head = (
@@ -164,11 +172,14 @@ def plan(cfg: RunConfig, native: GridSpec) -> Plan:
     warnings = list(cfg.validate())
     p = cfg.profile
     grids = pyramid(native, p)
+    run_levels = set(cfg.levels.run_levels(grids))
     n = max(cfg.n_subjects, 1)
     per_task = max(1, cfg.slurm.register.chunks_per_task)
 
     levels: list[LevelPlan] = []
     for k, g in enumerate(grids):
+        if k not in run_levels:
+            continue  # levels.run leaves it out, so it costs nothing
         chunks = tile(g, p)
         cap = cfg.levels.cap(k)
         if len(chunks) == 1:
@@ -201,8 +212,8 @@ def plan(cfg: RunConfig, native: GridSpec) -> Plan:
         deepest = levels[-1]
         if deepest.work_ch_vox / max(sum(l.work_ch_vox for l in levels), 1) > 0.9:
             warnings.append(
-                "the native level is over 90% of the work; check that the "
-                "caps for coarser levels are not set too low to converge"
+                "the finest level run is over 90% of the work; check that "
+                "the caps for coarser levels are not set too low to converge"
             )
 
     return Plan(
@@ -215,4 +226,5 @@ def plan(cfg: RunConfig, native: GridSpec) -> Plan:
         overhead=p.overhead,
         throughput_ch_vox_per_s=cfg.throughput_ch_vox_per_s,
         warnings=tuple(warnings),
+        pyramid_levels=len(grids),
     )

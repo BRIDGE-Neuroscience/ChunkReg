@@ -36,6 +36,10 @@ def normalise_channels(x: np.ndarray, method: str = "l2") -> np.ndarray:
     cosine similarity between feature vectors, which is what lets an
     intensity-era optimiser work on learned features at all.
     """
+    if type(x).__module__.split(".", 1)[0] == "torch":
+        from ..gpu_ops import normalise_channels as _on_device
+
+        return _on_device(x, method)
     a = np.asarray(x, dtype=np.float32)
     if method == "none":
         return a

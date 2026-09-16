@@ -22,6 +22,7 @@ from scipy import ndimage
 
 from .. import backend as _backend
 from .. import fields as _fields
+from .. import xp as _xp
 from ..config import RunConfig
 from ..grid import window_on
 from ..store import Field, TaskArray, Volume, read_padded, write_block
@@ -81,8 +82,8 @@ def blend_core(
     own = manifest.chunk(chunk_id)
     grid = manifest.grid
     core_shape = tuple(own.core_shape)
-    num = np.zeros((3,) + core_shape, dtype=np.float64)
-    den = np.zeros(core_shape, dtype=np.float64)
+    num = _xp.zeros((3,) + core_shape, dtype=np.float64)
+    den = _xp.zeros(core_shape, dtype=np.float64)
 
     lo = np.asarray(own.core_origin, dtype=np.int64)
     hi = lo + np.asarray(core_shape, dtype=np.int64)
@@ -103,26 +104,39 @@ def blend_core(
         src = tuple(slice(int(s), int(e)) for s, e in zip(a - plo, bnd - plo))
         dst = tuple(slice(int(s), int(e)) for s, e in zip(a - lo, bnd - lo))
 
-        # Only the overlap with this core is ever read, so neither the window
-        # nor the upsampled residual is built outside it.
-        lat = cache[task_id].read(index)
-        dense = _upsample_box(lat, cfg.profile.lattice_factor, src)
-        wq = window_on(other, grid, cfg.profile, src)
+        # Only the overlap with this core is ever read, decompressed, upsampled
+        # or weighted. The lattice read covers just that overlap, and the
+        # upsample takes the box relative to what was read.
+        f = cfg.profile.lattice_factor
+        llo = [b.start // f for b in src]
+        lhi = [-(-b.stop // f) for b in src]
+        lat = cache[task_id].read_box(index, llo, lhi)
+        local = tuple(slice(b.start - l * f, b.stop - l * f) for b, l in zip(src, llo))
+        if _xp.uses_torch():
+            from .. import gpu_ops
+            from ..grid import axis_windows
+
+            dense = gpu_ops.upsample_box(_xp.put(lat), f, local)
+            wz, wy, wx = (
+                _xp.put(w[box]) for w, box in zip(axis_windows(other, grid, cfg.profile), src)
+            )
+            wq = gpu_ops.outer3(wz, wy, wx)
+        else:
+            dense = _upsample_box(lat, f, local)
+            wq = window_on(other, grid, cfg.profile, src)
         num[(slice(None),) + dst] += dense * wq
         den[dst] += wq
 
-    if den.min() <= 0:
+    if float(den.min()) <= 0:
         raise RuntimeError(
             f"blend denominator reached zero on chunk {chunk_id}; cores should "
             f"tile the level exactly, so this means the manifest is inconsistent"
         )
-    out = (num / den).astype(np.float32)
+    out = _xp.to_float32(num / den)
 
     sigma = cfg.profile.lattice_factor  # one lattice voxel, in level voxels
     if sigma > 0:
-        out = np.stack(
-            [ndimage.gaussian_filter(out[d], sigma * 0.5, mode="nearest") for d in range(3)]
-        )
+        out = _fields.smooth(out, sigma * 0.5, mode="nearest")
     return out
 
 
@@ -162,7 +176,7 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
 
     core_origin = tuple(own.core_origin)
     core_shape = tuple(own.core_shape)
-    acc_i = np.zeros(core_shape, dtype=np.float32)
+    acc_i = _xp.zeros(core_shape)
     lat_origin, lat_shape = None, None
     acc_w = None
     stats = []
@@ -181,7 +195,7 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
 
         lat = _pool(u, cfg.profile.lattice_factor)
         if acc_w is None:
-            acc_w = np.zeros_like(lat)
+            acc_w = _xp.zeros_like(lat)
             lat_origin = tuple(int(o) // cfg.profile.lattice_factor for o in core_origin)
             lat_shape = lat.shape[1:]
         acc_w += lat
@@ -206,12 +220,5 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
     }
 
 
-def _pool(u: np.ndarray, factor: int) -> np.ndarray:
-    if factor == 1:
-        return np.asarray(u, dtype=np.float32)
-    a = np.asarray(u, dtype=np.float32)
-    n = [(-(-s // factor)) for s in a.shape[1:]]
-    pad = [(0, 0)] + [(0, t * factor - s) for t, s in zip(n, a.shape[1:])]
-    if any(p[1] for p in pad):
-        a = np.pad(a, pad, mode="edge")
-    return a.reshape(3, n[0], factor, n[1], factor, n[2], factor).mean(axis=(2, 4, 6))
+def _pool(u, factor: int):
+    return _fields.pool_field(u, factor)

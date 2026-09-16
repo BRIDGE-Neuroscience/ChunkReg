@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .. import fields as _fields
+from .. import xp as _xp
 from ..grid import GridSpec
 from ..store import Volume
 
@@ -35,6 +36,10 @@ def warped_subject_block(
 
 def tissue_fraction(patch: np.ndarray, threshold: float = 0.0) -> float:
     """Fraction of a normalised patch above a background threshold."""
+    if _xp.is_tensor(patch):
+        from ..gpu_ops import tissue_fraction as _on_device
+
+        return _on_device(patch, threshold)
     a = np.asarray(patch, dtype=np.float32)
     if a.size == 0:
         return 0.0

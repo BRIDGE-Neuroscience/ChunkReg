@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from . import xp
 from .config import RunConfig, StageSpec
 from .engines import get_engine
 from .features import get_extractor
@@ -101,9 +102,20 @@ def measure_receptive_field(
     c = size // 2
     poked[c, c, c] = 1.0 - base[c, c, c]
 
-    a = np.asarray(extractor(base, spacing_mm), dtype=np.float32)
-    b = np.asarray(extractor(poked, spacing_mm), dtype=np.float32)
-    delta = np.abs(a - b).max(axis=0)
+    a = extractor(xp.put(base), spacing_mm)
+    b = extractor(xp.put(poked), spacing_mm)
+    if xp.is_tensor(a):
+        import torch
+
+        delta = (a - b).abs().amax(dim=0)
+        peak = float(delta.max())
+        if peak <= 0:
+            return 0
+        idx = torch.nonzero(delta > threshold * peak)
+        if idx.numel() == 0:
+            return 0
+        return int((idx - c).abs().max())
+    delta = np.abs(np.asarray(a, np.float32) - np.asarray(b, np.float32)).max(axis=0)
     peak = float(delta.max())
     if peak <= 0:
         return 0
@@ -114,27 +126,46 @@ def measure_receptive_field(
     return int(np.abs(idx - c).max())
 
 
-def calibrate(cfg: RunConfig, engine: str | None = None) -> Calibration:
-    """Measure the receptive field, per-voxel memory and throughput."""
+def calibrate(
+    cfg: RunConfig, engine: str | None = None, stages=None
+) -> Calibration:
+    """Measure the receptive field, per-voxel memory and throughput.
+
+    ``stages`` is what the timed chunk runs; pass the finest level's stages to
+    time what dominates the run. Without it a short fixed schedule is used.
+    """
     profile = cfg.profile
     extractor = get_extractor(profile.features)
     extractor.setup()
-    eng = get_engine(engine or "demons")
+    device = xp.device_name()
+    eng = get_engine(engine or cfg.engine_for(device))
 
     r_f = measure_receptive_field(extractor)
 
     # Throughput on a chunk small enough to time quickly, scaled to the real
     # padded size. Registration cost is close to linear in voxels once the
     # pyramid schedule is fixed, so this extrapolates honestly.
-    probe_side = min(48, profile.padded)
+    #
+    # On a GPU the probe is a full padded chunk: a small one mostly measures
+    # kernel launch overhead and overstates the cost of a real chunk. The CPU
+    # reference keeps a small probe so calibration stays quick there.
+    on_gpu = xp.on_gpu()
+    probe_side = profile.padded if on_gpu else min(48, profile.padded)
     rng = np.random.default_rng(1)
-    from scipy import ndimage
+    if xp.uses_torch():
+        import torch
 
-    v = ndimage.gaussian_filter(
-        rng.random((probe_side,) * 3).astype(np.float32), 2.0
-    )
-    fixed = extractor(v, 0.05)
-    moving = extractor(np.roll(v, 2, axis=0), 0.05)
+        from . import fields as _fields
+
+        v = _fields.smooth(xp.put(rng.random((probe_side,) * 3)), 2.0)
+        shifted = torch.roll(v, shifts=2, dims=0)
+    else:
+        from scipy import ndimage
+
+        v = ndimage.gaussian_filter(
+            rng.random((probe_side,) * 3).astype(np.float32), 2.0
+        )
+        shifted = np.roll(v, 2, axis=0)
     # One iteration count per scale, whatever the profile's pyramid depth. A
     # fixed two-element schedule raised a length mismatch on every profile with
     # three or more scales, which is exactly the deep-pyramid profile a user
@@ -144,16 +175,34 @@ def calibrate(cfg: RunConfig, engine: str | None = None) -> Calibration:
         _SCHEDULE[min(i, len(_SCHEDULE) - 1)] for i in range(len(profile.scales))
     )
     stage = StageSpec(kind="greedy", scales=profile.scales, iterations=iterations)
+    run_stages = list(stages) if stages else [stage]
 
+    def one_chunk():
+        eng.register(extractor(v, 0.05), extractor(shifted, 0.05), 0.05, run_stages)
+        if on_gpu:
+            torch.cuda.synchronize()
+
+    if on_gpu:
+        one_chunk()  # kernel selection and allocator warm-up, not timed
+        torch.cuda.reset_peak_memory_stats()
+    # Timed end to end, feature extraction included: that is what each chunk
+    # of a run costs.
     t0 = time.perf_counter()
-    eng.register(fixed, moving, 0.05, [stage])
+    one_chunk()
     elapsed = max(time.perf_counter() - t0, 1e-6)
+    measured_bytes = (
+        torch.cuda.max_memory_allocated() / (probe_side**3 * profile.channels)
+        if on_gpu
+        else None
+    )
 
     probe_work = probe_side**3 * profile.channels
     throughput = probe_work / elapsed
     seconds_per_chunk = (profile.padded**3 * profile.channels) / throughput
 
-    device, per_voxel_channel = _device_and_memory(profile)
+    device_label, per_voxel_channel = _device_and_memory(profile)
+    if measured_bytes is not None:
+        per_voxel_channel = float(measured_bytes)
 
     return Calibration(
         features=profile.features,
@@ -164,7 +213,7 @@ def calibrate(cfg: RunConfig, engine: str | None = None) -> Calibration:
         seconds_per_chunk=seconds_per_chunk,
         padded=profile.padded,
         channels=profile.channels,
-        device=device,
+        device=device_label,
     )
 
 

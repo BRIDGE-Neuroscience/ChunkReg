@@ -23,6 +23,15 @@ class IntensityFeatures:
         return None
 
     def __call__(self, patch, spacing_mm: float, mask=None) -> np.ndarray:
+        from .. import xp as _xp
+
+        if _xp.is_tensor(patch):
+            if patch.ndim != 3:
+                raise ValueError(f"expected a (Z, Y, X) patch, got {tuple(patch.shape)}")
+            out = _xp.to_float32(patch)[None]
+            if mask is not None:
+                out = out * _xp.put(mask)[None]
+            return out.contiguous()
         a = np.asarray(patch, dtype=np.float32)
         if a.ndim != 3:
             raise ValueError(f"expected a (Z, Y, X) patch, got {a.shape}")

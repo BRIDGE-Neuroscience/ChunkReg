@@ -166,7 +166,11 @@ def sample_box(
 
     feats = extractor(block, grid.spacing_mm)
     sl = (slice(pad, pad + size_vox),) * 3
-    return block[sl], feats[(slice(None),) + sl]
+    # The report renders images on the host, so only the cropped cube and its
+    # features come back.
+    from . import xp
+
+    return xp.get(block[sl]), xp.get(feats[(slice(None),) + sl])
 
 
 def build_feature_report(

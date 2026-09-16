@@ -30,6 +30,23 @@ def isolated_cwd(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def cpu_device(monkeypatch):
+    """Run every test on the NumPy reference path unless it asks otherwise.
+
+    Configs default to device 'auto', which would pick a GPU on a machine that
+    has one and then refuse the CPU demons engine the tests use. A test that
+    exercises the PyTorch path switches with ``xp.using`` or by setting
+    ``CHUNKREG_DEVICE`` itself.
+    """
+    from chunkreg import xp
+
+    monkeypatch.setenv("CHUNKREG_DEVICE", "cpu")
+    xp.configure("cpu")
+    yield
+    xp.configure("cpu", honour_env=False)
+
+
+@pytest.fixture(autouse=True)
 def memory_backend():
     """Use the memory backend and start every test with an empty store."""
     _backend.set_default_backend("memory")

@@ -72,7 +72,9 @@ def probe(cfg: RunConfig, pairs: int = 3, engine: str | None = None) -> ProbeRep
     native = vols[ids[0]].native_grid
     grid = pyramid(native, cfg.profile)[0]
 
-    eng = get_engine(engine or "demons")
+    from . import xp
+
+    eng = get_engine(engine or cfg.engine_for(xp.device_name()))
     ex = get_extractor(cfg.profile.features)
     ex.setup()
     stages = list(cfg.levels.stages(0))

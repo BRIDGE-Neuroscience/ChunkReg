@@ -116,7 +116,7 @@ def test_an_ambiguous_group_says_which_arrays_it_found(tmp_path):
         open_source(tmp_path / "g.zarr")
 
 
-def test_anisotropic_voxels_are_refused(tmp_path):
+def test_anisotropic_voxels_are_read_per_axis(tmp_path):
     path = write_ome(tmp_path / "a.zarr", volume())
     root = zarr.open_group(path, mode="r+")
     ome = dict(root.attrs["ome"])
@@ -124,8 +124,8 @@ def test_anisotropic_voxels_are_refused(tmp_path):
         1, 1, 100.0, 50.0, 50.0
     ]
     root.attrs["ome"] = ome
-    with pytest.raises(ValueError, match="anisotropic"):
-        open_source(path)
+    src = open_source(path)
+    assert src.voxel_mm == pytest.approx((0.1, 0.05, 0.05))
 
 
 def test_several_channels_are_refused(tmp_path):
@@ -247,11 +247,15 @@ def test_setup_refuses_a_spacing_that_contradicts_the_file(tmp_path):
         main(["setup", path, *QUICK])
 
 
-def test_subjects_on_different_grids_are_refused(tmp_path):
+def test_subjects_of_different_shapes_share_one_run_grid(tmp_path, capsys):
     path = cohort_config(tmp_path)
-    write_ome(tmp_path / "raw/s2.ome.zarr", volume(shape=(40, 36, 40)))
-    with pytest.raises(SystemExit, match="different grids"):
-        main(["setup", path, *QUICK])
+    write_ome(tmp_path / "raw/s2.ome.zarr", volume(shape=(44, 30, 40)))
+    assert main(["setup", path, *QUICK]) == 0
+    assert "sharded and on one grid" in capsys.readouterr().out
+    grids = [Volume.open(tmp_path / f"subjects/s{i}.zarr").native_grid for i in (1, 2)]
+    assert grids[0] == grids[1]
+    # The run grid holds the larger scan along every axis.
+    assert grids[0].shape == (44, 36, 44)
 
 
 def test_a_foreign_zarr_as_path_points_at_source(tmp_path):

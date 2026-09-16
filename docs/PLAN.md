@@ -482,9 +482,10 @@ shard = core; channel count fits the GPU class; stage lists well-formed.
 ## 10. CLI
 
 ```
-chunkreg setup     CONFIG         # ingest, conventions, calibration, cohort spread, plan
+chunkreg setup     CONFIG [--stop-at L]   # ingest onto the run grid, conventions, calibration, cohort spread, plan
 chunkreg selftest  CONFIG
-chunkreg run       CONFIG [--from-level k]      # the run itself
+chunkreg run       CONFIG [--stop-at L] [--from-level k]   # the run itself; resumes on its own,
+                                                 # --from-level k redoes k and finer
 chunkreg pair      CONFIG
 chunkreg run-task  CONFIG --level k --iter i --pass P --id T      # what sbatch invokes
 chunkreg status    CONFIG [--retry]

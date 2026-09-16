@@ -63,9 +63,11 @@ class PCAFeatures:
         hundred thousand vectors determine it as well as all of them.
         """
         rng = np.random.default_rng(seed)
+        from .. import xp as _xp
+
         rows = []
         for patch in patches:
-            f = self._inner(patch, spacing_mm)
+            f = _xp.get(self._inner(patch, spacing_mm))
             flat = f.reshape(f.shape[0], -1).T
             take = min(len(flat), max(1, sample // 8))
             idx = rng.choice(len(flat), size=take, replace=False)
@@ -85,6 +87,21 @@ class PCAFeatures:
                 "a different basis."
             )
         f = self._inner(patch, spacing_mm)
+        from .. import xp as _xp
+
+        if _xp.is_tensor(f):
+            import torch
+
+            basis = torch.as_tensor(self._basis, device=f.device)
+            mean = torch.as_tensor(self._mean, device=f.device)
+            flat = f.reshape(f.shape[0], -1) - mean[:, None]
+            out = normalise_channels(
+                (basis @ flat).reshape((self.channels,) + tuple(f.shape[1:])),
+                self.normalisation,
+            )
+            if mask is not None:
+                out = out * _xp.put(mask)[None]
+            return out.contiguous()
         flat = f.reshape(f.shape[0], -1) - self._mean[:, None]
         out = (self._basis @ flat).reshape((self.channels,) + f.shape[1:])
         out = normalise_channels(out, self.normalisation)

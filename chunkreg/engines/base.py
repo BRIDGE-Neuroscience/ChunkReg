@@ -18,6 +18,8 @@ from typing import Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
+from .. import xp as _xp
+
 __all__ = ["RegResult", "Engine", "StageNotSupported"]
 
 
@@ -46,9 +48,13 @@ class RegResult:
     affine: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        u = np.asarray(self.disp_mm, dtype=np.float32)
+        u = (
+            _xp.to_float32(self.disp_mm)
+            if _xp.is_tensor(self.disp_mm)
+            else np.asarray(self.disp_mm, dtype=np.float32)
+        )
         if u.ndim != 4 or u.shape[0] != 3:
-            raise ValueError(f"disp_mm must be (3, Z, Y, X), got {u.shape}")
+            raise ValueError(f"disp_mm must be (3, Z, Y, X), got {tuple(u.shape)}")
         self.disp_mm = u
 
     @property
@@ -77,16 +83,24 @@ class Engine(Protocol):
 
 
 def check_inputs(fixed: np.ndarray, moving: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Validate and normalise the pair an engine was handed."""
-    f = np.ascontiguousarray(fixed, dtype=np.float32)
-    m = np.ascontiguousarray(moving, dtype=np.float32)
+    """Validate and normalise the pair an engine was handed.
+
+    Device arrays stay on their device; host arrays stay on the host.
+    """
+    if _xp.is_tensor(fixed) or _xp.is_tensor(moving):
+        f = (fixed if _xp.is_tensor(fixed) else _xp.put(fixed)).float().contiguous()
+        m = (moving if _xp.is_tensor(moving) else _xp.put(moving)).float().contiguous()
+    else:
+        f = np.ascontiguousarray(fixed, dtype=np.float32)
+        m = np.ascontiguousarray(moving, dtype=np.float32)
     if f.ndim != 4 or m.ndim != 4:
         raise ValueError(
-            f"expected (C, Z, Y, X) feature stacks, got {f.shape} and {m.shape}"
+            f"expected (C, Z, Y, X) feature stacks, got {tuple(f.shape)} and "
+            f"{tuple(m.shape)}"
         )
-    if f.shape != m.shape:
+    if tuple(f.shape) != tuple(m.shape):
         raise ValueError(
-            f"fixed {f.shape} and moving {m.shape} must share a grid and "
+            f"fixed {tuple(f.shape)} and moving {tuple(m.shape)} must share a grid and "
             f"channel count; the moving chunk is resampled onto the fixed grid "
             f"before features are extracted"
         )

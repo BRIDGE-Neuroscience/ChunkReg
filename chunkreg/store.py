@@ -31,6 +31,7 @@ import numpy as np
 
 from . import backend as _backend
 from . import fields as _fields
+from . import xp as _xp
 from .grid import Chunk, GridSpec, Profile, pyramid, pyramid_depth, shard_grid, tile
 
 __all__ = [
@@ -98,7 +99,11 @@ def read_padded(
 
 
 def write_block(arr, origin: Sequence[int], block: np.ndarray, lead: int = 0) -> None:
-    """Write a block, clipping anything that falls outside the array."""
+    """Write a block, clipping anything that falls outside the array.
+
+    A device array is brought back to the host here, at the last moment.
+    """
+    block = _xp.get(block)
     full = np.asarray(arr.shape[lead:], dtype=np.int64)
     o = np.asarray(origin, dtype=np.int64)
     s = np.asarray(block.shape[lead:], dtype=np.int64)
@@ -281,6 +286,10 @@ class Volume:
     ) -> tuple[float, float]:
         """Derive and store the intensity window from a coarse level."""
         k = 0 if level is None else self._check_level(level)
+        if _xp.uses_torch():
+            lo, hi = self._window_on_device(k, percentiles, mask_frac)
+            self.set_normalisation(lo, hi)
+            return self.normalisation  # type: ignore[return-value]
         a = np.asarray(self.array(k)[:], dtype=np.float32)
         sel = a > (a.max() * mask_frac) if mask_frac > 0 else np.ones_like(a, bool)
         if not sel.any():
@@ -291,6 +300,17 @@ class Volume:
         self.set_normalisation(float(lo), float(hi))
         return self.normalisation  # type: ignore[return-value]
 
+    def _window_on_device(self, k: int, percentiles, mask_frac: float):
+        from . import gpu_ops
+
+        a = _xp.put(self.array(k)[:])
+        sel = a > (a.max() * mask_frac) if mask_frac > 0 else None
+        vals = a[sel] if sel is not None and bool(sel.any()) else a
+        lo, hi = (gpu_ops.percentile(vals, q) for q in percentiles)
+        if not hi > lo:
+            lo, hi = float(a.min()), float(a.max()) + 1e-6
+        return float(lo), float(hi)
+
     def normalise(self, block: np.ndarray) -> np.ndarray:
         """Apply the stored window, clipped to ``[0, 1]``."""
         norm = self.normalisation
@@ -300,6 +320,8 @@ class Volume:
                 "call compute_normalisation() during ingest"
             )
         lo, hi = norm
+        if _xp.is_tensor(block):
+            return ((_xp.to_float32(block) - lo) / (hi - lo)).clamp_(0.0, 1.0)
         out = (np.asarray(block, dtype=np.float32) - lo) / (hi - lo)
         return np.clip(out, 0.0, 1.0, out=out)
 
@@ -307,8 +329,14 @@ class Volume:
     def read_padded(
         self, level: int, origin, shape, normalise: bool = False
     ) -> np.ndarray:
-        """Read a box at ``level``, zero outside the volume."""
-        block = read_padded(self.array(level), origin, shape, lead=0, mode="constant")
+        """Read a box at ``level``, zero outside the volume.
+
+        The block comes back where this process computes: on the GPU when the
+        run's device is one, so reading is the only host step.
+        """
+        block = _xp.put(
+            read_padded(self.array(level), origin, shape, lead=0, mode="constant")
+        )
         return self.normalise(block) if normalise else block
 
     def read_chunk(self, level: int, chunk: Chunk, normalise: bool = True) -> np.ndarray:
@@ -342,9 +370,12 @@ class Volume:
                             tuple(2 * v for v in s),
                             mode="edge",
                         )
-                        pooled = fine.reshape(
-                            s[0], 2, s[1], 2, s[2], 2
-                        ).mean(axis=(1, 3, 5))
+                        if _xp.uses_torch():
+                            pooled = _fields.pool_field(_xp.put(fine)[None], 2)[0]
+                        else:
+                            pooled = fine.reshape(
+                                s[0], 2, s[1], 2, s[2], 2
+                            ).mean(axis=(1, 3, 5))
                         write_block(dst, o, pooled)
 
 
@@ -462,7 +493,7 @@ class Field:
         lo, ext = lattice_box(o, s, self.factor)
         lo = np.asarray(lo, dtype=np.int64) - margin
         ext = np.asarray(ext, dtype=np.int64) + 2 * margin
-        block = self.read_lattice(lo, ext)
+        block = _xp.put(self.read_lattice(lo, ext))
 
         sub_lat = GridSpec(
             tuple(int(v) for v in ext), lat.spacing_mm, tuple(lat.world(lo))
@@ -493,7 +524,7 @@ class Field:
         lat_lo = np.floor(lat.voxel(lo_world)).astype(np.int64) - margin
         lat_hi = np.ceil(lat.voxel(hi_world)).astype(np.int64) + margin + 1
         ext = np.maximum(lat_hi - lat_lo, 1)
-        block = self.read_lattice(lat_lo, ext)
+        block = _xp.put(self.read_lattice(lat_lo, ext))
         sub_lat = GridSpec(
             tuple(int(v) for v in ext), lat.spacing_mm, tuple(lat.world(lat_lo))
         )
@@ -515,18 +546,8 @@ class Field:
                 f"origin {tuple(int(v) for v in o)} is not aligned to the "
                 f"lattice factor {f}"
             )
-        u = np.asarray(block, dtype=np.float32)
-        s = np.asarray(u.shape[1:], dtype=np.int64)
-        pad = (-s) % f
-        if np.any(pad):
-            u = np.pad(
-                u,
-                [(0, 0)] + [(0, int(p)) for p in pad],
-                mode="edge",
-            )
-        n = np.asarray(u.shape[1:], dtype=np.int64) // f
-        pooled = u.reshape(3, n[0], f, n[1], f, n[2], f).mean(axis=(2, 4, 6))
-        self.write_lattice(o // f, pooled)
+        # Pooled where the block lives; only the lattice goes back to the host.
+        self.write_lattice(o // f, _fields.pool_field(block, f))
 
     def fill_identity(self) -> None:
         self.array[:] = 0
@@ -614,13 +635,18 @@ class TaskArray:
     ) -> "TaskArray":
         b = _backend.get_backend(backend)
         f = profile.lattice_factor
-        cap = int(math.ceil(profile.padded / f))
+        # Small inner chunks inside one shard per entry. A blend task reads
+        # only the thin strip where a neighbour's halo overlaps its core, and
+        # with the whole entry as one chunk every such read decompressed the
+        # entire entry, up to 27 times per core.
+        inner = max(1, profile.inner_chunk // f)
+        cap = -(-int(math.ceil(profile.padded / f)) // inner) * inner
         shape = (len(entries), 3, cap, cap, cap)
         b.create(
             path,
             shape,
             _fields.DISP_DTYPE,
-            chunks=(1, 3, cap, cap, cap),
+            chunks=(1, 3, inner, inner, inner),
             shards=(1, 3, cap, cap, cap),
             overwrite=overwrite,
         )
@@ -684,7 +710,7 @@ class TaskArray:
         """Store entry ``i``'s residual, given on its padded lattice extent."""
         e = self.entries[i]
         _, ext = e.lattice(self.factor)
-        u = np.asarray(block_lattice, dtype=np.float32)
+        u = np.asarray(_xp.get(block_lattice), dtype=np.float32)
         if u.shape != (3,) + ext:
             raise ValueError(
                 f"entry {i} expects {(3,) + ext} on the lattice, got {u.shape}"
@@ -694,6 +720,18 @@ class TaskArray:
             raise ValueError(f"entry {i} extent {ext} exceeds capacity {cap}")
         self.array[i, :, : ext[0], : ext[1], : ext[2]] = u.astype(
             self.array.dtype, copy=False
+        )
+
+    def read_box(self, i: int, lo, hi) -> np.ndarray:
+        """Part of entry ``i``'s lattice, ``[lo, hi)`` per axis.
+
+        Only the inner chunks the box touches are decompressed.
+        """
+        _, ext = self.entries[i].lattice(self.factor)
+        a = [max(0, int(v)) for v in lo]
+        b = [min(int(v), int(n)) for v, n in zip(hi, ext)]
+        return np.asarray(
+            self.array[i, :, a[0] : b[0], a[1] : b[1], a[2] : b[2]], dtype=np.float32
         )
 
     def read(self, i: int) -> np.ndarray:
@@ -791,9 +829,14 @@ def ingest_source(
                     source[tuple(slice(a, b) for a, b in zip(lo, hi))]
                 )
                 if size > 1:
-                    from scipy import ndimage
+                    if _xp.uses_torch():
+                        from . import gpu_ops
 
-                    block = ndimage.median_filter(block, size=size)
+                        block = _xp.get(gpu_ops.median_filter(_xp.put(block), size))
+                    else:
+                        from scipy import ndimage
+
+                        block = ndimage.median_filter(block, size=size)
                 core = tuple(
                     slice(o - a, min(o + step, n) - a)
                     for o, a, n in zip(origin, lo, shape)
@@ -822,7 +865,7 @@ def ingest_array(
     A thin wrapper over :func:`ingest_source`, kept because tests and small
     runs have an array in hand rather than a file.
     """
-    arr = np.asarray(data)
+    arr = _xp.get(data)
     if arr.ndim != 3:
         raise ValueError(f"expected a 3D volume, got shape {arr.shape}")
     return ingest_source(

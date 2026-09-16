@@ -31,7 +31,14 @@ def empty() -> np.ndarray:
 
 
 def histogram(values: np.ndarray) -> np.ndarray:
-    """Bin displacement magnitudes, in millimetres."""
+    """Bin displacement magnitudes, in millimetres.
+
+    A device tensor is binned on its device; only the counts come back.
+    """
+    if type(values).__module__.split(".", 1)[0] == "torch":
+        from .gpu_ops import histogram as _device_histogram
+
+        return _device_histogram(values, EDGES)
     v = np.asarray(values, dtype=np.float64).ravel()
     if v.size == 0:
         return empty()

@@ -25,6 +25,7 @@ from scipy import ndimage
 
 from .. import backend as _backend
 from .. import fields as _fields
+from .. import xp as _xp
 from .. import stats as _stats
 from ..config import RunConfig
 from ..grid import GridSpec
@@ -76,7 +77,7 @@ def run_update_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[s
     margin = _fields.required_margin(mean_warp, spacing)
     src_origin = tuple(o - margin for o in core_origin)
     src_shape = tuple(s + 2 * margin for s in core_shape)
-    block = read_padded(isum, src_origin, src_shape, mode="constant") / n
+    block = _xp.put(read_padded(isum, src_origin, src_shape, mode="constant")) / n
     updated = _fields.warp_offset(block, (margin, margin, margin), mean_warp, spacing)
 
     if manifest.level in cfg.levels.sharpen_laplacian_levels:
@@ -115,7 +116,7 @@ def _mean_warp_block(
         lead=1,
         mode="edge",
     )
-    block = block * np.float32(-eps / n)
+    block = _xp.put(block) * float(-eps / n)
 
     lat = grid.coarsened(factor)
     sub_lat = GridSpec(
@@ -133,6 +134,6 @@ def _sharpen(img: np.ndarray, amount: float = 0.5, sigma: float = 1.0) -> np.nda
     Applied only at coarse levels, where the averaging blur is a large fraction
     of the voxel and the template is a shape prior rather than a deliverable.
     """
-    blurred = ndimage.gaussian_filter(img, sigma, mode="nearest")
-    return np.clip(img + amount * (img - blurred), 0.0, None).astype(np.float32)
+    blurred = _fields.smooth(img, sigma, mode="nearest")
+    return _xp.to_float32(_xp.clip(img + amount * (img - blurred), 0.0, None))
 

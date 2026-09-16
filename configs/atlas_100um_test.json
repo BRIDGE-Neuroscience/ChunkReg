@@ -1,11 +1,14 @@
 {
-  "root": "/scratch/proj/hipct-cohort",
-  "runner": "slurm",
+  "root": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_100um_test",
+  "runner": "local",
+  "device": "cuda",
+  "engine": "fireants",
   "backend": "zarr",
   "profile": "a16",
   "gpu_mem_gb": 80,
 
   "spacing_mm": 0.05,
+  "grid": {"spacing_mm": 0.1, "align": "centre"},
 
   "bytes_per_voxel_channel": 90,
   "throughput_ch_vox_per_s": 1.5e6,
@@ -17,16 +20,14 @@
   },
 
   "subjects": [
-    {"id": "s01", "source": "raw/s01.ome.zarr"},
-    {"id": "s02", "source": "raw/s02.ome.zarr"},
-    {"id": "s03", "source": "raw/s03.ome.zarr"},
-    {"id": "s04", "source": "raw/s04.ome.zarr"},
-    {"id": "s05", "source": "raw/s05.ome.zarr"}
+    {"id": "AUMC_2025_044", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr"},
+    {"id": "LADAF_2020_27", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr"},
+    {"id": "LADAF_2021_17", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr"},
+    {"id": "S_21_46",       "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr"}
   ],
 
   "levels": {
-    "run": "all",
-    "caps": [8, 6, 4, 3, 2],
+    "caps": [8, 6, 4, 2, 1],
 
     "level0_stages": [
       "moments",
@@ -67,12 +68,5 @@
     "keep_history_levels": [0, 1],
     "delete_task_arrays": true,
     "delete_accumulators": true
-  },
-
-  "slurm": {
-    "partition": "gpu",
-    "register": {"gpus": 1, "cpus": 8, "mem_gb": 64, "time": "04:00:00", "chunks_per_task": 16},
-    "blend":    {"gpus": 0, "cpus": 8, "mem_gb": 32, "time": "02:00:00"},
-    "update":   {"gpus": 0, "cpus": 8, "mem_gb": 32, "time": "01:00:00"}
   }
 }

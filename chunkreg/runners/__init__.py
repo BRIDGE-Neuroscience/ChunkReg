@@ -14,6 +14,14 @@ from .local import LocalRunner
 __all__ = ["Runner", "TaskStatus", "LocalRunner", "get_runner"]
 
 
+def __getattr__(name):
+    if name == "MultiGPURunner":
+        from .multigpu import MultiGPURunner
+
+        return MultiGPURunner
+    raise AttributeError(name)
+
+
 def get_runner(name: str, **kwargs) -> Runner:
     if name == "local":
         return LocalRunner(**kwargs)
@@ -21,4 +29,8 @@ def get_runner(name: str, **kwargs) -> Runner:
         from .slurm import SlurmRunner
 
         return SlurmRunner(**kwargs)
+    if name == "multigpu":
+        from .multigpu import MultiGPURunner
+
+        return MultiGPURunner(**kwargs)
     raise ValueError(f"unknown runner {name!r}; use 'local' or 'slurm'")

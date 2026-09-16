@@ -25,6 +25,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .. import fields as _fields
+from .. import xp as _xp
 from .base import RegResult, check_inputs, check_stages
 
 __all__ = ["FireAntsEngine"]
@@ -75,6 +76,7 @@ class FireAntsEngine:
         self.device = device
         self.progress = bool(progress)
         self._api: dict[str, Any] | None = None
+        self._geometries: dict[tuple, Any] = {}
 
     def _lazy(self) -> dict[str, Any]:
         if self._api is None:
@@ -88,7 +90,21 @@ class FireAntsEngine:
         The chunk is isotropic and axis aligned, so spacing is uniform and the
         direction is identity. The array it holds is a placeholder; the real
         channels are substituted by FakeBatchedImages.
+
+        Built once per chunk shape and kept: almost every chunk of a level has
+        the same padded shape, and building one allocates a placeholder volume
+        on the host and copies it to the device.
         """
+        key = (tuple(int(n) for n in shape), float(spacing_mm), str(device))
+        cached = self._geometries.get(key)
+        if cached is not None:
+            return cached
+        if len(self._geometries) > 16:
+            self._geometries.clear()
+        self._geometries[key] = geom = self._build_geometry(shape, spacing_mm, device)
+        return geom
+
+    def _build_geometry(self, shape, spacing_mm: float, device):
         api = self._lazy()
         import SimpleITK as sitk
 
@@ -104,8 +120,11 @@ class FireAntsEngine:
     def _wrap(self, batch, stack, device):
         api = self._lazy()
         torch = api["torch"]
-        t = torch.as_tensor(np.ascontiguousarray(stack), dtype=torch.float32)
-        return api["FakeBatchedImages"](t[None].to(device), batch)
+        if _xp.is_tensor(stack):
+            t = stack.to(device=device, dtype=torch.float32)
+        else:
+            t = torch.as_tensor(np.ascontiguousarray(stack), dtype=torch.float32).to(device)
+        return api["FakeBatchedImages"](t[None], batch)
 
     # -- stages ------------------------------------------------------------- #
     def register(
@@ -121,7 +140,13 @@ class FireAntsEngine:
         check_stages(stages, self.supports, self.name)
         api = self._lazy()
         torch = api["torch"]
-        dev = device or self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dev = device or self.device
+        if dev is None:
+            dev = (
+                str(_xp.torch_device())
+                if _xp.uses_torch()
+                else ("cuda" if torch.cuda.is_available() else "cpu")
+            )
 
         shape = tuple(f.shape[1:])
         geom = self._geometry(shape, spacing_mm, dev)
@@ -188,15 +213,17 @@ class FireAntsEngine:
                 "no deformable stage ran, so there is no displacement field to "
                 "return. Add a 'greedy' or 'syn' stage."
             )
-        disp = _fields.grid_to_disp_mm(
-            grid.detach().cpu().numpy(), shape, spacing_mm
-        )
+        # Converted on the device; it only leaves if this process computes on
+        # the host.
+        disp = _fields.grid_to_disp_mm(grid.detach().to(dev), shape, spacing_mm)
+        if not _xp.uses_torch():
+            disp = _xp.get(disp)
         return RegResult(
             disp_mm=disp,
             loss_curve=curve,
             iters_per_scale=iters,
             converged=_converged(curve),
-            affine=None if affine is None else np.asarray(affine),
+            affine=None if affine is None else _xp.get(affine),
         )
 
 
