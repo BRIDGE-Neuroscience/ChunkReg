@@ -1,0 +1,145 @@
+#!/bin/bash
+# Anatomix feature maps at every pyramid level of one subject, as PNGs.
+# Runs scripts/anatomix_level_pngs.py inside chunkreg.sif on one H100.
+#
+#   qsub sge/anatomix_levels_test.qsub                         # first subject, all levels
+#   qsub -v SUBJECT=S_21_46 sge/anatomix_levels_test.qsub      # another subject
+#   qsub -v LEVELS=0,1,2,3 sge/anatomix_levels_test.qsub       # 1600 to 200 um only
+#   qsub -v AT="-10.5,4.0,22.0" sge/anatomix_levels_test.qsub  # a chosen point, world mm z,y,x
+#
+# For each level it takes the registration chunk (core plus halo) that holds
+# the point, extracts features on the GPU, and writes into OUT:
+#   L<k>_<um>um_intensity.png, L<k>_<um>um_features_rgb.png,
+#   L<k>_<um>um_channels_{axial,coronal,sagittal}.png, overview.png,
+#   summary.json (per-level timings, peak GPU memory, variance shown)
+#
+# The subject must already be ingested: run 'chunkreg setup' on CONFIG first
+# (the atlas_50um job does that). Nothing here writes to the subject stores.
+
+# ---- Grid Engine resources ------------------------------------------------
+#$ -N chunkreg_anatomix_levels
+#$ -l h_rt=01:00:00                  # walltime
+#$ -l gpu=true,gpu_type=h100
+#$ -pe gpu 1                         # one GPU is enough for one chunk at a time
+#$ -l tmem=64G                       # PER SLOT
+#$ -R y
+#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
+#$ -S /bin/bash
+#$ -cwd
+#$ -j y
+
+set -euo pipefail
+
+# ---- SETTINGS -------------------------------------------------------------
+# The image built by containers/build.sh.
+SIF="${SIF:-/home/akeenlys/storage_main/images/chunkreg.sif}"
+# The chunkreg checkout. Its scripts/ folder holds the test script, and by
+# default its chunkreg/ package is used instead of the copy in the image, so
+# the GPU feature path does not wait for an image rebuild.
+REPO="${REPO:-/home/akeenlys/storage_main/bridge_project_data/chunkreg}"
+CHUNKREG_SRC="${CHUNKREG_SRC-$REPO}"
+# The run config whose subject stores to read.
+CONFIG="${CONFIG:-$REPO/configs/atlas_50um.json}"
+# Subject id; empty takes the config's first subject.
+SUBJECT="${SUBJECT:-}"
+# Output folder; empty writes to <config root>/qc/anatomix_levels/<subject>.
+OUT="${OUT:-}"
+# Point to slice through, world mm as z,y,x; empty uses the tissue centroid.
+AT="${AT:-}"
+# Levels, comma separated; empty does every level.
+LEVELS="${LEVELS:-}"
+# Feature extractor; empty uses the config profile's (anatomix).
+FEATURES="${FEATURES:-}"
+# Host directories visible inside the container, comma separated.
+BINDS="${BINDS:-/home/akeenlys/storage_main}"
+# ---------------------------------------------------------------------------
+
+SCRIPT="$REPO/scripts/anatomix_level_pngs.py"
+
+echo "job ${JOB_ID:-<interactive>} on $(hostname), $(date)"
+echo "gpus=${CUDA_VISIBLE_DEVICES:-<all visible>} sif=$SIF"
+echo "config=$CONFIG subject=${SUBJECT:-<first>} levels=${LEVELS:-<all>} at=${AT:-<tissue centroid>}"
+
+[ -f "$SIF" ]    || { echo "FATAL: no image at $SIF; build it with containers/build.sh" >&2; exit 1; }
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG" >&2; exit 1; }
+[ -f "$SCRIPT" ] || { echo "FATAL: no script at $SCRIPT; is REPO=$REPO right?" >&2; exit 1; }
+CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+if [ -n "$CHUNKREG_SRC" ]; then
+    CHUNKREG_SRC="$(cd "$CHUNKREG_SRC" && pwd)"
+fi
+
+RUNTIME=$(command -v apptainer || command -v singularity) \
+    || { echo "FATAL: no apptainer/singularity (try: module load apptainer)" >&2; exit 1; }
+
+# Node-local scratch for the torch and matplotlib caches, never NFS.
+export TMPDIR="${TMPDIR:-/tmp/chunkreg.$$}"
+CACHE="$TMPDIR/chunkreg-cache"
+mkdir -p "$CACHE/torch" "$CACHE/mpl"
+
+pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+fi
+pass TMPDIR                  "$TMPDIR"
+pass XDG_CACHE_HOME          "$CACHE"
+pass TORCHINDUCTOR_CACHE_DIR "$CACHE/torch"
+pass MPLCONFIGDIR            "$CACHE/mpl"
+pass OMP_NUM_THREADS         "${NSLOTS:-1}"
+pass PATH                    "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
+pass HF_HOME                 "/opt/hf"
+pass HF_HUB_OFFLINE          "1"
+pass PYTHONNOUSERSITE        "1"
+pass PYTHONUNBUFFERED        "1"
+
+bind="$TMPDIR"
+IFS=, read -r -a bind_dirs <<< "$BINDS"
+for d in "${bind_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    [ -e "$d" ] || { echo "FATAL: BINDS entry $d does not exist" >&2; exit 1; }
+    bind="$bind,$d"
+    real="$(readlink -f "$d")"
+    [ "$real" = "$d" ] || { bind="$bind,$real"; echo "binding $d -> $real"; }
+done
+if [ -n "$CHUNKREG_SRC" ]; then
+    [ -d "$CHUNKREG_SRC/chunkreg" ] \
+        || { echo "FATAL: CHUNKREG_SRC=$CHUNKREG_SRC has no chunkreg/ package" >&2; exit 1; }
+    bind="$bind,$CHUNKREG_SRC:/opt/chunkreg-dev:ro"
+    pass PYTHONPATH "/opt/chunkreg-dev"
+    echo "using chunkreg source from $CHUNKREG_SRC"
+fi
+
+box() { "$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" "$@"; }
+
+# Fail in seconds if the GPU is missing or the checkout lacks the GPU path.
+box python - <<'EOF'
+import sys
+import torch
+import chunkreg
+print(f"chunkreg {chunkreg.__version__} from {chunkreg.__file__}")
+if not torch.cuda.is_available():
+    sys.exit("FATAL: torch sees no GPU inside the container (is --nv working?)")
+print(f"torch {torch.__version__} on {torch.cuda.get_device_name(0)}")
+try:
+    import chunkreg.xp, chunkreg.gpu_ops  # noqa: F401
+except ImportError:
+    sys.exit("FATAL: this chunkreg has no GPU path; set CHUNKREG_SRC to the repo")
+try:
+    import PIL  # noqa: F401
+except ImportError:
+    sys.exit("FATAL: Pillow is missing from the image; rebuild with the viz extra")
+EOF
+
+args=("$CONFIG" --device cuda)
+[ -n "$SUBJECT" ]  && args+=(--subject "$SUBJECT")
+[ -n "$OUT" ]      && args+=(--out "$OUT")
+[ -n "$AT" ]       && args+=("--at=$AT")   # "=" keeps a negative z from reading as a flag
+[ -n "$LEVELS" ]   && args+=(--levels "$LEVELS")
+[ -n "$FEATURES" ] && args+=(--features "$FEATURES")
+
+echo
+echo "==== anatomix feature maps  $(date -Is)"
+box python "$SCRIPT" "${args[@]}"
+
+echo
+echo "done $(date -Is)"
