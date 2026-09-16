@@ -1,0 +1,47 @@
+# Chunk profiles. The geometry is identical across all of them; only the
+# channel count and the feature receptive field differ, which is what makes
+# them interchangeable without re-tuning anything else.
+#
+# The clamp column is what the halo has left after paying for the similarity
+# kernel support and the feature receptive field. Note that i1 gets three times
+# the clamp of the feature profiles for free: raw intensity has no receptive
+# field to pay for.
+#
+#  name  core  halo  padded  channels  r_f  clamp (vox)  memory   device class
+#  a16    256    48     352        16   24           12    58 GB         80 GB
+#  a8     256    48     352         8   24           12    29 GB         40 GB
+#  a4     256    48     352         4   24           12    15 GB         24 GB
+#  i1     256    48     352         1    0           36     4 GB           any
+#
+# Memory assumes 90 bytes per voxel-channel; run `chunkreg calibrate` to
+# replace that with a measured figure for your backbone and hardware.
+
+a16:
+  channels: 16
+  features: anatomix
+  r_f: 24
+
+a8:
+  channels: 8
+  features: pca:8
+  r_f: 24
+
+a4:
+  channels: 4
+  features: pca:4
+  r_f: 24
+
+i1:
+  channels: 1
+  features: intensity
+  r_f: 0
+
+# A variant for 80 GB devices that buys back a deeper in-chunk pyramid. Four
+# scales cost 24 voxels of halo in kernel support alone, so the halo has to
+# grow from 48 to 64 to leave a usable clamp.
+a16-deep:
+  channels: 16
+  features: anatomix
+  r_f: 24
+  halo: 64
+  scales: [4, 2, 1]

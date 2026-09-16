@@ -1,0 +1,78 @@
+# HiP-CT cohort: 10 subjects at 50 um on a common grid.
+#
+# Run `chunkreg plan` against this before submitting anything. At profile a16
+# it resolves to five levels (800, 400, 200, 100, 50 um) with 1, 4, 18, 100 and
+# 800 chunks per subject, a clamp of 12 voxels at every level, and roughly
+# 2400 GPU-hours at the caps. Dropping to a4 divides that by four and the
+# device class from 80 GB to 24 GB; gate G2 is what decides whether the
+# channels are earning their cost at native resolution.
+
+root: /scratch/proj/hipct-cohort
+runner: slurm
+backend: zarr
+profile: a16
+gpu_mem_gb: 80
+
+# Replace with measurements from `chunkreg calibrate`. The defaults are
+# published figures, not observations of your hardware.
+bytes_per_voxel_channel: 90
+throughput_ch_vox_per_s: 1.5e6
+
+grid:
+  spacing_mm: 0.05
+
+subjects:
+  - {id: s01, path: subjects/s01.zarr}
+  - {id: s02, path: subjects/s02.zarr}
+  - {id: s03, path: subjects/s03.zarr}
+  - {id: s04, path: subjects/s04.zarr}
+  - {id: s05, path: subjects/s05.zarr}
+  - {id: s06, path: subjects/s06.zarr}
+  - {id: s07, path: subjects/s07.zarr}
+  - {id: s08, path: subjects/s08.zarr}
+  - {id: s09, path: subjects/s09.zarr}
+  - {id: s10, path: subjects/s10.zarr}
+
+levels:
+  # Backstops, not a schedule: a level exits as soon as the stopping rule is
+  # met. The coarsest level gets the most because it starts from a voxelwise
+  # mean carrying the full population shape bias, which decays as 0.75^k.
+  caps: [8, 6, 4, 3, 2]
+
+  # Level 0 is one chunk, so its halo is irrelevant and it can afford the deep
+  # pyramid that estimates the global component no finer level can see.
+  level0_stages:
+    - moments
+    - {rigid:  {scales: [4, 2, 1], iterations: [200, 100, 50], lr: 0.01}}
+    - {affine: {scales: [4, 2, 1], iterations: [200, 100, 50], lr: 0.01}}
+    - {greedy: {scales: [8, 4, 2, 1], iterations: [120, 80, 50, 30]}}
+
+  # Seeded levels solve a small residual. A deeper pyramid here would spend the
+  # entire halo on kernel support and leave no clamp; the config loader rejects
+  # it rather than letting it through silently.
+  seeded_stages:
+    - {greedy: {scales: [2, 1], iterations: [50, 30]}}
+
+  stop:
+    residual_frac: 0.5   # of the next level's clamp
+    ubar_vox: 1.0        # template step, in voxels of this level
+    percentile: 99.0
+
+  shape_update_step: 0.25
+  sharpen_laplacian_levels: [0, 1]
+  min_tissue_fraction: 0.02
+
+retry:
+  fold_frac: 0.001
+  ladder: [sigma_w_x2, clamp_x0.5, emit_seed]
+
+retention:
+  keep_history_levels: [0, 1]
+  delete_task_arrays: true
+  delete_accumulators: true
+
+slurm:
+  partition: gpu
+  register: {gpus: 1, cpus: 8, mem_gb: 64, time: "04:00:00", chunks_per_task: 16}
+  blend:    {cpus: 8, mem_gb: 32, time: "02:00:00"}
+  update:   {cpus: 8, mem_gb: 32, time: "01:00:00"}
