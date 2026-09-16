@@ -1,0 +1,5 @@
+# Shell scripts and container files run on Linux; keep LF on any checkout.
+*.sh    text eol=lf
+*.def   text eol=lf
+*.qsub  text eol=lf
+*.sbatch text eol=lf

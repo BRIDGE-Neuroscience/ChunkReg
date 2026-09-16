@@ -53,11 +53,11 @@ while [ $# -gt 0 ]; do
 done
 
 # One row per CUDA version: the devel base (nvcc is needed for the fused ops),
-# the torch release, and the wheel index that matches both.
+# the torch and torchvision releases, and the wheel index that matches them.
 case "$CUDA" in
-    12.1) BASE=nvidia/cuda:12.1.1-devel-ubuntu22.04 TORCH=2.5.1 TAG=cu121 ;;
-    12.4) BASE=nvidia/cuda:12.4.1-devel-ubuntu22.04 TORCH=2.5.1 TAG=cu124 ;;
-    12.6) BASE=nvidia/cuda:12.6.3-devel-ubuntu22.04 TORCH=2.7.1 TAG=cu126 ;;
+    12.1) BASE=nvidia/cuda:12.1.1-devel-ubuntu22.04 TORCH=2.5.1 VISION=0.20.1 TAG=cu121 ;;
+    12.4) BASE=nvidia/cuda:12.4.1-devel-ubuntu22.04 TORCH=2.5.1 VISION=0.20.1 TAG=cu124 ;;
+    12.6) BASE=nvidia/cuda:12.6.3-devel-ubuntu22.04 TORCH=2.7.1 VISION=0.22.1 TAG=cu126 ;;
     *) die "--cuda must be 12.1, 12.4 or 12.6, not '$CUDA'" ;;
 esac
 INDEX="https://download.pytorch.org/whl/$TAG"
@@ -134,6 +134,7 @@ trap 'rm -rf "$WORK"' EXIT
 sed -e "s|@BASE_IMAGE@|$BASE|g" \
     -e "s|@CUDA@|$CUDA|g" \
     -e "s|@TORCH_VERSION@|$TORCH|g" \
+    -e "s|@TORCHVISION_VERSION@|$VISION|g" \
     -e "s|@TORCH_INDEX@|$INDEX|g" \
     -e "s|@MAX_JOBS@|$JOBS|g" \
     -e "s|@REPO@|$REPO|g" \
@@ -151,9 +152,9 @@ rm -f "$PARTIAL"
 if ! "${BUILD[@]}" "$PARTIAL" "$WORK/chunkreg.def"; then
     rm -f "$PARTIAL"
     if [ "$MODE" = fakeroot ]; then
-        die "the build failed. If the error mentions fakeroot or subuid, this
-  account cannot use --fakeroot here; rerun with --mode sudo, or ask an
-  admin to run: sudo apptainer config fakeroot --add $(id -un)"
+        die "the build failed; the error is above. Only if it mentions fakeroot
+  or subuid is this account unable to use --fakeroot here: then rerun with
+  --mode sudo, or ask an admin to run: sudo apptainer config fakeroot --add $(id -un)"
     fi
     die "the build failed; the error is above"
 fi

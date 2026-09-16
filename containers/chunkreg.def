@@ -51,16 +51,29 @@ From: @BASE_IMAGE@
     PIP="/opt/venv/bin/python -m pip"
     $PIP install --no-cache-dir --upgrade pip setuptools wheel
 
-    # torch first, from the index for the image's CUDA. The constraint keeps
-    # every later install from swapping it for a PyPI build.
-    $PIP install --no-cache-dir "torch==@TORCH_VERSION@" \
-        --index-url "@TORCH_INDEX@"
-    echo "torch==@TORCH_VERSION@" > /opt/constraints.txt
-    PIP="$PIP -c /opt/constraints.txt"
-
+    # torch first, from the index for the image's CUDA. The constraints keep
+    # every later install from swapping it for a PyPI build. monai 1.6 wants
+    # torch 2.8+, so it is held at the last release that accepts this torch.
     $PIP install --no-cache-dir \
-        "/opt/chunkreg-src[store,io,gpu,qc,viz]" \
-        "git+https://github.com/neel-dey/anatomix.git"
+        "torch==@TORCH_VERSION@" "torchvision==@TORCHVISION_VERSION@" \
+        --index-url "@TORCH_INDEX@"
+    printf '%s\n' \
+        "torch==@TORCH_VERSION@" \
+        "torchvision==@TORCHVISION_VERSION@" \
+        "monai==1.5.2" > /opt/constraints.txt
+    export PIP_CONSTRAINT=/opt/constraints.txt
+
+    $PIP install --no-cache-dir "/opt/chunkreg-src[store,io,gpu,qc,viz]"
+
+    # anatomix pins torch==2.13 in its requirements, which none of the builds
+    # here can satisfy, so it goes in without deps and its requirements are
+    # listed below minus the torch pins. Pinned to a commit because main moves.
+    $PIP install --no-cache-dir --no-deps \
+        "git+https://github.com/neel-dey/anatomix.git@c67a181e6755b1138c7008017baaaf51cdb76fa3"
+    $PIP install --no-cache-dir \
+        numpy nibabel scipy scikit-image scikit-learn simpleitk nilearn h5py \
+        matplotlib torchio monai tensorboard tqdm natsort huggingface_hub \
+        "dynamic-network-architectures==0.4.4"
 
     # FireANTs, as anatomix's install_fireants.sh does it: the pinned fork,
     # --no-deps to keep this torch, then the fused ops. There is no GPU at
