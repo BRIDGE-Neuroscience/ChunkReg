@@ -1,25 +1,29 @@
 Bootstrap: docker
-From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+From: @BASE_IMAGE@
 
 # chunkreg with the GPU path: torch, MONAI, anatomix (weights baked in) and the
 # pinned FireANTs fork with its fused CUDA ops.
 #
-# Build from the repo root, since the %files paths below are relative to it:
-#     bash containers/build.sh            # -> chunkreg.sif
+# This is a template: do not build it directly. containers/build.sh fills in the
+# @...@ placeholders for the chosen CUDA version and builds it:
+#     bash containers/build.sh --cuda 12.1
 #
 # The devel base is deliberate: FireANTs' fused ops are compiled here, and that
-# needs nvcc. Everything lives in a venv under /opt/venv rather than a conda
-# prefix, and %post ends with a chmod, so the image runs for any uid; a
-# rapidsai-style /opt/conda owned by one uid is what broke the BRIDGE jobs.
+# needs nvcc. Python comes from uv rather than the distro, because zarr 3 needs
+# 3.11+ and Ubuntu 22.04 ships 3.10. Everything lives under /opt and %post ends
+# with a chmod, so the image runs for any uid; a rapidsai-style /opt/conda owned
+# by one uid is what broke the BRIDGE jobs.
 
 %labels
     Name chunkreg
     Description Hierarchical chunked co-registration, GPU build
+    CUDA @CUDA@
+    Torch @TORCH_VERSION@
 
 %files
-    pyproject.toml /opt/chunkreg-src/pyproject.toml
-    README.md      /opt/chunkreg-src/README.md
-    chunkreg       /opt/chunkreg-src/chunkreg
+    @REPO@/pyproject.toml /opt/chunkreg-src/pyproject.toml
+    @REPO@/README.md      /opt/chunkreg-src/README.md
+    @REPO@/chunkreg       /opt/chunkreg-src/chunkreg
 
 %environment
     export PATH=/opt/venv/bin:$PATH
@@ -35,16 +39,24 @@ From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-dev build-essential git ca-certificates
+        build-essential git curl ca-certificates
     rm -rf /var/lib/apt/lists/*
 
-    python3 -m venv /opt/venv
+    # Python from uv, installed under /opt so it ends up inside the image.
+    curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/opt/uv UV_NO_MODIFY_PATH=1 sh
+    export UV_PYTHON_INSTALL_DIR=/opt/python
+    /opt/uv/uv python install 3.12
+    /opt/uv/uv venv --python 3.12 --seed /opt/venv
     PIP="/opt/venv/bin/python -m pip"
     $PIP install --no-cache-dir --upgrade pip setuptools wheel
 
-    # torch first and pinned to the image's CUDA, so nothing later swaps it.
-    $PIP install --no-cache-dir torch==2.7.1 \
-        --index-url https://download.pytorch.org/whl/cu126
+    # torch first, from the index for the image's CUDA. The constraint keeps
+    # every later install from swapping it for a PyPI build.
+    $PIP install --no-cache-dir "torch==@TORCH_VERSION@" \
+        --index-url "@TORCH_INDEX@"
+    echo "torch==@TORCH_VERSION@" > /opt/constraints.txt
+    PIP="$PIP -c /opt/constraints.txt"
 
     $PIP install --no-cache-dir \
         "/opt/chunkreg-src[store,io,gpu,qc,viz]" \
@@ -61,7 +73,7 @@ From: nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
         "SimpleITK>=2.2.1" nibabel scipy scikit-image matplotlib tqdm pandas hydra-core
     export CUDA_HOME=/usr/local/cuda
     export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
-    export MAX_JOBS=4
+    export MAX_JOBS="@MAX_JOBS@"
     $PIP install --no-cache-dir --no-build-isolation /opt/fireants/fused_ops
 
     # Only the backbone the profiles use is fetched; add others here if needed.
@@ -77,6 +89,9 @@ import torch, monai, zarr, SimpleITK, fireants, fireants_fused_ops
 from anatomix.model.load_from_hf import load_from_hf
 import chunkreg
 load_from_hf("anatomix")
+# get_arch_list() is empty without a GPU, and a build has none.
+arches = torch._C._cuda_getArchFlags()
+assert "sm_90" in arches, f"torch has no H100 kernels: {arches}"
 print("chunkreg", chunkreg.__version__, "torch", torch.__version__,
       "cuda", torch.version.cuda, "- imports and cached weights OK")
 EOF

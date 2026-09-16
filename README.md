@@ -151,6 +151,12 @@ pass is submitted as a job array, and each element calls
 `chunkreg run-task`. Edit the templates in [slurm/](slurm/) to load your
 environment.
 
+On a Grid Engine cluster, build the Apptainer image on a Linux machine with
+`bash containers/build.sh`; its `--help` explains how to pick the CUDA
+version. Then set `"runner": "local"`, fill in the settings at the top of
+[sge/chunkreg.qsub](sge/chunkreg.qsub) and submit it with `qsub`. The whole run happens in that one GPU job. If the job hits its
+time limit, submit it again and the run resumes.
+
 ## Tests
 
 ```bash
