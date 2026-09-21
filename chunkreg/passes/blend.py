@@ -15,6 +15,7 @@ everywhere by construction.
 from __future__ import annotations
 
 import time
+from itertools import product
 from typing import Any
 
 import numpy as np
@@ -29,7 +30,44 @@ from ..store import Field, TaskArray, Volume, read_padded, write_block
 from ._common import warped_subject_block
 from .manifest import Manifest
 
-__all__ = ["run_blend_task", "ensure_accumulators", "blend_core"]
+__all__ = ["run_blend_task", "ensure_accumulators", "blend_core", "blend_depends"]
+
+
+def blend_depends(cfg: RunConfig, manifest: Manifest) -> dict[int, set[int]]:
+    """For each core, the register tasks whose results its blend reads.
+
+    A core's blend reads the residuals of every chunk whose padded box reaches
+    into it -- itself plus at most its 26 neighbours -- for every subject, and
+    those sit in whichever task arrays the manifest grouped them into. Stating
+    that before the pass runs is what lets a runner start one core's blend
+    while the rest of the register pass is still going, instead of holding
+    every worker at a barrier that only the last few register tasks are still
+    keeping shut.
+
+    Candidates come from the chunk lattice rather than from testing every
+    chunk against every other, which is quadratic and at production chunk
+    counts costs more than the answer is worth. A padded box overruns its core
+    by at most the halo, so only chunks within ``ceil(halo / core)`` index
+    steps can reach in; each candidate is then checked against the same
+    overlap predicate the blend itself uses, so the result is exactly
+    :meth:`Manifest.chunks_touching_core`.
+    """
+    radius = -(-int(cfg.profile.halo) // int(cfg.profile.core))
+    offsets = list(product(range(-radius, radius + 1), repeat=3))
+    by_index = {tuple(c.index): c for c in manifest.chunks}
+    deps: dict[int, set[int]] = {}
+    for own in manifest.chunks:
+        tasks: set[int] = set()
+        for dz, dy, dx in offsets:
+            other = by_index.get(
+                (own.index[0] + dz, own.index[1] + dy, own.index[2] + dx)
+            )
+            if other is None or not other.intersects(own.core_origin, own.core_shape):
+                continue
+            for subject in manifest.subjects:
+                tasks.add(manifest.locate(subject, other.id)[0])
+        deps[own.id] = tasks
+    return deps
 
 
 def ensure_accumulators(cfg: RunConfig, manifest: Manifest) -> tuple[Any, Any]:

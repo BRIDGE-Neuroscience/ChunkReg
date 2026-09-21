@@ -245,7 +245,16 @@ class MemoryBackend:
 
     @staticmethod
     def _key(path) -> str:
-        return str(Path(path).as_posix()).rstrip("/")
+        """One key per location, however the caller spelled the path.
+
+        Keyed absolutely, because the same store is reached by a relative path
+        from one caller and an absolute one from another -- a pairwise run
+        rewrites its subject paths to absolute so they survive the move to its
+        own root. Lexical, not ``resolve()``: no filesystem lookup, and a
+        symlink keeps whichever name it was opened under, the same way the
+        zarr backend would.
+        """
+        return Path(os.path.abspath(path)).as_posix().rstrip("/")
 
     def create(
         self,

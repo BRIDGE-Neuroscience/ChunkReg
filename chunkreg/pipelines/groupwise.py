@@ -16,6 +16,12 @@ step is sub-voxel, further passes cannot move the template by anything it can
 represent. A level that inherits an already-converged shape exits after one
 pass; the first level, which starts from a biased voxelwise mean, uses its cap.
 
+Register and blend are one dispatch, not two. A core's blend reads the chunks
+whose padded boxes reach into it and nothing else, so it can start as soon as
+those are registered. A runner that says it can (``runs_fused``) is handed both
+passes and the dependency between them; the rest keep the barrier, which for a
+serial runner costs nothing anyway.
+
 A run resumes rather than restarts. Every finished pass leaves a record and
 every seeded level a marker, so starting the same run again replays the
 records through the stopping rule, skips the work they cover and carries on
@@ -50,7 +56,14 @@ from ..runners.base import RunReport
 from ..store import Field, Volume
 from .. import stats as _stats
 
-__all__ = ["PassReport", "LevelReport", "RunResult", "build_template", "register_pair"]
+__all__ = [
+    "PassReport",
+    "LevelReport",
+    "RunResult",
+    "build_template",
+    "register_pair",
+    "pair_config",
+]
 
 
 @dataclass
@@ -89,21 +102,29 @@ class RunResult:
     template: Volume
     fields: dict[str, Field]
     levels: list[LevelReport] = field(default_factory=list)
+    fixed_template: str | None = None
+    """The subject held fixed, when there was one. A pairwise run reports no
+    template motion, so the column that carries it is left out rather than
+    printed as a column of zeros."""
 
     @property
     def n_passes(self) -> int:
         return sum(lv.n_passes for lv in self.levels)
 
     def summary(self) -> str:
+        step = self.fixed_template is None
         rows = [
             f"{'lvl':>3} {'spacing':>8} {'pass':>5} {'d99 mm':>9} "
-            f"{'step mm':>9} {'folds':>8} {'exit':>28}"
+            + (f"{'step mm':>9} " if step else "")
+            + f"{'folds':>8} {'exit':>28}"
         ]
         for lv in self.levels:
             for p in lv.passes:
                 rows.append(
                     f"{lv.level:>3} {lv.grid.spacing_mm:>8.4g} {p.iteration:>5} "
-                    f"{p.d99_mm:>9.4f} {p.step_mm:>9.4f} {p.fold_frac:>8.2%} "
+                    f"{p.d99_mm:>9.4f} "
+                    + (f"{p.step_mm:>9.4f} " if step else "")
+                    + f"{p.fold_frac:>8.2%} "
                     f"{(p.reason if p.stopped else ''):>28}"
                 )
         return "\n".join(rows)
@@ -197,7 +218,14 @@ def build_template(
 
         if not _is_seeded(cfg, level):
             if previous is None:
-                say("level 0: initial template from the voxelwise mean")
+                say(
+                    "level 0: initial template from "
+                    + (
+                        f"subject {cfg.template_subject!r}"
+                        if cfg.template_subject
+                        else "the voxelwise mean"
+                    )
+                )
                 _promote.seed_level_zero(cfg, grid, volumes)
             else:
                 say(f"promote level {previous} -> {level}")
@@ -235,8 +263,9 @@ def build_template(
             say(
                 f"level {level} pass {iteration}: "
                 + ("done earlier, " if replayed else "")
-                + f"d99 {pr.d99_mm:.4f} mm, step {pr.step_mm:.4f} mm, "
-                f"folds {pr.fold_frac:.2%}"
+                + f"d99 {pr.d99_mm:.4f} mm, "
+                + ("" if cfg.template_subject else f"step {pr.step_mm:.4f} mm, ")
+                + f"folds {pr.fold_frac:.2%}"
                 + (f" -> {reason}" if stopped else "")
             )
             if not replayed:
@@ -262,6 +291,7 @@ def build_template(
         template=Volume.open(cfg.template_path(last), cfg.backend),
         fields=fields_,
         levels=reports,
+        fixed_template=cfg.template_subject,
     )
 
 
@@ -286,23 +316,40 @@ def _run_pass(
     if hasattr(runner, "bind"):
         runner.bind(config_path, level, iteration, cfg=cfg)
 
-    reg = runner.run(
-        "register",
-        lambda tid: _register.run_register_task(
-            cfg, manifest, tid, engine=engine, extractor=extractor
-        ),
-        range(manifest.n_tasks),
-    )
-    reg.raise_for_failures()
-
-    # Created once here so the common path does not rely on the race-tolerance
-    # inside the task.
+    # Created before anything is dispatched, so the common path does not rely
+    # on the race-tolerance inside the task, and so a blend that starts while
+    # register is still running finds them there.
     _blend.ensure_accumulators(cfg, manifest)
-    bl = runner.run(
-        "blend",
-        lambda cid: _blend.run_blend_task(cfg, manifest, cid),
-        range(len(manifest.chunks)),
-    )
+    register_ids = range(manifest.n_tasks)
+    blend_ids = range(len(manifest.chunks))
+
+    if getattr(runner, "runs_fused", False):
+        # A core's blend waits only on the chunks that reach into it, not on
+        # the whole register pass, so the two run as one dependency-ordered
+        # dispatch. The barrier they replace is where most of a node's GPUs
+        # sit idle behind the last few register tasks of every pass.
+        reg, bl = runner.run_chain(
+            "register",
+            register_ids,
+            "blend",
+            blend_ids,
+            _blend.blend_depends(cfg, manifest),
+        )
+    else:
+        reg = runner.run(
+            "register",
+            lambda tid: _register.run_register_task(
+                cfg, manifest, tid, engine=engine, extractor=extractor
+            ),
+            register_ids,
+        )
+        reg.raise_for_failures()
+        bl = runner.run(
+            "blend",
+            lambda cid: _blend.run_blend_task(cfg, manifest, cid),
+            blend_ids,
+        )
+    reg.raise_for_failures()
     bl.raise_for_failures()
 
     # A template held fixed is not estimated, so there is no intensity average
@@ -425,19 +472,23 @@ def _forget(cfg: RunConfig, from_level: int) -> None:
             marker.unlink()
 
 
-def register_pair(
-    cfg: RunConfig,
-    fixed: str,
-    moving: str,
-    runner=None,
-    engine=None,
-    config_path: str | None = None,
-) -> RunResult:
-    """Pairwise registration: the same loop with the template held fixed.
+def pair_config(
+    cfg: RunConfig, fixed: str, moving: str, root: str | Path | None = None
+) -> RunConfig:
+    """The configuration a pairwise run of two of these subjects runs under.
 
-    The fixed volume *is* the template at every level, so no template is
-    estimated, the unbiasing update pass does not run, and the loop reduces to
-    seeded refinement of one subject down the pyramid.
+    Two things change, and both have to, for reasons that are easy to miss.
+
+    The subject list narrows to the two volumes and ``template_subject`` names
+    the fixed one. That much is the whole of pairwise registration.
+
+    The root moves to a directory of its own, and the subject paths are made
+    absolute so they still point at the cohort's stores from there. A pairwise
+    run writes the same files a groupwise run does -- ``levels/L*/template``,
+    ``levels/L*/pass_it*.json``, ``fields/<id>`` -- and a run resumes from
+    whatever it finds. Sharing a root with the cohort run, or with another
+    pair, would make each one replay the other's finished passes and seed from
+    the other's template, which is not a conflict any of them can detect.
     """
     from dataclasses import replace
 
@@ -455,13 +506,67 @@ def register_pair(
             f"itself has no meaning"
         )
 
-    paired = replace(
+    # Absolute, because this config's whole purpose is to be loaded somewhere
+    # else: a worker process or a batch node need not start in the directory
+    # the driver did, and a relative root would send them somewhere else.
+    root = os.path.abspath(root if root is not None else cfg.pair_root(fixed, moving))
+    subjects = []
+    for spec in cfg.subjects:
+        if spec.id not in (fixed, moving):
+            continue
+        source = spec.source
+        if source is not None and not Path(source).is_absolute():
+            source = os.path.abspath(cfg.root_path / source)
+        subjects.append(
+            replace(
+                spec,
+                path=os.path.abspath(cfg.subject_path(spec.id)),
+                source=source,
+            )
+        )
+    return replace(
         cfg,
-        subjects=tuple(s for s in cfg.subjects if s.id in (fixed, moving)),
+        root=str(root),
+        subjects=tuple(subjects),
         template_subject=fixed,
     )
+
+
+def register_pair(
+    cfg: RunConfig,
+    fixed: str,
+    moving: str,
+    runner=None,
+    engine=None,
+    root: str | Path | None = None,
+    config_path: str | Path | None = None,
+    progress: Callable[[str], None] | None = None,
+    from_level: int | None = None,
+) -> RunResult:
+    """Pairwise registration: the same loop with the template held fixed.
+
+    The fixed volume *is* the template at every level, so no template is
+    estimated, the unbiasing update pass does not run, and the loop reduces to
+    seeded refinement of one subject down the pyramid.
+
+    The derived configuration is written to disk before the run starts, and
+    that file is what the run is dispatched by. A multi-GPU worker and a batch
+    node each rebuild their task from a config path rather than receiving a
+    closure, so a pair that existed only in the driver's memory could not be
+    spread over anything: it had to run in one process. Writing it out is what
+    makes ``chunkreg pair`` reach the same GPUs ``chunkreg run`` does.
+    """
+    from ..config import save_config
+
+    paired = pair_config(cfg, fixed, moving, root=root)
+    path = save_config(paired, config_path or Path(paired.root) / "config.json")
     return build_template(
-        paired, runner=runner, engine=engine, config_path=config_path
+        paired,
+        runner=runner,
+        engine=engine,
+        from_level=from_level,
+        progress=progress,
+        config_path=str(path),
     )
 
 
@@ -492,12 +597,36 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float) -> Pa
 def _should_stop(
     cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap
 ) -> tuple[bool, str]:
-    converged_template = pr.step_mm < cfg.levels.ubar_vox * grid.spacing_mm
-    if threshold <= 0:
-        if converged_template:
-            return True, "template converged"
-    elif pr.d99_mm < threshold and converged_template:
-        return True, "residual fits the next halo"
+    """Has this level finished?
+
+    Two rules, because the two pipelines converge on different quantities.
+
+    With an estimated template, the binding constraint is the template itself:
+    the fields chase a target that is still moving, so the level is done when
+    the recentring step goes sub-voxel *and* the residual fits the next halo.
+
+    With a template held fixed the target never moves, the update pass does not
+    run, and ``step_mm`` is identically zero -- so that test passes vacuously
+    and cannot be the rule. What converges instead is the residual: the part of
+    the correspondence each pass could not already explain. The level is done
+    once that is smaller than the level can represent, or small enough for the
+    next level's halo to absorb. Without this a pairwise run stopped after one
+    pass at its finest level, every time.
+    """
+    fits_next_halo = threshold > 0 and pr.d99_mm < threshold
+
+    if cfg.template_subject is not None:
+        if pr.d99_mm < cfg.levels.residual_vox * grid.spacing_mm:
+            return True, "residual is sub-voxel"
+        if fits_next_halo:
+            return True, "residual fits the next halo"
+    else:
+        converged_template = pr.step_mm < cfg.levels.ubar_vox * grid.spacing_mm
+        if threshold <= 0:
+            if converged_template:
+                return True, "template converged"
+        elif fits_next_halo and converged_template:
+            return True, "residual fits the next halo"
     if iteration + 1 >= cap:
         return True, "cap reached"
     return False, ""

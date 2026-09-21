@@ -27,6 +27,7 @@ import numpy as np
 __all__ = [
     "DEVICES",
     "configure",
+    "tune_cuda",
     "device_name",
     "uses_torch",
     "on_gpu",
@@ -107,7 +108,60 @@ def configure(device: str | None, honour_env: bool = True) -> str:
     """Set this process's device. Returns the resolved name."""
     global _device
     _device = resolve(device, honour_env)
+    if _device.startswith("cuda"):
+        tune_cuda()
     return _device
+
+
+_tuned = False
+
+
+def tune_cuda(force: bool = False) -> None:
+    """Turn on the CUDA settings this workload wants, once per process.
+
+    Registration is convolution-bound: the engine's local correlation and its
+    Gaussian regularisation are the inner loop, and both run in fp32 through
+    cuDNN. Two defaults cost real throughput there and neither is a numerical
+    risk for this problem:
+
+    ``TF32``
+        On Ampere and later, fp32 convolutions and matmuls can use tensor
+        cores at roughly tenfold throughput for ten bits of mantissa. A
+        displacement field is accurate to a fraction of a voxel at best, and
+        the features it is solved on are normalised to order one, so the lost
+        bits are far below anything the result represents. The feature network
+        already runs in bfloat16, which is coarser still.
+
+    ``cudnn.benchmark``
+        Chunk geometry is fixed by the profile, so a level presents only a
+        handful of distinct shapes: the padded interior and whatever the
+        volume's faces, edges and corners trim it to. Autotuning each one once
+        and reusing the plan for every remaining chunk of the level is exactly
+        the case this flag is for.
+
+    Both are off with ``CHUNKREG_TF32=0`` and ``CHUNKREG_CUDNN_BENCHMARK=0``,
+    for bisecting a numerical difference against an earlier run.
+    """
+    global _tuned
+    if _tuned and not force:
+        return
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - resolve() already refused
+        return
+    if _env_flag("CHUNKREG_TF32", True):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    if _env_flag("CHUNKREG_CUDNN_BENCHMARK", True):
+        torch.backends.cudnn.benchmark = True
+    _tuned = True
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 
 def device_name() -> str:

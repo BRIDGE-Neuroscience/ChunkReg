@@ -445,3 +445,202 @@ def test_an_ingest_block_is_read():
     )
     assert loaded.ingest.dtype == "uint8"
     assert loaded.ingest.median_radius == 1.5
+
+
+# --------------------------------------------------------------------------- #
+# Workers per GPU
+# --------------------------------------------------------------------------- #
+def _one_subject(**kw) -> dict:
+    return {"root": "/run", "subjects": [{"id": "s01"}], **kw}
+
+
+def test_workers_per_gpu_defaults_to_one():
+    """The memory model is a model until setup measures it, so start safe."""
+    loaded = load_config(_one_subject(profile="a16"))
+    assert loaded.workers_per_gpu == 1
+    n, why = loaded.workers_on_each_gpu()
+    assert n == 1
+    assert "GB" in why
+
+
+def test_workers_per_gpu_auto_allows_a_second_only_when_two_fit():
+    light = load_config(
+        _one_subject(profile="a4", gpu_mem_gb=80, workers_per_gpu="auto")
+    )
+    heavy = load_config(
+        _one_subject(profile="a16", gpu_mem_gb=80, workers_per_gpu="auto")
+    )
+    assert light.workers_on_each_gpu()[0] == 2
+    assert heavy.workers_on_each_gpu()[0] == 1
+
+
+def test_an_over_budget_worker_count_is_stated_rather_than_silently_taken():
+    loaded = load_config(_one_subject(profile="a16", gpu_mem_gb=80, workers_per_gpu=2))
+    n, why = loaded.workers_on_each_gpu()
+    assert n == 2, "an explicit setting is honoured"
+    assert "out-of-memory" in why
+
+
+@pytest.mark.parametrize("value", [0, -1, "two", 1.5])
+def test_workers_per_gpu_rejects_nonsense(value):
+    with pytest.raises(ConfigError, match="workers_per_gpu"):
+        load_config(_one_subject(workers_per_gpu=value))
+
+
+# --------------------------------------------------------------------------- #
+# The shipped cohort config
+# --------------------------------------------------------------------------- #
+def test_the_atlas_config_resolves_as_intended():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "configs" / "atlas_50um.json"
+    loaded = load_config(path)
+    assert loaded.n_subjects == 4
+    assert loaded.device == "cuda" and loaded.engine == "fireants"
+    # Stop at 100 um rather than registering on a 100 um grid: the 50 um
+    # stores stay linked, and a later run carries on to 50 um.
+    assert loaded.levels.stop_at == 0.1, "100um is normalised to mm at load"
+    assert loaded.grid.spacing_mm == "finest"
+    # One chunk per task, so four subjects of a chunk share one template
+    # feature extraction and the tasks spread evenly over six GPUs.
+    assert loaded.slurm.register.chunks_per_task == 4
+    assert loaded.profile.features == "anatomix+mindssc@8"
+    assert loaded.profile.channels == 8
+    for level in (1, 2, 3, 4, 5):
+        assert loaded.levels.level_params[level]["tolerance"] == 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# Writing a configuration back out
+# --------------------------------------------------------------------------- #
+"""A run has to be able to write a config as well as read one.
+
+A derived run -- a pair drawn out of a cohort, a registration set up from two
+file paths -- is dispatched to worker processes and batch nodes by config file,
+so one that exists only in the driver's memory cannot leave the driver.
+"""
+
+
+def _roundtrips(raw: dict) -> None:
+    from chunkreg.config import load_config
+
+    cfg = load_config(raw)
+    back = load_config(cfg.to_config_dict())
+    assert back == cfg, (
+        f"written back as {cfg.to_config_dict()}, which loads differently"
+    )
+
+
+def test_a_minimal_config_round_trips():
+    _roundtrips({"root": "r", "spacing_mm": 0.05,
+                 "subjects": [{"id": "a", "source": "a.zarr"}]})
+
+
+@pytest.mark.parametrize("profile", ["a16", "a8", "a4", "i1"])
+@pytest.mark.parametrize(
+    "features",
+    [None, {"mind": True}, {"mind": False}, {"mind": True, "sample_channels": 8}],
+)
+def test_every_profile_and_features_block_round_trips(profile, features):
+    """The features block is derived, not stored, so it has to be rebuilt.
+
+    ``load_config`` applies it after ``profile_overrides``, and leaving it out
+    does not mean "leave the profile alone" -- it means "take the default",
+    which for an anatomix profile switches MIND on. A config that resolved to
+    MIND off therefore has to say so explicitly on the way out.
+    """
+    raw = {"root": "r", "spacing_mm": 0.05, "profile": profile,
+           "subjects": [{"id": "a", "source": "a.zarr"}]}
+    if features is not None:
+        raw["features"] = features
+    _roundtrips(raw)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"levels": {"stop_at": "200um"}},
+        {"levels": {"run": [0, "400um", "0.2mm"]}},
+        {"levels": {"run": "listed", "level_params": {"2": {"lr": 0.3}}}},
+        {"levels": {"level_stages": {"1": [{"greedy": {"scales": [2, 1],
+                                                       "iterations": [9, 8]}}]}}},
+        {"levels": {"stop": {"residual_frac": 0.3, "ubar_vox": 0.8,
+                             "residual_vox": 0.25, "percentile": 99.9}}},
+        {"levels": {"caps": [5, 4, 3]}},
+        {"grid": {"spacing_mm": 0.1, "shape": [10, 20, 30], "align": "corner"}},
+        {"ingest": {"dtype": "float32", "median_radius": 1.5,
+                    "percentiles": [1, 99], "link": False}},
+        {"retry": {"fold_frac": 0.02}},
+        {"retention": {"delete_task_arrays": False}},
+        {"runner": "slurm", "slurm": {"partition": "gpu", "account": "acct",
+                                      "max_wait_s": 900,
+                                      "register": {"gpus": 2, "cpus": 16,
+                                                   "time": "08:00:00",
+                                                   "chunks_per_task": 32}}},
+        {"device": "cuda", "engine": "fireants", "gpus": 2,
+         "workers_per_gpu": "auto", "seed": 7},
+        {"gpu_mem_gb": 40.0, "bytes_per_voxel_channel": 75.0,
+         "throughput_ch_vox_per_s": 2.0e6},
+        {"profile_overrides": {"core": 128, "halo": 56, "inner_chunk": 32}},
+    ],
+)
+def test_each_config_block_round_trips(block):
+    raw = {"root": "r", "spacing_mm": 0.05,
+           "subjects": [{"id": "a", "source": "a.zarr"}]}
+    raw.update(block)
+    _roundtrips(raw)
+
+
+def test_subject_entries_round_trip():
+    _roundtrips({
+        "root": "r",
+        "subjects": [
+            {"id": "a", "source": "a.zarr", "spacing_mm": [0.2, 0.05, 0.05]},
+            {"id": "b", "path": "custom/b.zarr", "source": "b.nii.gz",
+             "spacing_mm": 0.05},
+        ],
+    })
+
+
+def test_a_template_subject_round_trips():
+    _roundtrips({
+        "root": "r", "spacing_mm": 0.05, "template_subject": "a",
+        "subjects": [{"id": "a", "source": "a.zarr"},
+                     {"id": "b", "source": "b.zarr"}],
+    })
+
+
+def test_a_spacing_is_written_back_with_its_unit():
+    """A bare decimal is refused on the way in, so it cannot be written out.
+
+    ``levels.stop_at`` holds 0.2 for 200 um, and re-emitting that number would
+    produce a config that no longer loads: 0.2 could as easily be a typo for
+    level 2.
+    """
+    from chunkreg.config import load_config
+
+    cfg = load_config({"root": "r", "spacing_mm": 0.05,
+                       "subjects": [{"id": "a", "source": "a.zarr"}],
+                       "levels": {"stop_at": "200um"}})
+    assert cfg.to_config_dict()["levels"]["stop_at"] == "0.2mm"
+
+
+def test_only_what_differs_from_the_defaults_is_written():
+    """The result should read like a config someone wrote, not a dump."""
+    from chunkreg.config import load_config
+
+    cfg = load_config({"root": "r", "spacing_mm": 0.05,
+                       "subjects": [{"id": "a", "source": "a.zarr"}]})
+    written = cfg.to_config_dict()
+    assert set(written) == {"root", "subjects", "profile", "spacing_mm"}
+
+
+def test_save_config_writes_a_file_that_loads(tmp_path):
+    from chunkreg.config import load_config, save_config
+
+    cfg = load_config({"root": "r", "spacing_mm": 0.05, "template_subject": "a",
+                       "subjects": [{"id": "a", "source": "a.zarr"},
+                                    {"id": "b", "source": "b.zarr"}]})
+    path = save_config(cfg, tmp_path / "nested" / "config.json")
+    assert path.exists()
+    assert load_config(path) == cfg

@@ -1,38 +1,38 @@
 #!/bin/bash
-# chunkreg on a Grid Engine cluster (UCL CS), inside chunkreg.sif.
-# Atlas cohort at 50 um: AUMC_2025_044, LADAF_2020_27, LADAF_2021_17, S_21_46,
-# config configs/atlas_50um.json.
+# chunkreg on pryor (UCL CS Grid Engine), inside chunkreg.sif, on 6 H100s.
+# Atlas cohort: AUMC_2025_044, LADAF_2020_27, LADAF_2021_17, S_21_46.
+# Subject stores are already ingested under the config's root, so setup skips
+# ingest and goes straight to the conventions check, calibration and the plan.
 #
-#   qsub sge/atlas_50um.qsub                     # to 100 um, the config's stop_at
-#   qsub -v STOP_AT=200um sge/atlas_50um.qsub    # a quicker first look
-#   qsub -v STOP_AT=50um  sge/atlas_50um.qsub    # then carry on to native
+#   qsub -pe gpu 1 -l h_rt=2:00:00 -v STAGES=setup sge/atlas_50um_pryor.qsub
+#                                                # first: prove FireANTs works
+#   qsub sge/atlas_50um_pryor.qsub               # then: the run, to 100 um
+#   qsub -v STOP_AT=50um sge/atlas_50um_pryor.qsub   # later: carry on to 50 um
 #
-# The config stops at 100 um and registers 8 of the 28 anatomix+MIND channels
-# per pass. Going finer or wider is a resubmit, not a rerun: a later STOP_AT
-# carries on from what is already solved.
+# The setup-only job is worth running first and on one GPU. It is where the
+# FireANTs adapter is executed for the first time: 'chunkreg selftest' checks
+# the displacement conventions against that build and setup stops the job if
+# they are wrong, which is far cheaper to discover on one card than six. It
+# also prints the measured receptive field, bytes per voxel-channel and
+# throughput; copy the throughput into the config's throughput_ch_vox_per_s
+# to make the plan's GPU-hours mean anything.
 #
-# setup prints the measured H100 throughput in its calibration block. The
-# plan after it still uses the config's throughput_ch_vox_per_s, so copy the
-# measured value there to see the real cost of each STOP_AT.
+# CHUNKREG_SRC below points at the pushed checkout, so the code that runs is
+# the one in /home/akeenlys/storage_main/bridge_project_data/chunkreg
+# rather than the copy baked into the image. Rebuilding the image is not
+# needed for a code change; it is needed only if a dependency changes.
 #
-# Grid Engine has no chunkreg runner, so the whole run happens inside this one
-# job: the config must say "runner": "local". With "device": "cuda" the run
-# starts one worker per GPU the job holds, so -pe gpu sets how many are used.
-#
-# A job that hits h_rt is continued by submitting the same script again: setup
-# skips what is ingested, and run replays its finished passes and carries on
-# from the first one that is missing. The same goes for STOP_AT: stop at 200um,
-# look at the result, then submit again with STOP_AT=100um to go finer without
-# redoing anything.
+# A job that hits h_rt is continued by submitting the same script again: run
+# replays its finished passes and carries on from the first one missing.
 
 # ---- Grid Engine resources ------------------------------------------------
-#$ -N chunkreg_atlas_50um
-#$ -l h_rt=48:00:00                  # walltime
+#$ -N chunkreg_atlas
+#$ -l h_rt=24:00:00                  # walltime; the run resumes if it is hit
 #$ -l gpu=true,gpu_type=h100
 #$ -pe gpu 6                         # GPUs; one chunkreg worker on each
 #$ -l tmem=48G                       # PER SLOT: multiplied by the slot count above.
 #$ -R y
-#$ -o /SAN/external/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
+#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
 #$ -S /bin/bash
 #$ -cwd
 #$ -j y
@@ -41,12 +41,12 @@ set -euo pipefail
 
 # ---- SETTINGS -------------------------------------------------------------
 # The image built by containers/build.sh. Keep it on shared storage.
-SIF="${SIF:-/SAN/external/bridge_project_data/containers/chunkreg.sif}"
+SIF="${SIF:-/home/akeenlys/storage_main/bridge_project_data/containers/chunkreg.sif}"
 # The run config. Its root and every subject source must be under BINDS.
-CONFIG="${CONFIG:-/SAN/external/bridge_project_data/chunkreg/configs/atlas_50um.json}"
+CONFIG="${CONFIG:-/home/akeenlys/storage_main/bridge_project_data/chunkreg/configs/atlas_50um_pryor.json}"
 # Host directories visible inside the container, comma separated. $HOME and
 # the submit directory are bound automatically.
-BINDS="${BINDS:-/SAN/external/bridge_project_data}"
+BINDS="${BINDS:-/home/akeenlys/storage_main/bridge_project_data}"
 # Which commands to run, in order: any of setup, run, status.
 STAGES="${STAGES:-setup run status}"
 # The finest level to run: a spacing such as 200um or a level index. Empty runs
@@ -60,7 +60,7 @@ SETUP_ARGS="${SETUP_ARGS:-}"
 RUN_ARGS="${RUN_ARGS:-}"
 # Optional: a chunkreg checkout to use instead of the copy baked into the
 # image, so code edits do not need a rebuild. Leave empty to use the image.
-CHUNKREG_SRC="${CHUNKREG_SRC:-}"
+CHUNKREG_SRC="${CHUNKREG_SRC:-/home/akeenlys/storage_main/bridge_project_data/chunkreg}"
 # ---------------------------------------------------------------------------
 
 echo "job ${JOB_ID:-<interactive>} on $(hostname), $(date)"

@@ -55,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-ingest", action="store_true", help="skip ingest")
     p.add_argument(
+        "--jobs", type=int, default=4,
+        help="subjects to ingest at once (default 4); 1 ingests them in turn",
+    )
+    p.add_argument(
         "--no-selftest", action="store_true", help="skip the conventions check"
     )
     p.add_argument(
@@ -131,6 +135,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("config")
     p.add_argument("--fixed", required=True)
     p.add_argument("--moving", required=True)
+    p.add_argument(
+        "--root", default=None,
+        help="where to write this pair's output (default: "
+             "<root>/pairs/<fixed>__<moving>)",
+    )
+    p.add_argument(
+        "--stop-at", default=None, metavar="LEVEL",
+        help="finest level to run: an index such as 3 or a spacing such as "
+             "200um. Running again with a finer level carries on from here",
+    )
+    p.add_argument(
+        "--from-level", type=int, default=None, metavar="N",
+        help="redo from level N, discarding progress at N and finer",
+    )
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--engine", default=None)
 
@@ -157,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--profile", default="a16", help="profile for the output store")
     p.add_argument(
+        "--on", default=None, metavar="STORE",
+        help="resample the result onto the lattice the scan behind STORE "
+             "arrived on, instead of leaving it on the run grid",
+    )
+    p.add_argument(
         "--device", default="auto",
         help="where to warp: auto, cuda, cuda:N or cpu (default: a GPU if there is one)",
     )
@@ -164,6 +187,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("export", help="store -> nifti or tiff")
     p.add_argument("store")
     p.add_argument("out")
+    p.add_argument(
+        "--level", type=int, default=None,
+        help="pyramid level to write, numbered as the run numbers them "
+             "(0 coarsest). Default: the store's finest. A template store "
+             "holds a single level, so this is for subject stores, where it "
+             "is how a coarse level is pulled out to look at beside a "
+             "template of the same level",
+    )
+    p.add_argument(
+        "--on", default=None, metavar="STORE",
+        help="write on the lattice the scan behind STORE arrived on, rather "
+             "than on the run grid. For a registration onto a fixed volume "
+             "that is the fixed subject's store, which puts the result back "
+             "on the sampling it is expected in, anisotropic voxels included",
+    )
 
     p = sub.add_parser("clean", help="apply the retention policy")
     p.add_argument("config")
@@ -176,6 +214,26 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+def _ingest_subjects(cfg, reingest: bool = False, jobs: int = 4):
+    """``chunkreg.ingest.ingest_subjects``, narrating to stdout."""
+    from .ingest import ingest_subjects
+
+    return ingest_subjects(cfg, reingest=reingest, jobs=jobs, say=print)
+
+
+def _check_subjects(cfg) -> None:
+    """``chunkreg.ingest.check_subjects``, narrating to stdout."""
+    from .ingest import check_subjects
+
+    check_subjects(cfg, say=print)
+
+
+def _native_grid(cfg):
+    from .ingest import native_grid
+
+    return native_grid(cfg)
+
+
 def _load(path, stop_at=None):
     """Load a config, with a ``--stop-at`` from the command line applied."""
     from dataclasses import replace
@@ -203,48 +261,17 @@ def _configure(cfg) -> str:
 
 
 def _gpu_slots(cfg, device: str) -> list[str]:
-    """The GPUs a local run spreads over, one worker each.
+    from .runners import gpu_slots
 
-    Only a plain ``cuda`` device spreads: ``cuda:N`` asks for one card, and a
-    CPU device has none.
-    """
-    if device != "cuda":
-        return []
-    from .runners.multigpu import visible_gpus
-
-    ids = visible_gpus()
-    if cfg.gpus == "all":
-        return ids
-    want = int(cfg.gpus)
-    if want > len(ids):
-        print(
-            f"  warning: gpus is {want} but this job can see {len(ids)} GPU(s) "
-            f"({', '.join(ids) or 'none'}); using those"
-        )
-    return ids[:want]
+    return gpu_slots(cfg, device, say=print)
 
 
-def _native_grid(cfg):
-    from .store import Volume
+def _make_runner(cfg, device: str, engine_name: str, config_path, workers: int = 1):
+    from .runners import runner_for
 
-    first = cfg.subjects[0]
-    if Volume.exists(cfg.subject_path(first.id), cfg.backend):
-        return Volume.open(cfg.subject_path(first.id), cfg.backend).native_grid
-    if cfg.spacing_mm is None:
-        raise SystemExit(
-            "no ingested subjects found and no spacing_mm in the config, so "
-            "the native grid is unknown. Run 'chunkreg setup' first."
-        )
-    raise SystemExit(
-        f"subject {first.id!r} is not ingested at {cfg.subject_path(first.id)}. "
-        f"Run 'chunkreg setup' first."
+    return runner_for(
+        cfg, device, engine_name, config_path, workers=workers, say=print
     )
-
-
-def _resolve(cfg, rel) -> Path:
-    """A config-relative path, left alone if it is already absolute."""
-    q = Path(rel)
-    return q if q.is_absolute() else cfg.root_path / q
 
 
 def _fmt_stage(st) -> str:
@@ -324,274 +351,6 @@ def _report_stray_overrides(cfg, levels) -> None:
         )
 
 
-def _fmt_voxel(v) -> str:
-    v = tuple(float(x) for x in v)
-    if max(v) <= min(v) * (1 + 1e-6):
-        return f"{v[0]:g} mm"
-    return " x ".join(f"{x:g}" for x in v) + " mm (z, y, x)"
-
-
-def _scan_voxel(cfg, spec, source) -> tuple[float, float, float]:
-    """A scan's voxel size, from the subject entry, the file or the config.
-
-    A subject's own ``spacing_mm`` is taken over the file, since the point of
-    setting it is a file that is wrong or silent. The top-level value is a
-    cohort-wide default, so it has to agree with any file that states a size.
-    """
-    from .io_formats import spacing_agrees
-
-    stated = source.voxel_mm
-    if spec.spacing_mm is not None:
-        if stated is not None and not spacing_agrees(spec.spacing_mm, stated):
-            print(
-                f"  note: {spec.id}: using the subject's spacing_mm "
-                f"{_fmt_voxel(spec.spacing_mm)} over the file's {_fmt_voxel(stated)}"
-            )
-        return spec.spacing_mm
-    if cfg.spacing_mm is not None:
-        if stated is not None and not spacing_agrees(cfg.spacing_mm, stated):
-            raise SystemExit(
-                f"subject {spec.id!r}: the config says {cfg.spacing_mm:g} mm but "
-                f"{source.description} says {_fmt_voxel(stated)}. Fix one, or set "
-                f"spacing_mm on the subject to overrule the file; the pipeline "
-                f"will not guess which is right."
-            )
-        return (cfg.spacing_mm,) * 3
-    if stated is not None:
-        return stated
-    if not isinstance(cfg.grid.spacing_mm, str):
-        # Configs written before the grid block chose the run resolution used
-        # grid.spacing_mm to mean the sources' voxel size.
-        return (cfg.grid.spacing_mm,) * 3
-    raise SystemExit(
-        f"subject {spec.id!r}: {source.description} does not state its voxel "
-        f"size; set 'spacing_mm' on the subject or at the top level of the config."
-    )
-
-
-def _same_grid(a, b) -> bool:
-    import math
-
-    return (
-        a.shape == b.shape
-        and math.isclose(a.spacing_mm, b.spacing_mm, rel_tol=1e-9)
-        and all(
-            math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-9 * a.spacing_mm)
-            for x, y in zip(a.origin_mm, b.origin_mm)
-        )
-    )
-
-
-def _fmt_grid(g) -> str:
-    return f"{'x'.join(str(n) for n in g.shape)} @ {g.spacing_mm:g} mm"
-
-
-def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
-    """Ingest every subject that names a source and has no store yet.
-
-    Scans may differ in shape and voxel size. The run grid is resolved from the
-    whole cohort (see :mod:`chunkreg.cohort`) and each scan is resampled onto
-    it, so every store ends up on one grid.
-    """
-    from . import backend as _backend
-    from .cohort import Placement, ResampledSource, placement_notes, resolve_run_grid
-    from .io_formats import is_chunkreg_store, is_zarr, open_source
-    from .store import Volume, ingest_source, link_source
-
-    todo, kept = [], []
-    for spec in cfg.subjects:
-        dst = cfg.subject_path(spec.id)
-        present = Volume.exists(dst, cfg.backend)
-        if present and not (reingest and spec.source is not None):
-            kept.append(spec.id)
-            continue
-        if spec.source is None:
-            if is_zarr(dst):
-                raise SystemExit(
-                    f"subject {spec.id!r}: {dst} is a zarr but not a chunkreg "
-                    f"store. Name it as the subject's 'source' and let 'path' "
-                    f"default; setup then reads it in place, or copies it if it "
-                    f"is not on the run grid."
-                )
-            raise SystemExit(
-                f"subject {spec.id!r} has no store at {dst} and no 'source' to "
-                f"ingest from. Add a 'source' to the subject entry."
-            )
-        todo.append(spec)
-    if not todo:
-        return [], kept
-
-    # The run grid depends on every scan, so the ones already ingested count
-    # too. Their stores record the scan they came from, which saves opening
-    # sources that may have been moved since.
-    scans, sources = {}, {}
-    for spec in cfg.subjects:
-        if spec in todo:
-            src_path = _resolve(cfg, spec.source)
-            dst = cfg.subject_path(spec.id)
-            if src_path.resolve() == Path(dst).resolve():
-                raise SystemExit(
-                    f"subject {spec.id!r}: 'source' and 'path' are both {dst}; "
-                    f"the store has to be written somewhere else"
-                )
-            source = open_source(src_path)
-            sources[spec.id] = (src_path, source)
-            scans[spec.id] = (source.shape, _scan_voxel(cfg, spec, source))
-            continue
-        vol = Volume.open(cfg.subject_path(spec.id), cfg.backend)
-        recorded = (vol.meta.get("provenance") or {}).get("placement")
-        if recorded:
-            pl = Placement.from_json(recorded)
-            scans[spec.id] = (pl.shape, pl.voxel_mm)
-        else:
-            g = vol.native_grid
-            scans[spec.id] = (g.shape, (g.spacing_mm,) * 3)
-
-    try:
-        grid, placements = resolve_run_grid(
-            scans, cfg.grid.spacing_mm, cfg.grid.shape, cfg.grid.align
-        )
-    except ValueError as exc:
-        raise SystemExit(f"cannot choose a run grid: {exc}") from None
-    moved = {
-        sid: Volume.open(cfg.subject_path(sid), cfg.backend).native_grid
-        for sid in kept
-    }
-    moved = {sid: g for sid, g in moved.items() if not _same_grid(g, grid)}
-    if moved:
-        detail = ", ".join(f"{sid} {_fmt_grid(g)}" for sid, g in moved.items())
-        raise SystemExit(
-            f"with these scans and grid settings the run grid is "
-            f"{_fmt_grid(grid)}, but existing stores are on another grid "
-            f"({detail}). The grid follows from every scan, so adding a larger "
-            f"or finer scan, or changing the grid block, moves it. Run "
-            f"'chunkreg setup --reingest' to put every scan on the new grid."
-        )
-
-    print(
-        f"  run grid {_fmt_grid(grid)} (grid.spacing_mm {cfg.grid.spacing_mm}, "
-        f"align {cfg.grid.align})"
-    )
-    _backend.write_json(
-        cfg.grid_record_path,
-        {
-            "shape": list(grid.shape),
-            "spacing_mm": grid.spacing_mm,
-            "origin_mm": list(grid.origin_mm),
-            "align": cfg.grid.align,
-            "placements": {sid: p.to_json() for sid, p in placements.items()},
-        },
-        cfg.backend,
-    )
-
-    done = []
-    for spec in todo:
-        dst = cfg.subject_path(spec.id)
-        src_path, source = sources[spec.id]
-        placement = placements[spec.id]
-        how, notes = placement_notes(grid, placement)
-        view = ResampledSource(source, placement, grid)
-        provenance = {
-            "source": str(src_path),
-            "config": cfg.fingerprint(),
-            "placement": placement.to_json(),
-        }
-        # A zarr already exactly on the run grid is read where it is: copying
-        # it would only duplicate the largest level. Anything that changes the
-        # voxels on the way in (a median, another dtype) needs the copy.
-        linkable = (
-            cfg.ingest.link
-            and view.is_identity
-            and is_zarr(src_path)
-            and not is_chunkreg_store(src_path)
-            and cfg.ingest.median_radius is None
-            and cfg.ingest.dtype in ("auto", str(source.dtype))
-        )
-        if linkable:
-            from .io_formats import open_zarr_in_place
-
-            arr = open_zarr_in_place(src_path)
-            layout = f"chunks {tuple(getattr(arr, 'chunks', ()) or ())}"
-            shards = getattr(arr, "shards", None)
-            layout += f", shards {tuple(shards)}" if shards else ", not sharded"
-            how = (
-                f"read in place, full resolution not copied ({layout}; set "
-                f"ingest.link false to copy it into {cfg.profile.core}-voxel shards)"
-            )
-            vol = link_source(
-                src_path,
-                dst,
-                grid.spacing_mm,
-                cfg.profile,
-                origin_mm=grid.origin_mm,
-                backend=cfg.backend,
-                overwrite=True,
-                percentiles=cfg.ingest.percentiles,
-                provenance=provenance,
-            )
-        else:
-            vol = ingest_source(
-                view,
-                dst,
-                grid.spacing_mm,
-                cfg.profile,
-                origin_mm=grid.origin_mm,
-                dtype=cfg.ingest.dtype,
-                backend=cfg.backend,
-                overwrite=True,
-                percentiles=cfg.ingest.percentiles,
-                median_radius=cfg.ingest.median_radius,
-                provenance=provenance,
-            )
-        lo, hi = vol.normalisation
-        print(
-            f"  {spec.id}: {source.description} -> {dst}\n"
-            f"      scan {'x'.join(str(n) for n in source.shape)} @ "
-            f"{_fmt_voxel(placement.voxel_mm)}, {how}\n"
-            f"      {vol.native_grid.shape} @ {grid.spacing_mm:g} mm, "
-            f"{vol.n_levels} levels, {vol.array(vol.n_levels - 1).dtype}, "
-            f"window [{lo:.4g}, {hi:.4g}]"
-        )
-        for note in notes:
-            print(f"      warning: {note}")
-        done.append(spec.id)
-    return done, kept
-
-
-def _check_subjects(cfg) -> None:
-    """Every subject must be a store this profile can run on, on one grid."""
-    from .store import Volume, check_volume
-
-    grids = {}
-    failures = []
-    for spec in cfg.subjects:
-        dst = cfg.subject_path(spec.id)
-        if not Volume.exists(dst, cfg.backend):
-            failures.append(f"{spec.id}: no store at {dst}")
-            continue
-        vol = Volume.open(dst, cfg.backend)
-        errors, warnings = check_volume(vol, cfg.profile)
-        failures += [f"{spec.id}: {e}" for e in errors]
-        for w in warnings:
-            print(f"  warning: {spec.id}: {w}")
-        grids[spec.id] = vol.native_grid
-    first = next(iter(grids.values()), None)
-    if first is not None and not all(_same_grid(g, first) for g in grids.values()):
-        detail = ", ".join(f"{k} {_fmt_grid(g)}" for k, g in grids.items())
-        failures.append(
-            f"subjects are on different grids ({detail}). Every store has to be "
-            f"on the one run grid; 'chunkreg setup --reingest' resamples every "
-            f"scan onto it"
-        )
-    if failures:
-        raise SystemExit(
-            "subject stores are not ready:\n  "
-            + "\n  ".join(failures)
-            + "\nRe-run 'chunkreg setup --reingest' after fixing the sources."
-        )
-    print(f"  {len(grids)} subject store(s) sharded and on one grid")
-
-
 def cmd_setup(args) -> int:
     """Stage one: ingest, check conventions, measure, and plan."""
     from .grid import pyramid
@@ -612,7 +371,7 @@ def cmd_setup(args) -> int:
     if args.no_ingest:
         print("  skipped (--no-ingest)")
     else:
-        done, kept = _ingest_subjects(cfg, reingest=args.reingest)
+        done, kept = _ingest_subjects(cfg, reingest=args.reingest, jobs=args.jobs)
         if not done:
             print(f"  nothing to do; {len(kept)} subject(s) already ingested")
         elif kept:
@@ -679,10 +438,8 @@ def cmd_setup(args) -> int:
 
 def cmd_run(args) -> int:
     """Stage two: build the template."""
-    from .engines import get_engine
     from .grid import pyramid
     from .pipelines import build_template
-    from .runners import LocalRunner, get_runner
 
     cfg = _load(args.config, args.stop_at)
     _check_subjects(cfg)
@@ -705,36 +462,7 @@ def cmd_run(args) -> int:
         print(f"  per-level tuning active on level(s) {tuned}")
     print()
 
-    engine = None
-    if cfg.runner == "slurm":
-        runner = get_runner(
-            "slurm",
-            cfg=cfg,
-            poll_seconds=cfg.slurm.poll_seconds,
-            max_wait_s=cfg.slurm.max_wait_s,
-        )
-    else:
-        gpus = _gpu_slots(cfg, device)
-        if len(gpus) > 1:
-            print(f"  running on {len(gpus)} GPUs ({', '.join(gpus)}), one worker each")
-            # Bound to the config file up front: a resumed run can promote
-            # a level on the workers before it runs any pass.
-            runner = get_runner(
-                "multigpu", cfg=cfg, gpus=gpus, engine=engine_name, device="cuda",
-                config_path=args.config,
-            )
-        else:
-            workers = args.workers
-            if device.startswith("cuda") and workers > 1:
-                # Threads would share one card, and one registration can
-                # already fill it. Parallelism on a GPU comes from more GPUs.
-                print(
-                    f"  note: --workers {workers} ignored on a single GPU; "
-                    f"tasks run one at a time"
-                )
-                workers = 1
-            runner = LocalRunner(workers=workers)
-            engine = get_engine(engine_name)
+    runner, engine = _make_runner(cfg, device, engine_name, args.config, args.workers)
     try:
         result = build_template(
             cfg,
@@ -805,23 +533,47 @@ def cmd_features(args) -> int:
 
 
 def cmd_pair(args) -> int:
-    from .pipelines import register_pair
-    from .runners import LocalRunner
+    """Register one moving volume onto one fixed one."""
+    from .config import save_config
+    from .grid import pyramid
+    from .pipelines import build_template, pair_config
 
-    from .engines import get_engine
+    cfg = _load(args.config, args.stop_at)
+    _check_subjects(cfg)
+    levels = pyramid(_native_grid(cfg), cfg.profile)
 
-    cfg = _load(args.config)
-    device = _configure(cfg)
-    # In process on one device: the paired config exists only here, so worker
-    # processes reading the config file would register the wrong pair.
-    result = register_pair(
-        cfg,
-        args.fixed,
-        args.moving,
-        runner=LocalRunner(workers=args.workers),
-        engine=get_engine(args.engine or cfg.engine_for(device)),
+    # Derived and written out before anything is dispatched. A worker process
+    # or a batch node rebuilds its task by loading a config file, so the pair
+    # has to exist as a file for the run to reach past this process.
+    paired = pair_config(cfg, args.fixed, args.moving, root=args.root)
+    path = save_config(paired, Path(paired.root) / "config.json")
+
+    print(
+        f"registering {args.moving!r} onto {args.fixed!r}, {len(levels)} levels, "
+        f"profile {cfg.profile_name!r}, runner {cfg.runner}\n"
+        f"  writing to {paired.root} under {path}"
     )
+    device = _configure(paired)
+    engine_name = args.engine or paired.engine_for(device)
+    print(_ladder(paired, levels))
+    print()
+
+    runner, engine = _make_runner(paired, device, engine_name, path, args.workers)
+    try:
+        result = build_template(
+            paired,
+            runner=runner,
+            engine=engine,
+            from_level=args.from_level,
+            progress=print,
+            config_path=str(path),
+        )
+    finally:
+        if hasattr(runner, "close"):
+            runner.close()
+    print()
     print(result.summary())
+    print(f"\nfield: {paired.final_field_path(args.moving)}")
     return 0
 
 
@@ -865,82 +617,45 @@ def cmd_status(args) -> int:
 def cmd_apply(args) -> int:
     """Warp a volume through a field, on the field's own grid, block by block."""
     from . import xp
-    from .config import get_profile
-    from .passes._common import warped_subject_block
-    from .store import Field, Volume, ingest_source
+    from .apply import apply_field, matching_level
+    from .store import Field, Volume
 
     device = xp.configure(args.device)
     print(f"  compute: {'NumPy on the CPU' if device == 'cpu' else 'PyTorch on ' + device}")
 
     vol = Volume.open(args.volume)
     field = Field.open(args.field)
-    grid = field.level_grid
-
-    # The field defines the grid, so the volume has to be read at the level
-    # that matches it. Taking the level from a flag let the two disagree, which
-    # produced either a shape error or a silently wrong warp.
-    level = args.level
-    if level is None:
-        candidates = [
-            k for k in range(vol.n_levels) if vol.grid(k).shape == grid.shape
-        ]
-        if not candidates:
-            raise SystemExit(
-                f"no level of {args.volume} is on the field's grid "
-                f"{grid.shape} at {grid.spacing_mm} mm; levels are "
-                f"{[vol.grid(k).shape for k in range(vol.n_levels)]}"
-            )
-        level = candidates[0]
-    elif vol.grid(level).shape != grid.shape:
-        raise SystemExit(
-            f"level {level} of {args.volume} is {vol.grid(level).shape} but the "
-            f"field is on {grid.shape}; omit --level to match them automatically"
+    try:
+        level = args.level if args.level is not None else matching_level(vol, field.level_grid)
+        apply_field(
+            vol, field, args.out, level=level, profile=args.profile,
+            target=args.on,
         )
-
-    class _Warped:
-        """The warped volume, computed one requested box at a time.
-
-        Each box reads its source with a margin sized from the field, so the
-        result is exact at box edges and never holds the whole volume.
-        """
-
-        shape = tuple(grid.shape)
-        dtype = np.dtype(np.float32)
-
-        def __getitem__(self, key):
-            origin = tuple(int(k.start) for k in key)
-            size = tuple(int(k.stop) - int(k.start) for k in key)
-            u = field.read_dense(origin, size)
-            return xp.get(
-                warped_subject_block(
-                    vol, level, origin, size, u, grid.spacing_mm, normalise=False
-                )
-            )
-
-    ingest_source(
-        _Warped(),
-        args.out,
-        grid.spacing_mm,
-        get_profile(args.profile),
-        origin_mm=grid.origin_mm,
-        dtype="float32",
-        overwrite=True,
-    )
-    print(f"wrote {args.out} from level {level} of {args.volume}")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    where = f", on the lattice of {args.on}" if args.on else ""
+    print(f"wrote {args.out} from level {level} of {args.volume}{where}")
     return 0
 
 
 def cmd_export(args) -> int:
-    from .io_formats import write_volume
+    from .apply import export_store
+
     from .store import Volume
 
-    vol = Volume.open(args.store)
-    grid = vol.grid(vol.n_levels - 1)
-    from . import xp
-
-    block = xp.get(vol.read_padded(vol.n_levels - 1, (0, 0, 0), grid.shape))
-    write_volume(args.out, block, grid)
-    print(f"wrote {args.out}")
+    try:
+        vol = Volume.open(args.store)
+        level = vol.n_levels - 1 if args.level is None else vol._check_level(args.level)
+        grid = vol.grid(level)
+        print(
+            f"  level {level} of 0..{vol.n_levels - 1}: "
+            f"{'x'.join(str(n) for n in grid.shape)} @ {grid.spacing_mm:g} mm"
+        )
+        export_store(vol, args.out, level=level, target=args.on)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    where = f" on the lattice of {args.on}" if args.on else ""
+    print(f"wrote {args.out}{where}")
     return 0
 
 
@@ -983,10 +698,17 @@ _COMMANDS = {
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    from .ingest import IngestError
+
     try:
         return _COMMANDS[args.cmd](args)
     except (SystemExit, KeyboardInterrupt):
         raise
+    except IngestError as exc:
+        # A cohort that cannot be ingested is a configuration problem with a
+        # message written for a person, not a traceback. The library raises so
+        # a script can catch it; here it is the end of the run.
+        raise SystemExit(str(exc)) from None
     except Exception as exc:  # noqa: BLE001 - a CLI should not show a traceback
         print(f"chunkreg {args.cmd}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

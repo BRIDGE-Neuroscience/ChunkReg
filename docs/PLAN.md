@@ -43,7 +43,12 @@ NIfTI, zarr) with known voxel spacing, on the same or different grids, roughly
 the same field of view. Outputs: `template.zarr` at every level, one
 `fields/<sid>.zarr` per volume mapping template coordinates to that volume,
 and a QC record. Pairwise registration is the same pipeline with N = 1 and a
-fixed template.
+fixed template: `template_subject` names the volume to hold, its own data is
+the template at every level, the unbiasing update pass does not run, and the
+level loop converges on the residual instead of on template motion (see
+[The stopping rule](#the-stopping-rule)). `grid.reference` then takes the run
+grid from that volume, so the result lands on the lattice it is expected on
+rather than on a grid chosen for a cohort.
 
 The pipeline in one paragraph. Ingest resamples each volume onto a common
 grid as a sharded, multiscale zarr store. The pyramid has `K + 1` levels where
@@ -178,6 +183,22 @@ cap (default `[8, 6, 4, 3, 2]` from coarse to fine) and a floor of 1. A level
 that inherits a converged shape exits after one pass; the first level runs
 until the global shape is right. The last level stops on `‖ū‖` alone.
 
+**With a fixed template the rule is different, because `ū` does not exist.**
+No update pass runs, so the recentring step is identically zero and the
+`ε‖ū‖ < spacing` half passes vacuously — on the last level, where it is the
+whole rule, that exits every level after one pass however far from converged
+it is. What converges instead is the residual itself, the part of the
+correspondence each pass could not already explain:
+
+```
+stop at level k when   d99_residual(k) < residual_vox · spacing(k)
+                or     d99_residual(k) < 0.5 · D_max(k+1)
+```
+
+`residual_vox` defaults to 0.5. Below half a voxel at the 99th percentile the
+pass is correcting less than the level can represent and the next level will
+resolve it better than another pass here.
+
 ### 2.7 Inner iteration schedule
 
 For an intensity LNCC of width `k`, the coarsest in-chunk scale must satisfy
@@ -311,7 +332,7 @@ clamped to `D_max(k)`, seeded.
 | Fixed chunk profile | `a16` (256/48, 16 ch) | memory surprises; per-level retuning | `config.profile` |
 | Derived clamp `D_max(k)` | 12 native voxels | halo bound violation; runaway chunk solutions | planner, register |
 | Halo bound validation | from profile + measured `r_f` | silently under-sized halos | `config.validate` |
-| Per-level stopping rule | `d99 < 0.5·D_max(k+1)` and `ε‖ū‖ < spacing` | too few passes (aperture leftovers) or too many (cost) | `pipelines.groupwise` |
+| Per-level stopping rule | `d99 < 0.5·D_max(k+1)` and `ε‖ū‖ < spacing`; with a fixed template, `d99 < residual_vox·spacing` instead | too few passes (aperture leftovers) or too many (cost) | `pipelines.groupwise` |
 | Iteration caps + early stop | `[8,6,4,3,2]` passes; per-scale caps; `tolerance 1e-6` | unbounded runtime | config, engine |
 | Chunk retry ladder | folds > 0.1 % or loss diverged → (1) `σ_w × 2`, (2) clamp × 0.5, (3) emit seed and flag | one bad chunk poisoning a level | register |
 | Tissue-fraction skip | < 2 % → emit seed | registering air | register |
@@ -343,8 +364,12 @@ scalable-reg/
     features/                     base.py (protocol) · anatomix.py · pca.py · intensity.py · mindssc.py
     engines/                      base.py (protocol, StageSpec) · fireants_greedy.py · fireants_linear.py
     passes/                       manifest.py · register.py · blend.py · update.py · promote.py · qc.py
-    pipelines/                    groupwise.py (level loop + stopping rule) · pairwise.py · planner.py
-    runners/                      base.py · local.py · slurm.py
+    pipelines/                    groupwise.py (level loop + stopping rule, pairwise entry) · planner.py
+    twoimage.py                   register(fixed, moving, root): the cohort filled in from two paths
+    ingest.py                     run grid resolution, placement, link-or-copy, provenance
+    cohort.py                     Placement, ResampledSource (scan -> run grid, and back)
+    apply.py                      apply_field, resample_to_scan, scan_view, export_store
+    runners/                      base.py · local.py · slurm.py · multigpu.py · runner_for
     config.py                     dataclasses, YAML, validation (halo bound, profile, shard alignment)
     calibrate.py                  measure r_f, capture range, B, throughput
     probe.py                      measure d99 at level 0; report
@@ -403,9 +428,14 @@ plan(config) -> Plan
 calibrate(config, device) -> Calibration         # r_f, capture, B, throughput
 probe(config, pairs=3) -> ProbeReport            # d99 at level 0, expected passes per level
 build_template(volumes, config, runner) -> (Volume, dict[str, Field])
-register_pair(fixed, moving, config, runner) -> Field
-apply_field(volume, field, out_path, level=0) -> Volume
-export(volume_or_field, path, fmt)               # nifti | tiff | ome-zarr
+register_pair(config, fixed, moving, runner) -> RunResult   # a pair out of a cohort
+pair_config(config, fixed, moving) -> RunConfig             # the derived config it runs under
+register(fixed, moving, root, grid="fixed") -> PairResult    # two paths, no cohort
+ingest_subjects(config, say=None) -> (ingested, kept)
+save_config(config, path) -> Path                # the inverse of load_config
+apply_field(volume, field, out_path, level=0, target=None) -> Volume
+resample_to_scan(volume, target, out) -> Volume  # run grid -> a scan's own lattice
+export(volume_or_field, path, fmt, target=None)  # nifti | tiff | ome-zarr
 selftest(config) -> bool
 ```
 
@@ -486,11 +516,13 @@ chunkreg setup     CONFIG [--stop-at L]   # ingest onto the run grid, convention
 chunkreg selftest  CONFIG
 chunkreg run       CONFIG [--stop-at L] [--from-level k]   # the run itself; resumes on its own,
                                                  # --from-level k redoes k and finer
-chunkreg pair      CONFIG
+chunkreg pair      CONFIG --fixed ID --moving ID [--root DIR] [--stop-at L] [--from-level k]
+                                                 # derives a two-subject config under
+                                                 # <root>/pairs/<fixed>__<moving>/ and runs there
 chunkreg run-task  CONFIG --level k --iter i --pass P --id T      # what sbatch invokes
 chunkreg status    CONFIG [--retry]
-chunkreg apply     VOLUME FIELD OUT
-chunkreg export    STORE OUT.nii.gz|OUT.tif
+chunkreg apply     VOLUME FIELD OUT [--on STORE]  # --on delivers on that scan's own lattice
+chunkreg export    STORE OUT.nii.gz|OUT.tif [--on STORE]
 chunkreg clean     CONFIG --level k --iter i
 ```
 
@@ -660,6 +692,42 @@ and sharding logic sits above the seam, so exercising it on the memory backend
 exercises the zarr path too. Zarr remains the only backend a real run should
 use.
 
+**Passes are not always barriers.** Section 8 lists `register` and `blend` as
+consecutive passes, and the level loop ran them that way: every task of one
+finished before any task of the other started. On a node with several GPUs that
+barrier is where most of them go idle, one by one, behind the slowest register
+task of the pass, and it is paid twice per pass per level. But a blend task's
+read set is already known exactly -- it is the property section 2.5 relies on,
+that a core reads its own chunk and at most 26 neighbours -- so a core's blend
+can start as soon as those are registered rather than when the level is. The
+dependency is computed from the chunk lattice before the pass
+(`passes/blend.py: blend_depends`) and the multi-GPU runner dispatches both
+passes as one graph. A failed register task abandons the blends that read it
+instead of letting them open a task array that was never written. `update` is
+still a barrier, and correctly so: it reads the accumulators with a margin, so
+it depends on every blend rather than on a known few.
+
+**A GPU can hold more than one worker.** Section 2.9 sizes a task's memory so
+that one fits a device of the profile's class, which quietly assumes the
+device's occupancy is the task's to fill. It is not: a worker spends part of
+every task reading a chunk, writing a task array and decompressing shards,
+with the GPU idle throughout. `workers_per_gpu` puts a second worker on a card
+to cover the first's reads. It is off by default, because whether two tasks fit
+depends on `bytes_per_voxel_channel`, which is a declared constant until
+`setup` measures it, and an out-of-memory failure mid-level costs more than the
+idle gap.
+
+**TF32 and cuDNN autotuning are on.** Not in the design, which does not discuss
+precision below the choice of float16 for stored fields. The registration inner
+loop is fp32 convolution -- the local correlation and its Gaussian
+regularisation -- and both defaults leave throughput on the floor for an
+Ampere-or-later device. Ten bits of mantissa is far more than a displacement
+field resolves, and the features are already extracted in bfloat16; chunk
+geometry is fixed by the profile, so autotuning sees a handful of shapes per
+level and reuses each plan for every chunk of that shape. Set in
+`xp.configure`, so every entry point gets them, and both are switchable from
+the environment for bisecting a numerical difference.
+
 ### Verified by the test suite
 
 Conventions (direction, component order, composition, the engine bridge) under
@@ -667,7 +735,10 @@ known integer shifts; cores tiling exactly with a blend denominator never below
 one; the read set of a blend task being at most 27 chunks; pyramid depth,
 chunk counts and clamps matching this document's worked example; store round
 trips including the lattice; task idempotency; retention actually deleting
-scratch; identical results from serial and parallel runners; recovery of a
+scratch; identical results from serial and parallel runners, including when the
+parallel one fuses register and blend; the fused dependency map agreeing
+exactly with a scan of every chunk against every other, and a failed register
+task abandoning the blends that read it and no others; recovery of a
 three-subject synthetic cohort with fields staying diffeomorphic; and, in
 `chunkreg selftest`, that a shift solved in tiles and blended agrees with the
 same shift solved whole.

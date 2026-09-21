@@ -9,6 +9,13 @@ passes and also promotion and settling, one chunk core per task, so no step of
 a run is left waiting on a single process while the other GPUs idle. A worker is pinned to its GPU with ``CUDA_VISIBLE_DEVICES`` before
 PyTorch starts, so inside it the GPU is simply ``cuda``.
 
+Passes are not always run one at a time. A blend task depends on a known
+handful of register tasks rather than on all of them, so the driver can hand
+the workers both passes at once with that dependency attached and let each
+core's blend start the moment its own chunks are done. What it removes is the
+barrier at the end of every register pass, where a node's GPUs go idle one by
+one waiting for the slowest task.
+
 Like the SLURM runner, this one never runs the callable it is handed: a
 closure over the manifest cannot be sent to another process. It sends the
 task's address instead, ``(pass, level, iteration, task id)``, and the worker
@@ -29,7 +36,7 @@ import time
 import traceback
 from itertools import count
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .base import RunReport, TaskStatus
 
@@ -90,11 +97,11 @@ def _worker(
         if msg is None:
             break
         job, pass_name, level, iteration, task_id, params = msg
-        outbox.put(("start", slot, (job, task_id), None))
+        outbox.put(("start", slot, (job, pass_name, task_id), None))
         try:
             if pass_name == "carry":
                 out = carry_task(cfg, params["spec"], task_id)
-                outbox.put(("done", slot, (job, task_id), out))
+                outbox.put(("done", slot, (job, pass_name, task_id), out))
                 continue
             key = (level, iteration)
             manifest = manifests.get(key)
@@ -113,9 +120,9 @@ def _worker(
                 out = run_update_task(cfg, manifest, task_id)
             else:
                 raise ValueError(f"unknown pass {pass_name!r}")
-            outbox.put(("done", slot, (job, task_id), out))
+            outbox.put(("done", slot, (job, pass_name, task_id), out))
         except Exception:  # noqa: BLE001 - reported to the driver
-            outbox.put(("fail", slot, (job, task_id), traceback.format_exc()))
+            outbox.put(("fail", slot, (job, pass_name, task_id), traceback.format_exc()))
         finally:
             # The driver shares the first GPU (it seeds level 0 there), so a
             # worker must not sit on memory it is not using.
@@ -128,6 +135,8 @@ class MultiGPURunner:
     name = "multigpu"
     runs_carry = True
     """Promotion and settling run as per-core tasks on the workers too."""
+    runs_fused = True
+    """Register and blend can run as one dependency-ordered dispatch."""
 
     def __init__(
         self,
@@ -138,6 +147,7 @@ class MultiGPURunner:
         device: str = "cuda",
         config_path: str | Path | None = None,
         poll_seconds: float = 5.0,
+        progress_seconds: float = 60.0,
     ) -> None:
         self.cfg = cfg
         self.gpus = list(gpus) if gpus is not None else visible_gpus()
@@ -147,6 +157,7 @@ class MultiGPURunner:
         self.device = device
         self.config_path = None if config_path is None else str(config_path)
         self.poll_seconds = float(poll_seconds)
+        self.progress_seconds = float(progress_seconds)
         self.level = 0
         self.iteration = 0
         self._ctx = mp.get_context("spawn")
@@ -178,53 +189,223 @@ class MultiGPURunner:
         ids: Sequence[int],
         **kwargs: Any,
     ) -> RunReport:
-        report = RunReport(pass_name=pass_name)
-        ids = list(ids)
-        if not ids:
-            return report
+        return self._dispatch([(pass_name, list(ids))], {}, kwargs)[pass_name]
+
+    def run_chain(
+        self,
+        first: str,
+        first_ids: Sequence[int],
+        second: str,
+        second_ids: Sequence[int],
+        depends: Mapping[int, Iterable[int]],
+        **kwargs: Any,
+    ) -> tuple[RunReport, RunReport]:
+        """Run two passes at once, each item of the second gated on the first.
+
+        ``depends`` maps an id of ``second`` to the ids of ``first`` it reads.
+        An item of the second pass is queued the moment the last of its
+        dependencies reports, so the workers move on to it while the rest of
+        the first pass is still running instead of standing idle at a barrier
+        that only a few of them are still holding up.
+
+        A dependency that fails abandons everything downstream of it rather
+        than letting a task read a result that was never written; the abandoned
+        items come back as failures naming the one that failed.
+        """
+        blocked = {
+            (second, int(i)): {(first, int(d)) for d in deps}
+            for i, deps in depends.items()
+        }
+        reports = self._dispatch(
+            [(first, list(first_ids)), (second, list(second_ids))], blocked, kwargs
+        )
+        return reports[first], reports[second]
+
+    # -- dispatch ----------------------------------------------------------- #
+    def _dispatch(
+        self,
+        stages: Sequence[tuple[str, Sequence[int]]],
+        blocked_on: Mapping[tuple[str, int], set[tuple[str, int]]],
+        params: dict,
+    ) -> dict[str, RunReport]:
+        """Run several passes' items over the workers, honouring dependencies.
+
+        Work is addressed as ``(pass name, id)`` throughout, because with two
+        passes in flight an id alone no longer identifies a task.
+        """
+        order: dict[str, list[int]] = {}
+        items: list[tuple[str, int]] = []
+        for name, ids in stages:
+            order[name] = [int(i) for i in ids]
+            items += [(name, int(i)) for i in order[name]]
+        reports = {name: RunReport(pass_name=name) for name, _ in stages}
+        if not items:
+            return reports
+
         self._start()
         from .. import xp
 
         xp.release()  # whatever the driver cached while promoting
         job = next(self._jobs)
-        params = dict(kwargs)
-        for i in ids:
-            self._inbox.put((job, pass_name, self.level, self.iteration, int(i), params))
 
-        pending = set(ids)
-        running: dict[int, int] = {}  # slot -> task id
-        results: dict[int, TaskStatus] = {}
+        pending = set(items)
+        waiting = {it: set(d) for it, d in blocked_on.items() if it in pending and d}
+        waiters: dict[tuple[str, int], list[tuple[str, int]]] = {}
+        for it, deps in waiting.items():
+            for d in deps:
+                waiters.setdefault(d, []).append(it)
+        results: dict[tuple[str, int], TaskStatus] = {}
+        running: dict[int, tuple[str, int]] = {}
+
+        # A pass at a chunked level is hundreds of tasks over several minutes,
+        # and with the engine's own chatter silenced the driver was the only
+        # thing that could say the run was alive. One throttled line beats
+        # either extreme.
+        started = time.monotonic()
+        last_said = [started]
+
+        def tick(force: bool = False) -> None:
+            if self.progress_seconds <= 0:
+                return
+            now = time.monotonic()
+            if not force and now - last_said[0] < self.progress_seconds:
+                return
+            last_said[0] = now
+            total = len(items)
+            failed = sum(1 for s in results.values() if not s.ok)
+            print(
+                f"    {'+'.join(order)}: {total - len(pending)}/{total} done"
+                + (f", {failed} failed" if failed else "")
+                + f", {len(running)} running, {now - started:.0f}s",
+                flush=True,
+            )
+
+        def send(item: tuple[str, int]) -> None:
+            name, task_id = item
+            self._inbox.put((job, name, self.level, self.iteration, task_id, params))
+
+        def record(item: tuple[str, int], ok: bool, payload: Any) -> None:
+            pending.discard(item)
+            waiting.pop(item, None)
+            results[item] = TaskStatus(
+                task_id=item[1],
+                ok=ok,
+                result=payload if ok else None,
+                error=None if ok else str(payload),
+            )
+
+        def release(item: tuple[str, int], ok: bool) -> None:
+            """Queue, or abandon, whatever was waiting on a finished item."""
+            stack = [(item, ok)]
+            while stack:
+                done, done_ok = stack.pop()
+                for w in waiters.pop(done, ()):
+                    if w not in waiting:
+                        continue
+                    if not done_ok:
+                        record(
+                            w,
+                            False,
+                            f"{w[0]} task {w[1]} never ran: it reads the result "
+                            f"of {done[0]} task {done[1]}, which failed",
+                        )
+                        stack.append((w, False))
+                        continue
+                    deps = waiting[w]
+                    deps.discard(done)
+                    if not deps:
+                        waiting.pop(w)
+                        send(w)
+
+        def fail_dead(slot: int, why: Any) -> None:
+            item = running.pop(slot, None)
+            if item is not None and item in pending:
+                record(item, False, why)
+                release(item, False)
+
+        def reap() -> None:
+            """Account for workers that died without reporting."""
+            alive = 0
+            for slot, proc in enumerate(self._procs):
+                if proc.is_alive():
+                    alive += 1
+                    continue
+                fail_dead(
+                    slot,
+                    f"worker for GPU {self.gpus[slot]} exited with code "
+                    f"{proc.exitcode}",
+                )
+            # A worker killed between taking a task and announcing it leaves
+            # that task nowhere: not queued, not running. Live workers that are
+            # all idle with an empty queue for several polls in a row mean
+            # exactly that. A worker announces a task as soon as it takes one,
+            # so a few polls cannot mistake a slow start for a lost task.
+            if alive and pending and not running and self._inbox.empty():
+                self._idle_polls += 1
+            else:
+                self._idle_polls = 0
+            if self._idle_polls >= 3:
+                for item in sorted(pending):
+                    record(
+                        item,
+                        False,
+                        f"{item[0]} task {item[1]} was taken by a GPU worker "
+                        f"that died before starting it; rerun to retry"
+                        if item not in waiting
+                        else f"{item[0]} task {item[1]} never ran: the pass "
+                        f"stalled with its dependencies unfinished",
+                    )
+                return
+            if alive == 0 and pending:
+                why = "\n".join(
+                    f"GPU {self.gpus[s]}: {msg}"
+                    for s, msg in sorted(self._deaths.items())
+                )
+                for item in sorted(pending):
+                    record(
+                        item,
+                        False,
+                        f"every GPU worker has exited; {item[0]} task "
+                        f"{item[1]} never ran" + (f"\n{why}" if why else ""),
+                    )
+
+        for item in items:
+            if item not in waiting:
+                send(item)
+
         self._idle_polls = 0
         while pending:
             try:
                 kind, slot, key, payload = self._outbox.get(timeout=self.poll_seconds)
             except queue.Empty:
-                self._reap(running, pending, results, pass_name)
+                reap()
+                tick()
                 continue
             self._idle_polls = 0
-            if kind in ("ready",):
+            if kind == "ready":
                 continue
             if kind == "dead":
                 self._deaths[slot] = str(payload)
-                self._fail_dead(slot, payload, running, pending, results)
+                fail_dead(slot, payload)
                 continue
-            got_job, task_id = key
+            got_job, got_pass, task_id = key
             if got_job != job:
                 continue  # left over from an abandoned pass
+            item = (got_pass, int(task_id))
             if kind == "start":
-                running[slot] = task_id
+                running[slot] = item
             elif kind in ("done", "fail"):
                 running.pop(slot, None)
-                if task_id in pending:
-                    pending.discard(task_id)
-                    results[task_id] = TaskStatus(
-                        task_id=task_id,
-                        ok=kind == "done",
-                        result=payload if kind == "done" else None,
-                        error=None if kind == "done" else payload,
-                    )
-        report.statuses = [results[i] for i in sorted(results)]
-        return report
+                if item in pending:
+                    record(item, kind == "done", payload)
+                    release(item, kind == "done")
+                tick()
+
+        for name, ids in order.items():
+            reports[name].statuses = [
+                results[(name, i)] for i in ids if (name, i) in results
+            ]
+        return reports
 
     def close(self) -> None:
         if not self._procs:
@@ -278,59 +459,3 @@ class MultiGPURunner:
             p.start()
             self._procs.append(p)
 
-    def _reap(self, running, pending, results, pass_name) -> None:
-        """Account for workers that died without reporting."""
-        alive = 0
-        for slot, p in enumerate(self._procs):
-            if p.is_alive():
-                alive += 1
-                continue
-            self._fail_dead(
-                slot,
-                f"worker for GPU {self.gpus[slot]} exited with code {p.exitcode}",
-                running,
-                pending,
-                results,
-            )
-        # A worker killed between taking a task and announcing it leaves that
-        # task nowhere: not queued, not running. Live workers that are all idle
-        # with an empty queue for several polls in a row mean exactly that.
-        # A worker announces a task as soon as it takes one, so a few polls
-        # cannot mistake a slow start for a lost task.
-        if alive and pending and not running and self._inbox.empty():
-            self._idle_polls += 1
-        else:
-            self._idle_polls = 0
-        if self._idle_polls >= 3:
-            for task_id in sorted(pending):
-                results[task_id] = TaskStatus(
-                    task_id=task_id,
-                    ok=False,
-                    error=(
-                        f"{pass_name} task was taken by a GPU worker that died "
-                        f"before starting it; rerun to retry"
-                    ),
-                )
-            pending.clear()
-            return
-        if alive == 0 and pending:
-            why = "\n".join(
-                f"GPU {self.gpus[s]}: {msg}" for s, msg in sorted(self._deaths.items())
-            )
-            for task_id in sorted(pending):
-                results[task_id] = TaskStatus(
-                    task_id=task_id,
-                    ok=False,
-                    error=(
-                        f"every GPU worker has exited; {pass_name} task never ran"
-                        + (f"\n{why}" if why else "")
-                    ),
-                )
-            pending.clear()
-
-    @staticmethod
-    def _fail_dead(slot, why, running, pending, results) -> None:
-        task_id = running.pop(slot, None)
-        if task_id is not None and task_id in pending:
-            pending.discard(task_id)
-            results[task_id] = TaskStatus(task_id=task_id, ok=False, error=str(why))

@@ -281,3 +281,107 @@ def test_a_subject_spacing_overrules_the_file(tmp_path, capsys):
     assert "over the file's 0.1 mm" in out
     placement = Volume.open("subjects/coarse.zarr").meta["provenance"]["placement"]
     assert placement["voxel_mm"] == [0.05, 0.05, 0.05]
+
+
+# --------------------------------------------------------------------------- #
+# One scan's own sampling as the run grid
+# --------------------------------------------------------------------------- #
+"""``grid.reference`` is for registering onto a particular volume.
+
+A cohort wants a grid that compromises between every scan. A registration onto
+one fixed volume wants the fixed volume's own lattice, because that is where
+the answer is expected back and because a finer moving scan would otherwise
+drag every level to a resolution no scan actually resolves.
+"""
+
+FIXED = ((40, 50, 60), (0.05, 0.05, 0.05))
+FINER = ((80, 80, 80), (0.025, 0.025, 0.025))
+
+
+def test_the_reference_scans_own_sampling_becomes_the_run_grid():
+    grid, _ = resolve_run_grid({"fix": FIXED, "mov": FINER}, reference="fix")
+    assert grid.shape == FIXED[0]
+    assert grid.spacing_mm == pytest.approx(0.05)
+
+
+def test_the_reference_scan_lands_on_the_grid_unchanged():
+    """An identity placement, so the scan is copied rather than interpolated."""
+    grid, placements = resolve_run_grid({"fix": FIXED, "mov": FINER}, reference="fix")
+    placed = placements["fix"]
+    assert placed.shape == grid.shape
+    assert placed.voxel_mm == pytest.approx((grid.spacing_mm,) * 3)
+    assert placed.origin_mm == pytest.approx(grid.origin_mm)
+    how, warnings = placement_notes(grid, placed)
+    assert how == "copied"
+    assert warnings == []
+
+
+def test_without_a_reference_a_finer_scan_drags_the_whole_grid_to_its_resolution():
+    """What the reference mode exists to avoid."""
+    grid, placements = resolve_run_grid({"fix": FIXED, "mov": FINER})
+    assert grid.spacing_mm == pytest.approx(0.025)
+    _, warnings = placement_notes(grid, placements["fix"])
+    assert any("coarser than the run grid" in w for w in warnings), (
+        "the fixed scan should be being interpolated up here"
+    )
+
+
+def test_the_other_scans_are_resampled_onto_the_reference_grid():
+    grid, placements = resolve_run_grid({"fix": FIXED, "mov": FINER}, reference="fix")
+    how, _ = placement_notes(grid, placements["mov"])
+    assert "down" in how, f"a finer scan should be averaged down, got {how!r}"
+
+
+def test_a_reference_grid_crops_a_scan_that_overflows_it():
+    wide = ((40, 50, 200), (0.05, 0.05, 0.05))
+    grid, placements = resolve_run_grid({"fix": FIXED, "wide": wide}, reference="fix")
+    assert grid.shape == FIXED[0]
+    _, warnings = placement_notes(grid, placements["wide"])
+    assert any("cropped" in w for w in warnings)
+
+
+def test_an_unknown_reference_is_refused():
+    with pytest.raises(ValueError, match="not one of the scans"):
+        resolve_run_grid({"fix": FIXED}, reference="nobody")
+
+
+def test_an_anisotropic_reference_is_refused():
+    """A run grid is isotropic, so an anisotropic scan cannot be one."""
+    aniso = ((40, 50, 60), (0.2, 0.05, 0.05))
+    with pytest.raises(ValueError, match="run grid is isotropic"):
+        resolve_run_grid({"fix": aniso}, reference="fix")
+
+
+@pytest.mark.parametrize(
+    "extra, match",
+    [
+        ({"spacing": 0.1}, "two different grids"),
+        ({"shape": (10, 10, 10)}, "two different grids"),
+    ],
+)
+def test_a_reference_plus_an_explicit_grid_is_refused(extra, match):
+    """Both together ask for two different grids at once."""
+    with pytest.raises(ValueError, match=match):
+        resolve_run_grid({"fix": FIXED}, reference="fix", **extra)
+
+
+def test_a_config_reference_must_name_a_subject():
+    raw = {
+        "root": "r", "spacing_mm": 0.05,
+        "subjects": [{"id": "fix", "source": "a.zarr"}],
+        "grid": {"reference": "nobody"},
+    }
+    with pytest.raises(ConfigError, match="not one of the subjects"):
+        load_config(raw)
+
+
+def test_a_config_reference_survives_being_written_back():
+    raw = {
+        "root": "r", "spacing_mm": 0.05, "template_subject": "fix",
+        "subjects": [{"id": "fix", "source": "a.zarr"},
+                     {"id": "mov", "source": "b.zarr"}],
+        "grid": {"reference": "fix"},
+    }
+    cfg = load_config(raw)
+    assert cfg.grid.reference == "fix"
+    assert load_config(cfg.to_config_dict()) == cfg

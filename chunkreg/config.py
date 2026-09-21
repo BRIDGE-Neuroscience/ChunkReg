@@ -40,6 +40,7 @@ __all__ = [
     "PROFILES",
     "get_profile",
     "load_config",
+    "save_config",
     "unused_level_overrides",
     "skipped_level_overrides",
     "ConfigError",
@@ -238,6 +239,16 @@ class LevelPolicy:
     level's clamp, so the finer level's halo can absorb what is left."""
     ubar_vox: float = 1.0
     """Stop once the template recentring step is below this many voxels."""
+    residual_vox: float = 0.5
+    """Stop a held-fixed-template level once its residual is below this many
+    voxels.
+
+    Only pairwise runs read this. An estimated template converges when it stops
+    moving, which is what ``ubar_vox`` measures; a template held fixed never
+    moves, so that test is vacuous and the residual is the only thing left that
+    converges. Below half a voxel at the 99th percentile the pass is correcting
+    less than the level can represent, and the next level will resolve it
+    better than another pass here."""
     stop_percentile: float = 99.0
     """Which percentile of displacement magnitude the stopping rule reads.
 
@@ -422,6 +433,19 @@ class GridRequest:
     """The run grid's shape. ``None`` fits every scan."""
     align: str = "centre"
     """``centre`` or ``corner``: how each scan is placed on the grid."""
+    reference: str | None = None
+    """A subject whose own sampling is the run grid.
+
+    For registering onto one particular volume rather than building a template
+    from a group: the named subject's shape and voxel size become the grid, it
+    is copied onto it unchanged, and every other scan is resampled onto it and
+    cropped to its field of view. The output then lands on the lattice the
+    answer is expected on.
+
+    Without it the grid is the smallest box holding every scan, at the finest
+    voxel in the cohort, which is right for a cohort and wrong for a target: a
+    moving scan sampled more finely than the fixed one would otherwise drag
+    the whole run to its resolution."""
 
 
 @dataclass(frozen=True)
@@ -487,8 +511,40 @@ class RunConfig:
     """Registration engine. ``auto`` is FireANTs on a GPU device and the demons
     reference on the CPU."""
     gpus: int | str = "all"
-    """How many GPUs a local run uses at once, one worker process each.
-    ``all`` uses every GPU the job can see."""
+    """How many GPUs a local run uses at once. ``all`` uses every GPU the job
+    can see."""
+    workers_per_gpu: int | str = 1
+    """Worker processes sharing one GPU.
+
+    One worker per GPU leaves the card idle whenever its worker is reading a
+    chunk, writing a task array or decompressing a shard, which at a low
+    channel count is a large fraction of a task. A second worker on the same
+    card fills those gaps with the other's compute, at the cost of holding two
+    registrations in memory at once.
+
+    That trade only exists when two tasks fit. ``auto`` takes the profile's
+    per-task estimate and allows a second worker when both fit inside 80% of
+    ``gpu_mem_gb``, which at sixteen channels they do not. The default is 1:
+    the memory estimate is a model until ``chunkreg setup`` measures
+    ``bytes_per_voxel_channel`` on the actual backbone, and an out-of-memory
+    failure mid-level is worse than an idle gap."""
+
+    def workers_on_each_gpu(self) -> tuple[int, str]:
+        """Workers to run per GPU, and the arithmetic behind the number."""
+        per_task = self.profile.mem_gb(self.bytes_per_voxel_channel)
+        budget = 0.8 * self.gpu_mem_gb
+        if self.workers_per_gpu == "auto":
+            n = 2 if 2 * per_task <= budget else 1
+            why = (
+                f"auto: {n} x {per_task:.0f} GB fits the {budget:.0f} GB "
+                f"usable of a {self.gpu_mem_gb:.0f} GB device"
+            )
+            return n, why
+        n = int(self.workers_per_gpu)
+        why = f"{n} x {per_task:.0f} GB against {budget:.0f} GB usable"
+        if n * per_task > budget:
+            why += " -- over budget, expect out-of-memory failures"
+        return n, why
 
     def engine_for(self, device: str) -> str:
         """The engine to use once the device is known."""
@@ -545,8 +601,13 @@ class RunConfig:
         """The run grid and each scan's placement on it, written at ingest."""
         return self.root_path / "grid.json"
 
+    @property
+    def scratch_root(self) -> Path:
+        """Everything a finished pass may delete lives under here."""
+        return self.root_path / "scratch"
+
     def scratch_dir(self, level: int, iteration: int) -> Path:
-        return self.root_path / "scratch" / f"L{level}_it{iteration}"
+        return self.scratch_root / f"L{level}_it{iteration}"
 
     def task_path(self, level: int, iteration: int, task_id: int) -> Path:
         return self.scratch_dir(level, iteration) / f"task_{task_id:06d}.zarr"
@@ -572,6 +633,15 @@ class RunConfig:
         template, which is a target rather than a member of the group.
         """
         return tuple(s for s in self.subject_ids if s != self.template_subject)
+
+    def pair_root(self, fixed: str, moving: str) -> Path:
+        """Where a pairwise run of these two subjects keeps its own output.
+
+        Below the cohort's root but separate from it, because a pairwise run
+        writes the same file names a groupwise run does and every run resumes
+        from what it finds.
+        """
+        return self.root_path / "pairs" / f"{fixed}__{moving}"
 
     def subject_path(self, subject: str) -> Path:
         for s in self.subjects:
@@ -753,6 +823,26 @@ class RunConfig:
             raise ConfigError(f"grid.shape must be three positive integers, got {g.shape}")
         if g.align not in ("centre", "corner"):
             raise ConfigError(f"grid.align must be 'centre' or 'corner', got {g.align!r}")
+        if g.reference is not None:
+            if g.reference not in self.subject_ids:
+                raise ConfigError(
+                    f"grid.reference is {g.reference!r}, which is not one of "
+                    f"the subjects {list(self.subject_ids)}"
+                )
+            if not (isinstance(g.spacing_mm, str) and g.spacing_mm == "finest"):
+                raise ConfigError(
+                    f"grid.reference is {g.reference!r} and grid.spacing_mm is "
+                    f"{g.spacing_mm!r}. The reference subject's own voxel size "
+                    f"is the run spacing, so setting both asks for two "
+                    f"different grids; drop one."
+                )
+            if g.shape is not None:
+                raise ConfigError(
+                    f"grid.reference is {g.reference!r} and grid.shape is "
+                    f"{list(g.shape)}. The reference subject's own shape is the "
+                    f"run grid's, so setting both asks for two different grids; "
+                    f"drop one."
+                )
         if isinstance(self.levels.stop_at, int) and self.levels.stop_at < 0:
             raise ConfigError(f"levels.stop_at is negative: {self.levels.stop_at}")
 
@@ -802,6 +892,209 @@ class RunConfig:
 
         blob = json.dumps(self.to_json(), sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
+
+    def to_config_dict(self) -> dict:
+        """This run as a mapping :func:`load_config` reads back unchanged.
+
+        :meth:`to_json` is a dataclass dump for hashing and provenance; it is
+        not the file schema and does not load. This is the file schema, and it
+        exists because a run has to be able to write a configuration as well as
+        read one: a derived run (a pair drawn out of a cohort, a registration
+        set up from two paths) is dispatched to worker processes and batch
+        nodes by config file, so a config that lives only in memory cannot
+        leave the driver. See :func:`chunkreg.pipelines.register_pair`.
+
+        Only what differs from the defaults is written, so the result reads
+        like a configuration someone wrote rather than a dump of every knob.
+        """
+        out: dict[str, Any] = {"root": self.root}
+
+        out["subjects"] = [
+            {
+                k: v
+                for k, v in (
+                    ("id", sub.id),
+                    ("path", sub.path),
+                    ("source", sub.source),
+                    (
+                        "spacing_mm",
+                        None if sub.spacing_mm is None else list(sub.spacing_mm),
+                    ),
+                )
+                if v is not None
+            }
+            for sub in self.subjects
+        ]
+
+        out["profile"] = self.profile_name
+        # The profile carried here can differ from the named preset two ways,
+        # and they have to be written back separately. profile_overrides reach
+        # any field directly. The features block instead *derives* the
+        # extractor spec and, from it, the channel count -- so those two are
+        # left out of the overrides and reconstructed as a features block
+        # below. Writing them as overrides would not survive the round trip:
+        # load_config applies the features block after the overrides, and a
+        # missing block does not mean "leave it alone", it means "take the
+        # default", which for an anatomix profile is MIND switched on.
+        try:
+            base = get_profile(self.profile_name)
+        except ConfigError:
+            raise ConfigError(
+                f"this run's profile_name is {self.profile_name!r}, which is "
+                f"not one of the presets {sorted(PROFILES)}. A configuration "
+                f"is written as a preset plus the overrides that change it, so "
+                f"a profile with no preset behind it cannot be written in a "
+                f"form load_config would read back."
+            ) from None
+        overrides = {
+            f.name: getattr(self.profile, f.name)
+            for f in dataclasses.fields(self.profile)
+            if f.name not in ("features", "channels")
+            and getattr(self.profile, f.name) != getattr(base, f.name)
+        }
+        if overrides:
+            out["profile_overrides"] = {
+                k: list(v) if isinstance(v, tuple) else v
+                for k, v in overrides.items()
+            }
+        features = _features_config_block(self.profile)
+        if _with_features(base, None) != _with_features(base, features):
+            out["features"] = features
+
+        for key, value, default in (
+            ("spacing_mm", self.spacing_mm, None),
+            ("template_subject", self.template_subject, None),
+            ("runner", self.runner, "local"),
+            ("backend", self.backend, "zarr"),
+            ("device", self.device, "auto"),
+            ("engine", self.engine, "auto"),
+            ("gpus", self.gpus, "all"),
+            ("workers_per_gpu", self.workers_per_gpu, 1),
+            ("seed", self.seed, 0),
+            ("gpu_mem_gb", self.gpu_mem_gb, 80.0),
+            ("bytes_per_voxel_channel", self.bytes_per_voxel_channel, 90.0),
+            ("throughput_ch_vox_per_s", self.throughput_ch_vox_per_s, 1.5e6),
+        ):
+            if value != default:
+                out[key] = value
+
+        grid = _diff_block(self.grid, GridRequest())
+        if grid:
+            if "shape" in grid:
+                grid["shape"] = list(grid["shape"])
+            out["grid"] = grid
+
+        levels = self._levels_config_dict()
+        if levels:
+            out["levels"] = levels
+
+        for key, obj, default in (
+            ("ingest", self.ingest, IngestSpec()),
+            ("retry", self.retry, RetryPolicy()),
+            ("retention", self.retention, Retention()),
+        ):
+            block = _diff_block(obj, default)
+            if block:
+                out[key] = {
+                    k: list(v) if isinstance(v, tuple) else v for k, v in block.items()
+                }
+
+        slurm = _diff_block(self.slurm, SlurmConfig(), skip=("register", "blend", "update"))
+        for name in ("register", "blend", "update"):
+            res = _diff_block(
+                getattr(self.slurm, name), getattr(SlurmConfig, name)
+            )
+            if res:
+                slurm[name] = res
+        if slurm:
+            out["slurm"] = slurm
+
+        return out
+
+    def _levels_config_dict(self) -> dict:
+        """The ``levels`` block, including the nested ``stop`` sub-block."""
+        default = LevelPolicy()
+        out: dict[str, Any] = {}
+
+        stop = {
+            key: getattr(self.levels, attr)
+            for key, attr in (
+                ("residual_frac", "residual_frac"),
+                ("ubar_vox", "ubar_vox"),
+                ("residual_vox", "residual_vox"),
+                ("percentile", "stop_percentile"),
+            )
+            if getattr(self.levels, attr) != getattr(default, attr)
+        }
+        if stop:
+            out["stop"] = stop
+
+        for key in (
+            "caps", "shape_update_step", "sharpen_laplacian_levels",
+            "min_tissue_fraction", "level0_max_disp_frac",
+        ):
+            value = getattr(self.levels, key)
+            if value != getattr(default, key):
+                out[key] = list(value) if isinstance(value, tuple) else value
+
+        for key in ("level0_stages", "seeded_stages"):
+            value = getattr(self.levels, key)
+            if value != getattr(default, key):
+                out[key] = [st.to_json() for st in value]
+
+        if self.levels.level_stages:
+            out["level_stages"] = {
+                str(k): [st.to_json() for st in v]
+                for k, v in sorted(self.levels.level_stages.items())
+            }
+        if self.levels.level_params:
+            out["level_params"] = {
+                str(k): dict(v) for k, v in sorted(self.levels.level_params.items())
+            }
+
+        if self.levels.run is not None:
+            out["run"] = (
+                self.levels.run
+                if isinstance(self.levels.run, str)
+                else [_level_ref_json(e) for e in self.levels.run]
+            )
+        if self.levels.stop_at is not None:
+            out["stop_at"] = _level_ref_json(self.levels.stop_at)
+        return out
+
+
+def _features_config_block(profile: Profile) -> dict:
+    """The ``features`` block that reproduces a resolved profile's extractor.
+
+    The inverse of :func:`_with_features`, read off the spec string it writes:
+    ``anatomix+mindssc@16`` is MIND on, sixteen channels drawn per pass.
+    ``sample_channels`` is stated even when it is null, because leaving the key
+    out asks for the default rather than for "no sampling".
+    """
+    spec, _, sample = str(profile.features).partition("@")
+    return {
+        "mind": "mindssc" in spec.split("+"),
+        "sample_channels": int(sample) if sample else None,
+    }
+
+
+def _level_ref_json(ref: int | float):
+    """A level reference as the file schema writes it.
+
+    An index stays a number. A spacing must carry its unit: a bare decimal is
+    refused on the way back in, deliberately, because ``0.2`` could as easily
+    be a typo for level 2 as it could be 200 um.
+    """
+    return ref if isinstance(ref, int) else f"{ref:g}mm"
+
+
+def _diff_block(obj, default, skip: Sequence[str] = ()) -> dict:
+    """The fields of a dataclass that differ from a reference instance."""
+    return {
+        f.name: getattr(obj, f.name)
+        for f in dataclasses.fields(obj)
+        if f.name not in skip and getattr(obj, f.name) != getattr(default, f.name)
+    }
 
 
 def skipped_level_overrides(cfg: "RunConfig", run_levels: Sequence[int]) -> list[int]:
@@ -1007,6 +1300,20 @@ def _with_features(profile: Profile, block) -> Profile:
         raise ConfigError(f"features block: {exc}") from None
 
 
+def save_config(cfg: "RunConfig", path: str | Path) -> Path:
+    """Write a run configuration as JSON that :func:`load_config` reads back.
+
+    Used wherever a config derived in memory has to be handed to another
+    process: a multi-GPU worker and a batch node each address their task by
+    config file, so they rebuild the configuration by loading it rather than
+    receiving it.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(cfg.to_config_dict(), indent=2), encoding="utf-8")
+    return out
+
+
 def load_config(source: str | Path | dict) -> RunConfig:
     """Read a run configuration from a JSON or YAML file, or a mapping."""
     raw = _read_raw(source) if isinstance(source, (str, Path)) else dict(source)
@@ -1018,6 +1325,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
         "backbone", "ingest", "template_subject", "features", "device", "engine", "gpus",
+        "workers_per_gpu",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -1089,7 +1397,11 @@ def load_config(source: str | Path | dict) -> RunConfig:
         },
         "the 'levels' block",
     )
-    _check_keys(stop, {"residual_frac", "ubar_vox", "percentile"}, "'levels.stop'")
+    _check_keys(
+        stop,
+        {"residual_frac", "ubar_vox", "residual_vox", "percentile"},
+        "'levels.stop'",
+    )
 
     level_stages = {
         _level_key(k, "levels.level_stages"): _stages(v, ())
@@ -1111,6 +1423,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         seeded_stages=_stages(lv.get("seeded_stages"), DEFAULT_SEEDED_STAGES),
         residual_frac=float(stop.get("residual_frac", LevelPolicy.residual_frac)),
         ubar_vox=float(stop.get("ubar_vox", LevelPolicy.ubar_vox)),
+        residual_vox=float(stop.get("residual_vox", LevelPolicy.residual_vox)),
         stop_percentile=float(stop.get("percentile", LevelPolicy.stop_percentile)),
         shape_update_step=float(
             lv.get("shape_update_step", LevelPolicy.shape_update_step)
@@ -1190,7 +1503,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
     )
 
     gr = dict(raw.get("grid") or {})
-    _check_keys(gr, {"spacing_mm", "shape", "align"}, "the 'grid' block")
+    _check_keys(
+        gr, {"spacing_mm", "shape", "align", "reference"}, "the 'grid' block"
+    )
     grid_spacing = gr.get("spacing_mm", GridRequest.spacing_mm)
     if not isinstance(grid_spacing, str):
         grid_spacing = float(grid_spacing)
@@ -1198,6 +1513,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
         spacing_mm=grid_spacing,
         shape=None if gr.get("shape") is None else tuple(int(n) for n in gr["shape"]),
         align=str(gr.get("align", GridRequest.align)),
+        reference=(
+            None if gr.get("reference") is None else str(gr["reference"])
+        ),
     )
     spacing = raw.get("spacing_mm")
 
@@ -1226,9 +1544,30 @@ def load_config(source: str | Path | dict) -> RunConfig:
         device=str(raw.get("device", "auto")),
         engine=str(raw.get("engine", "auto")),
         gpus=_gpus(raw.get("gpus", "all")),
+        workers_per_gpu=_workers_per_gpu(raw.get("workers_per_gpu", 1)),
     )
     cfg.validate()
     return cfg
+
+
+def _workers_per_gpu(value) -> int | str:
+    if value == "auto":
+        return "auto"
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError(
+            f"workers_per_gpu must be 'auto' or a positive integer, got {value!r}"
+        )
+    try:
+        n = int(value)
+    except ValueError:
+        raise ConfigError(
+            f"workers_per_gpu must be 'auto' or a positive integer, got {value!r}"
+        ) from None
+    if n < 1:
+        raise ConfigError(
+            f"workers_per_gpu must be 'auto' or a positive integer, got {value!r}"
+        )
+    return n
 
 
 def _gpus(value) -> int | str:

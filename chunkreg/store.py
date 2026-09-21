@@ -376,6 +376,24 @@ class Volume:
         k = self._check_level(level)
         return self.native_grid.coarsened(2 ** (self.n_levels - 1 - k))
 
+    @property
+    def placement(self):
+        """Where the scan this store was made from sat on the run grid.
+
+        Recorded at ingest, and the only record of the original sampling once
+        a scan has been resampled onto the run grid: shape, voxel size, and
+        the world position of its first voxel. Returns ``None`` for a store
+        written without one, which is every store made by ``ingest_array``
+        and by versions before the grid block existed.
+
+        This is what takes a result back to the lattice the scan arrived on.
+        See :func:`chunkreg.apply.resample_to_scan`.
+        """
+        from .cohort import Placement
+
+        recorded = (self.meta.get("provenance") or {}).get("placement")
+        return None if recorded is None else Placement.from_json(recorded)
+
     def grids(self) -> list[GridSpec]:
         return [self.grid(k) for k in range(self.n_levels)]
 

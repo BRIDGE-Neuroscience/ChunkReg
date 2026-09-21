@@ -98,6 +98,16 @@ class Placement:
         }
 
     @classmethod
+    def from_grid(cls, grid: GridSpec) -> "Placement":
+        """A run grid described as a placement.
+
+        A grid is the isotropic special case of one, which is what lets a
+        resample run in either direction: a scan onto the run grid at ingest,
+        and the run grid back onto a scan's own lattice afterwards.
+        """
+        return cls(grid.shape, (grid.spacing_mm,) * 3, grid.origin_mm)
+
+    @classmethod
     def from_json(cls, d: dict) -> "Placement":
         return cls(
             tuple(int(n) for n in d["shape"]),
@@ -111,12 +121,21 @@ def resolve_run_grid(
     spacing: float | str = "finest",
     shape: Sequence[int] | None = None,
     align: str = "centre",
+    reference: str | None = None,
 ) -> tuple[GridSpec, dict[str, Placement]]:
     """The run grid for a cohort, and where each scan sits on it.
 
     ``scans`` maps a subject id to its ``(shape, voxel_mm)``, both ``(z, y,
     x)``. The result is a pure function of its arguments, so the same cohort
     always resolves to the same grid.
+
+    ``reference`` names a scan whose own sampling *is* the run grid. Without
+    it the grid is a compromise between every scan, which is what a cohort
+    wants and what a registration onto one particular volume does not: there
+    the answer is expected back on the fixed image's lattice, and a run grid
+    finer than it would inflate every level for detail no scan has. The named
+    scan is then copied onto the grid unchanged, and the rest are resampled
+    onto it and cropped to its field of view.
     """
     if not scans:
         raise ValueError("a run grid needs at least one scan")
@@ -126,6 +145,35 @@ def resolve_run_grid(
         sid: (tuple(int(n) for n in shp), as_voxel_mm(vox))
         for sid, (shp, vox) in scans.items()
     }
+
+    if reference is not None:
+        if reference not in info:
+            raise ValueError(
+                f"grid.reference names {reference!r}, which is not one of the "
+                f"scans {sorted(info)}"
+            )
+        ref_shape, ref_voxel = info[reference]
+        if max(ref_voxel) > min(ref_voxel) * (1 + _REL):
+            raise ValueError(
+                f"grid.reference names {reference!r}, whose voxels are "
+                f"{ref_voxel[0]:g} x {ref_voxel[1]:g} x {ref_voxel[2]:g} mm. A "
+                f"run grid is isotropic, so an anisotropic scan cannot be one: "
+                f"set grid.spacing_mm and grid.shape to the grid you want "
+                f"instead, and this scan is resampled onto it like any other."
+            )
+        if not (isinstance(spacing, str) and spacing == "finest"):
+            raise ValueError(
+                f"grid.reference names {reference!r} and grid.spacing_mm is "
+                f"{spacing!r}; the reference scan's own voxel size is the run "
+                f"spacing, so setting both asks for two different grids"
+            )
+        if shape is not None:
+            raise ValueError(
+                f"grid.reference names {reference!r} and grid.shape is "
+                f"{list(shape)}; the reference scan's own shape is the run "
+                f"grid's, so setting both asks for two different grids"
+            )
+        spacing, shape = ref_voxel[0], ref_shape
 
     if spacing == "finest":
         s = min(min(v) for _, v in info.values())
@@ -220,24 +268,32 @@ def placement_notes(grid: GridSpec, placement: Placement) -> tuple[str, list[str
 # Reading a scan as if it were already on the run grid
 # --------------------------------------------------------------------------- #
 class ResampledSource:
-    """A scan presented on the run grid, resampled one requested box at a time.
+    """One sampling of a volume presented on another, a box at a time.
 
-    Behaves like a :class:`chunkreg.io_formats.VolumeSource` with the run
-    grid's shape, so :func:`chunkreg.store.ingest_source` streams it into a
-    store exactly as it would a scan that was already on the grid.
+    Behaves like a :class:`chunkreg.io_formats.VolumeSource` with the target's
+    shape, so :func:`chunkreg.store.ingest_source` streams it into a store
+    exactly as it would a volume that was already on the target lattice.
+
+    It runs in both directions, because both directions are the same
+    arithmetic. At ingest the source is a scan and the target is the run grid.
+    Afterwards the source is a result on the run grid and the target is the
+    lattice some scan arrived on, which is how a result gets back to the
+    sampling it is expected on. ``target`` is a :class:`GridSpec` for the
+    first and a :class:`Placement` -- which may be anisotropic -- for the
+    second.
 
     Downsampling first mean-pools by the whole part of the factor and then
     applies a Gaussian for what is left, sigma ``(r - 1) / 2`` pooled voxels
     for a remaining factor ``r``. Trilinear interpolation places the result.
-    Outside the scan is zero. Large boxes are split so a read never holds more
-    than ``max_read_voxels`` scan voxels at once.
+    Outside the source is zero. Large boxes are split so a read never holds
+    more than ``max_read_voxels`` source voxels at once.
     """
 
     def __init__(
         self,
         source,
         placement: Placement,
-        grid: GridSpec,
+        target: GridSpec | Placement,
         max_read_voxels: int = 2**28,
     ) -> None:
         if tuple(int(n) for n in source.shape) != placement.shape:
@@ -245,16 +301,24 @@ class ResampledSource:
                 f"placement is for shape {placement.shape} but the source is "
                 f"{tuple(source.shape)}"
             )
+        want = (
+            target if isinstance(target, Placement) else Placement.from_grid(target)
+        )
         self.source = source
         self.placement = placement
-        self.grid = grid
-        self.shape = grid.shape
+        self.grid = target
+        self.target = want
+        self.shape = want.shape
         self.dtype = np.dtype(source.dtype)
-        self.spacing_mm = grid.spacing_mm
+        self.spacing_mm = (
+            target.spacing_mm
+            if isinstance(target, GridSpec)
+            else want.voxel_mm
+        )
         self.max_read_voxels = int(max_read_voxels)
         self.description = getattr(source, "description", "scan")
 
-        s = grid.spacing_mm
+        s = np.asarray(want.voxel_mm, dtype=np.float64)
         v = np.asarray(placement.voxel_mm, dtype=np.float64)
         factor = s / v
         self._pool = np.maximum(1, np.floor(factor + _REL)).astype(np.int64)
@@ -265,7 +329,7 @@ class ResampledSource:
         )
         # Where run voxel 0 lands, and how far one run voxel moves, in pooled
         # voxels of the scan.
-        self._p0 = (np.asarray(grid.origin_mm) - self._pooled_origin) / self._pooled_mm
+        self._p0 = (np.asarray(want.origin_mm) - self._pooled_origin) / self._pooled_mm
         self._dp = s / self._pooled_mm
         self._copy = bool(
             np.all(self._pool == 1)
@@ -286,7 +350,7 @@ class ResampledSource:
         """
         return (
             self._copy
-            and tuple(self.placement.shape) == tuple(self.grid.shape)
+            and tuple(self.placement.shape) == tuple(self.target.shape)
             and all(abs(p) <= _REL for p in self._p0)
         )
 

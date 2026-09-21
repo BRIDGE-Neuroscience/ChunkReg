@@ -30,7 +30,51 @@ import numpy as np
 
 from .base import normalise_channels
 
-__all__ = ["AnatomixFeatures", "load_backbone"]
+__all__ = ["AnatomixFeatures", "load_backbone", "too_big_for_one_pass"]
+
+
+_TOO_BIG = (
+    "out of memory",
+    "32-bit index",      # "input tensor must fit into 32-bit index math"
+    "int_max",           # "... only supports ... less than INT_MAX elements"
+    "2^31 elements",
+    "2**31 elements",
+)
+"""Substrings of the errors that mean "too big", not "wrong".
+
+PyTorch says this several different ways depending on which kernel hits it, and
+the wording shares no single phrase, so the list is the observed forms rather
+than a pattern. Anything not on it is a real bug and must not be retried as a
+size problem: tiling a chunk that failed for another reason hides the reason.
+"""
+
+_CHANNEL_BOUND = 64
+"""Assumed widest layer, for sizing a window batch before trying it.
+
+anatomix's widest full-resolution tensor is 32 channels, seen in the decoder's
+``upsample_nearest3d``. Sixty-four leaves a factor of two, which is cheaper
+than discovering the real number by failing.
+"""
+
+
+def too_big_for_one_pass(exc: BaseException) -> bool:
+    """Does this error mean the chunk must be tiled, rather than that it is broken?
+
+    A padded chunk can be too large for one forward pass in two ways, and both
+    have the same remedy. Running out of device memory is the obvious one. The
+    other is a hard size limit: many CUDA kernels index their input with 32-bit
+    arithmetic and refuse a tensor of more than 2**31 elements however much
+    memory is free.
+
+    Feature channels multiply a chunk's voxels, so the limit is closer than it
+    looks. At the 352-cubed padded chunk of the default profile the widest
+    full-resolution layer sits at 0.97 of it. Widening the halo to 56 takes the
+    padded chunk to 368, which the network pads up to 384 for its downsamples,
+    and that is 1.27 of the limit -- a profile change with tens of gigabytes
+    still free, and nothing about it says "tile this".
+    """
+    text = str(exc).lower()
+    return any(m in text for m in _TOO_BIG)
 
 _BACKBONE_CHANNELS = {
     "anatomix": 16,
@@ -84,8 +128,9 @@ class AnatomixFeatures:
         r_f: int = 24,
         device: str | None = None,
         amp: bool = True,
-        fallback_window: int = 128,
+        fallback_window: int = 256,
         pad_multiple: int = 32,
+        min_window: int = 64,
     ) -> None:
         if backbone not in _BACKBONE_CHANNELS:
             raise ValueError(
@@ -105,6 +150,7 @@ class AnatomixFeatures:
         self.amp = bool(amp)
         self.fallback_window = int(fallback_window)
         self.pad_multiple = int(pad_multiple)
+        self.min_window = int(min_window)
         self._tile_from: int | None = None
         self._model: Any = None
 
@@ -167,7 +213,7 @@ class AnatomixFeatures:
         try:
             return self._whole(x)
         except RuntimeError as exc:  # pragma: no cover - needs a GPU
-            if "out of memory" not in str(exc).lower():
+            if not too_big_for_one_pass(exc):
                 raise
             if x.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -187,10 +233,22 @@ class AnatomixFeatures:
         out = self._model(x)
         return out[..., : shape[0], : shape[1], : shape[2]]
 
+    def _window_batch(self, window: int) -> int:
+        """Windows per forward pass that stay inside the element limit.
+
+        The limit applies to the batched tensor, so it is the window *and* the
+        batch that have to fit: eight 256-cubed windows of 32 channels come to
+        exactly 2**31, one element over INT_MAX, and fail on a chunk with
+        seventy gigabytes free. Sizing the batch from the window here costs
+        nothing; finding it by trial costs a forward pass per step down.
+        """
+        room = (2**31 - 1) // max(1, window**3 * _CHANNEL_BOUND)
+        return max(1, min(self.sw_batch, room))
+
     def _sliding(self, x, window: int):
         from monai.inferers import sliding_window_inference
 
-        batch = self.sw_batch
+        batch = self._window_batch(window)
         while True:
             try:
                 return sliding_window_inference(
@@ -203,6 +261,19 @@ class AnatomixFeatures:
                     sigma_scale=self.sigma,
                 )
             except RuntimeError as exc:  # pragma: no cover - needs a GPU
-                if "out of memory" not in str(exc).lower() or batch == 1:
+                if not too_big_for_one_pass(exc):
                     raise
-                batch = max(1, batch // 2)
+                # Fewer windows at a time first, since that costs nothing but
+                # parallelism. Only when one window at a time is still too much
+                # is the window itself the problem.
+                if batch > 1:
+                    batch = max(1, batch // 2)
+                    continue
+                if window <= self.min_window:
+                    raise
+                if x.device.type == "cuda":
+                    import torch
+
+                    torch.cuda.empty_cache()
+                window = max(self.min_window, window // 2)
+                batch = self._window_batch(window)

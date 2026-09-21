@@ -304,7 +304,11 @@ def test_scratch_is_cleaned_up(cohort, small_profile):
 
     cfg = make_cfg(small_profile)
     build_template(cfg, runner=LocalRunner())
-    left = [p for p in _backend.get_backend("memory").paths() if "scratch" in p]
+    # Matched against the run's own scratch directory, not the substring
+    # "scratch": store keys are absolute, so a temporary directory that happens
+    # to carry the word (this test's own, for one) would match every path.
+    scratch = str(cfg.scratch_root.resolve())
+    left = [p for p in _backend.get_backend("memory").paths() if p.startswith(scratch)]
     assert left == [], f"retention left {len(left)} transient objects behind"
 
 

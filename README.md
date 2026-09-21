@@ -1,7 +1,12 @@
 # chunkreg
 
-Co-registers a cohort of 3D volumes that are too large for one GPU. The output
-is an unbiased group template and one displacement field per subject.
+Registers 3D volumes that are too large for one GPU.
+
+Give it a cohort and it builds an unbiased group template plus one displacement
+field per subject. Give it two volumes and it registers the moving one onto the
+fixed one and hands the result back on the fixed volume's own lattice — see
+[Registering one volume onto another](#registering-one-volume-onto-another).
+Both are the same pipeline; nothing is ever held in memory whole.
 
 How it works is in [docs/PLAN.md](docs/PLAN.md). This page is how to use it.
 
@@ -101,6 +106,7 @@ The `grid` block chooses that grid:
 | `grid.spacing_mm` | The finest resolution the run can register at: `finest` (default, the finest voxel in the cohort), `coarsest`, or a number in mm. |
 | `grid.shape` | Optional `[z, y, x]`. By default the grid is the smallest box that holds every scan. A scan larger than a set shape is cropped. |
 | `grid.align` | `centre` (default) centres every scan in the grid. `corner` lines up their first voxels. |
+| `grid.reference` | A subject whose own shape and voxel size *are* the grid. It is then copied onto the grid unchanged and every other scan is resampled onto it and cropped to its field of view. Cannot be combined with `spacing_mm` or `shape`, which would ask for a different grid. |
 
 Resampling depends on how each scan compares with the grid:
 
@@ -116,6 +122,16 @@ is then an exact 2×2×2 average.
 
 To register 50 µm scans at 100 µm, set `"grid": {"spacing_mm": 0.1}`. The stores
 are then an eighth of the size, and every pyramid level is coarser by one step.
+
+`grid.reference` is for registering **onto** a volume rather than building a
+template from a group. The default rule takes the finest voxel in the cohort,
+which for a pair means a finer moving scan drags the whole run to its
+resolution and the fixed scan is interpolated up. Naming the fixed subject
+keeps the run — and the result — on its lattice:
+
+```json
+"grid": {"reference": "s01"}
+```
 
 `setup` prints the run grid and how each scan reaches it, and writes both to
 `<root>/grid.json`. Each store also records where its scan sits on the grid. The
@@ -138,6 +154,10 @@ While editing a config, skip the slow measurements:
 ```bash
 chunkreg setup run.json --no-calibrate --no-probe
 ```
+
+`setup` ingests four subjects at a time, since a scan is a long read off shared
+storage and the subjects are independent. `--jobs N` changes that, and
+`--jobs 1` ingests them in turn.
 
 ## Tuning each level
 
@@ -263,18 +283,20 @@ of them, so memory and per-pass cost stay what 16 channels cost. The draw:
 | `root` | Where everything is written. |
 | `profile` | Chunk profile: `a16`, `a8`, `a4` (anatomix features) or `i1` (raw intensity). |
 | `spacing_mm` | Voxel size of sources that do not state one. |
-| `grid.*` | The run grid; see [The run grid](#the-run-grid). |
+| `grid.*` | The run grid, including `grid.reference`; see [The run grid](#the-run-grid). |
 | `levels.stop_at` | Finest level to run; see [Choosing which levels run](#choosing-which-levels-run). |
 | `runner` | `local` or `slurm`. |
 | `device` | `cuda`, `cuda:N`, `cpu`, or `auto` (the default: a GPU if one is visible). |
 | `engine` | `fireants`, `demons`, or `auto` (FireANTs on a GPU). |
 | `gpus` | How many GPUs a local run uses. Default `all`. |
+| `workers_per_gpu` | Worker processes per GPU. Default 1; `auto` allows 2 when two tasks fit the device. |
 | `levels.caps` | Maximum passes per level. Levels usually stop earlier on their own. |
+| `levels.stop.*` | What "earlier on their own" means: `residual_frac` and `ubar_vox` for a run that estimates a template, `residual_vox` for one holding a subject fixed, and `percentile`. |
 | `ingest.median_radius` | Optional median denoise at ingest. A scan with one is always copied. |
 | `ingest.link` | Read zarr scans that are already on the run grid in place. Default `true`. |
 | `features.*` | MIND-SSC and channel sampling; see [Features](#features-anatomix-with-mind-ssc). |
 | `seed` | Seeds the per-pass channel draw. |
-| `template_subject` | Hold one subject fixed as the target instead of building a template. |
+| `template_subject` | Hold one subject fixed as the target instead of building a template. That subject gets no field, its own data is the template at every level, and the unbiasing update pass is skipped. |
 | `slurm.*` | Partition and per-pass resources, plus `max_wait_s` to fail instead of waiting forever. |
 
 Configs can be JSON or YAML.
@@ -289,6 +311,27 @@ With several GPUs in one job, `chunkreg run` starts one worker per GPU listed in
 `CUDA_VISIBLE_DEVICES`. Set `"gpus"` to a number to use fewer. `"device": "cpu"`
 keeps the NumPy reference path, and the `CHUNKREG_DEVICE` environment variable
 overrides the config for one process.
+
+A worker's GPU is idle whenever that worker is reading a chunk or writing a
+task array. `"workers_per_gpu": 2` puts a second worker on each card so one
+covers the other's reads, which is worth having at a low channel count and
+impossible at a high one: two tasks have to fit at once. The default is 1, and
+`"auto"` takes 2 only when the profile's memory estimate says both fit inside
+80% of `gpu_mem_gb`. That estimate is only a model until `chunkreg setup`
+measures `bytes_per_voxel_channel` on your backbone, so raise it once you have
+the measured figure rather than before.
+
+Register and blend are dispatched together rather than one after the other. A
+core's blend reads the chunks whose padded boxes reach into it and nothing
+else, so it starts as soon as those are registered instead of waiting for the
+whole register pass. What that removes is the barrier at the end of every pass
+where the GPUs go idle one by one behind the slowest task.
+
+On a GPU, chunkreg turns on TF32 and cuDNN autotuning: the registration inner
+loop is fp32 convolution, chunk shapes are fixed by the profile so a plan is
+tuned once and reused, and ten bits of mantissa are far more than a
+displacement field resolves. `CHUNKREG_TF32=0` and `CHUNKREG_CUDNN_BENCHMARK=0`
+turn them off to bisect a numerical difference against an earlier run.
 
 Ingest still resamples on the CPU when a scan is not already on the run grid.
 It does this once per scan, one block at a time. A scan that is already on the
@@ -310,14 +353,133 @@ chunkreg apply subjects/s01.zarr fields/s01.zarr s01_in_template.zarr
 chunkreg export levels/L4/template.zarr template.nii.gz
 ```
 
-## Pairwise registration
+Everything the pipeline writes is on the run grid, which is chosen for the
+cohort rather than for any one scan. `--on` puts a result back on the lattice
+a scan arrived on, taken from that scan's store:
+
+```bash
+chunkreg apply subjects/s02.zarr fields/s02.zarr s02_in_s01.zarr --on subjects/s01.zarr
+chunkreg export s02_in_s01.zarr s02_in_s01.nii.gz --on subjects/s01.zarr
+```
+
+For `apply` the warp and the resample are one streaming pass, so the
+intermediate on the run grid is never written. Anisotropic voxels are carried
+in the exported file's header, where a chunkreg store could not represent them.
+
+`export` reads a group of planes at a time rather than the whole volume. A
+TIFF is written straight out that way. A NIfTI is assembled through a memory
+map beside the output first, because the format is a header followed by the
+whole array — the process stays bounded, but the volume passes through the
+page cache and needs the space on disk twice for the duration. NIfTI also
+stores each dimension in 16 bits, so an axis over 32767 voxels is refused
+rather than truncated; past that size, write a TIFF or keep the OME-Zarr.
+
+## From Python
+
+Everything the CLI does is a function call. The two commands are
+`chunkreg.load_config` plus `chunkreg.build_template`:
+
+```python
+import chunkreg
+
+cfg = chunkreg.load_config("run.json")
+print(chunkreg.plan(cfg, native_grid).format())
+
+runner = chunkreg.get_runner(
+    "multigpu", cfg=cfg, gpus=["0", "1"], device="cuda", config_path="run.json"
+)
+try:
+    result = chunkreg.build_template(cfg, runner=runner, config_path="run.json")
+finally:
+    runner.close()
+
+print(result.summary())
+chunkreg.apply_field("subjects/s01.zarr", "fields/s01.zarr", "s01_in_template.zarr")
+chunkreg.export_store("levels/L4/template.zarr", "template.nii.gz")
+```
+
+Ingest is a function call too, so a script can prepare a run as well as drive
+one:
+
+```python
+chunkreg.ingest_subjects(cfg, say=print)
+chunkreg.save_config(cfg, "derived.json")
+```
+
+Also exported: `register`, `PairResult`, `register_pair`, `pair_config`,
+`ingest_subjects`, `save_config`, `resample_to_scan`, `scan_view`,
+`Placement`, `calibrate`, `probe`, `selftest`, `get_profile`, `RunConfig`,
+`Volume` and `Field`. A multi-GPU runner needs `config_path`,
+because it addresses each task by config file rather than shipping a closure to
+another process. These are imported on first use, so `import chunkreg` still
+costs nothing more than the grid geometry.
+
+## Registering one volume onto another
+
+Two volumes, neither of which fits in memory, and no cohort:
+
+```python
+import chunkreg
+
+result = chunkreg.register(
+    fixed="fixed.ome.zarr",
+    moving="moving.ome.zarr",
+    root="work/",
+    progress=print,
+)
+result.export_moving("moving_in_fixed.nii.gz")
+```
+
+That ingests both volumes, holds the fixed one as the target, runs the same
+level loop the cohort path runs, and writes the moving volume onto the fixed
+one's own lattice. Nothing is held whole at any point. Call it again with the
+same arguments to resume a run that stopped.
+
+`result.field` is the displacement, on the run grid, in millimetres, mapping
+fixed coordinates to moving ones. `result.warp_moving(out)` writes the warped
+volume as OME-Zarr instead of a file. The named arguments are `grid`,
+`profile`, `spacing_mm`, `stop_at`, `device`, `engine`, `gpus` and `workers`;
+any other config key goes through as a keyword:
+
+```python
+chunkreg.register(..., levels={"caps": [4, 3, 2]}, features={"mind": False})
+```
+
+### The fixed volume's grid
+
+By default `grid="fixed"`: the fixed volume's shape and voxel size *are* the
+run grid, so it is copied onto the grid unchanged and the moving volume is
+resampled onto it. This is what a cohort run cannot do, and it matters when
+the two differ:
+
+| registering 96³ at 25 µm onto 48³ at 50 µm | `grid="fixed"` | `grid="finest"` (the cohort rule) |
+|---|---|---|
+| the run grid | 48³ at 50 µm | 96³ at 25 µm |
+| the fixed volume | copied | interpolated up, adding voxels but no detail |
+| the result | on the fixed volume's lattice | on the moving volume's, at 8× the voxels |
+
+Eight times the voxels at every level, for detail the fixed volume does not
+have. `grid` also takes `"finest"`, `"coarsest"`, a spacing in millimetres, or
+a whole grid block as a mapping. In a config file the same setting is
+`"grid": {"reference": "s01"}`, and it works for any run, not just a pair.
+
+### From a cohort
+
+To register two subjects that are already part of a cohort:
 
 ```bash
 chunkreg pair run.json --fixed s01 --moving s02
 ```
 
-This registers one subject to another, using the same pipeline with the fixed
-subject as the template.
+This is the same pipeline with the fixed subject held as the template. It
+derives a two-subject config, writes it to
+`<root>/pairs/<fixed>__<moving>/config.json`, and runs there — so the pair gets
+its own levels, records and fields rather than resuming from the cohort's, and
+so the run reaches the same GPUs and the same cluster `chunkreg run` does.
+`--stop-at`, `--from-level` and `--root` work as they do for `run`.
+
+A config that sets `template_subject` does the same thing through
+`chunkreg run`, with no derived config at all.
 
 ## On a cluster
 
