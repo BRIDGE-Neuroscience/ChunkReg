@@ -1,25 +1,20 @@
+
+> [!NOTE]
+> **ChunkReg is just scaling wrapper, not a new registration method.** The
+> registration itself is
+> [anatomix by neel-dey](https://github.com/neel-dey/anatomix/tree/main/anatomix/registration):
+> its learned feature channels, its MIND-SSC descriptors, and its FireANTs
+> backend running the moments, rigid, affine and greedy stages. ChunkReg
+> adds is configs and cluster scripts for running at scale (mainly built for HiP-CT X-ray microscopy datasets)
+
+
 <p align="center">
   <img src="docs/chunkreg-logo.png"
        alt="ChunkReg — chunked metadata wrapper for registration in massive volumes"
        width="440">
 </p>
 
-> [!NOTE]
-> **ChunkReg is a scaling wrapper, not a new registration method.** The
-> registration itself is
-> [anatomix's](https://github.com/neel-dey/anatomix/tree/main/anatomix/registration):
-> its learned feature channels, its MIND-SSC descriptors, and its FireANTs
-> backend running the moments, rigid, affine and greedy stages. What ChunkReg
-> adds is everything needed to run that on volumes no GPU can hold — a
-> resolution pyramid, a fixed chunk geometry, blockwise stores, a
-> partition-of-unity blend, and a groupwise template loop. Credit for the
-> registration belongs upstream.
-
-Registers 3D volumes that are too large for one GPU. Nothing is ever held in
-memory whole: every volume is a chunked store on disk, and every pass works one
-chunk at a time with a fixed memory footprint.
-
-There are two ways to run it, and they are the same pipeline underneath:
+Managing registration for 3D volumes that are too large for one GPU. Chunkwise registration on GPU using anatomix and fireants backends for registration between two or many large volumes:
 
 | | What you give it | What you get |
 |---|---|---|
