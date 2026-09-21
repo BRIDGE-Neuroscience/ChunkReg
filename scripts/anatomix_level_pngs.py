@@ -3,8 +3,8 @@
 
 For each level of a subject's store, take the registration chunk (core plus
 halo, exactly the box the register pass reads) whose core contains one chosen
-anatomical point, run the run's feature extractor on it, and write PNGs through
-that point:
+anatomical point, run anatomix on it (or any extractor spec, including the
+run's own with ``--features run``), and write PNGs through that point:
 
     L<k>_<um>um_intensity.png          axial | coronal | sagittal, chunk core
                                        outlined in yellow, the point in red
@@ -22,7 +22,7 @@ level shows the same anatomy even when the scan is off centre. The subject has
 to be ingested already (``chunkreg setup``).
 
     python scripts/anatomix_level_pngs.py CONFIG [--subject ID] [--out DIR]
-        [--at Z,Y,X] [--levels 0,1,2] [--features anatomix] [--tile-px 256]
+        [--at Z,Y,X] [--levels 0,1,2] [--features anatomix|run|SPEC] [--tile-px 256]
 """
 
 from __future__ import annotations
@@ -54,8 +54,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     ap.add_argument("--levels", default=None, help="comma-separated levels (default: all)")
     ap.add_argument(
-        "--features", default=None,
-        help="extractor to use (default: the config profile's, e.g. anatomix)",
+        "--features", default="anatomix",
+        help="extractor spec (default: anatomix). 'run' uses the config's own "
+             "spec, e.g. anatomix+mindssc@16, i.e. what registration sees",
     )
     ap.add_argument("--device", default=None, help="override the config's device")
     ap.add_argument("--tile-px", type=int, default=256, help="plane height in overview.png")
@@ -262,7 +263,8 @@ def main(argv=None) -> int:
     if bad:
         sys.exit(f"levels {bad} do not exist; this store has levels 0..{len(grids) - 1}")
 
-    features = args.features or cfg.profile.features
+    # A combined, sampled spec without select() shows the subset of pass 0.
+    features = cfg.profile.features if args.features in (None, "", "run") else args.features
     out = Path(args.out) if args.out else cfg.root_path / "qc" / "anatomix_levels" / subject
     out.mkdir(parents=True, exist_ok=True)
 

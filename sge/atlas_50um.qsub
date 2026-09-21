@@ -28,7 +28,7 @@
 #$ -pe gpu 6                         # GPUs; one chunkreg worker on each
 #$ -l tmem=48G                       # PER SLOT: multiplied by the slot count above.
 #$ -R y
-#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
+#$ -o /SAN/external/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log   # dir must already exist
 #$ -S /bin/bash
 #$ -cwd
 #$ -j y
@@ -37,12 +37,12 @@ set -euo pipefail
 
 # ---- SETTINGS -------------------------------------------------------------
 # The image built by containers/build.sh. Keep it on shared storage.
-SIF="${SIF:-/home/akeenlys/storage_main/images/chunkreg.sif}"
+SIF="${SIF:-/SAN/external/bridge_project_data/containers/chunkreg.sif}"
 # The run config. Its root and every subject source must be under BINDS.
-CONFIG="${CONFIG:-/home/akeenlys/storage_main/bridge_project_data/chunkreg/configs/atlas_50um.json}"
+CONFIG="${CONFIG:-/SAN/external/bridge_project_data/chunkreg/configs/atlas_50um.json}"
 # Host directories visible inside the container, comma separated. $HOME and
 # the submit directory are bound automatically.
-BINDS="${BINDS:-/home/akeenlys/storage_main}"
+BINDS="${BINDS:-/SAN/external/bridge_project_data}"
 # Which commands to run, in order: any of setup, run, status.
 STAGES="${STAGES:-setup run status}"
 # The finest level to run: a spacing such as 200um or a level index. Empty runs
@@ -67,9 +67,9 @@ echo "config=$CONFIG stages=$STAGES stop_at=${STOP_AT:-<config>} engine=${ENGINE
 [ -f "$SIF" ]    || { echo "FATAL: no image at $SIF; build it with containers/build.sh" >&2; exit 1; }
 [ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG" >&2; exit 1; }
 # Absolute, so they mean the same thing inside the container as outside.
-CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+CONFIG="$(cd "$(dirname "$CONFIG")" && pwd -P)/$(basename "$CONFIG")"
 if [ -n "$CHUNKREG_SRC" ]; then
-    CHUNKREG_SRC="$(cd "$CHUNKREG_SRC" && pwd)"
+    CHUNKREG_SRC="$(cd "$CHUNKREG_SRC" && pwd -P)"
 fi
 
 RUNTIME=$(command -v apptainer || command -v singularity) \
@@ -125,6 +125,15 @@ if [ -n "$CHUNKREG_SRC" ]; then
 fi
 
 box() { "$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" "$@"; }
+
+# An automounted path (a home-directory mount point, say) can look fine here
+# and be empty inside the container. Say so plainly instead of a traceback.
+box test -r "$CONFIG" || {
+    echo "FATAL: $CONFIG is not visible inside the container. Its directory is" >&2
+    echo "  probably an automount the runtime cannot follow; use the real path" >&2
+    echo "  (on this cluster /SAN/external/...) in CONFIG, BINDS and the config." >&2
+    exit 1
+}
 
 # Fail in seconds, not after the queue wait, if the GPU or config is wrong.
 box python - "$CONFIG" <<'EOF'

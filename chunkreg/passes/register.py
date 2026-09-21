@@ -213,8 +213,13 @@ def run_register_task(
 
     t0 = time.perf_counter()
     engine = engine or get_engine(cfg.engine_for(_xp.device_name()))
-    extractor = extractor or get_extractor(cfg.profile.features)
+    extractor = extractor or get_extractor(cfg.profile.features, seed=cfg.seed)
     extractor.setup()
+    # A sampling extractor registers a different channel subset each pass. The
+    # subset is a function of the pass alone, so every chunk of it, in every
+    # task and on every worker, registers the same channels.
+    if hasattr(extractor, "select"):
+        extractor.select(manifest.level, manifest.iteration, cfg.seed)
 
     template = Volume.open(cfg.template_path(manifest.level), cfg.backend)
     subjects: dict[str, Volume] = {}

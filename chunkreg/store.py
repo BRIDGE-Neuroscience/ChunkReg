@@ -3,8 +3,9 @@
 Three store types cover everything the pipeline writes:
 
 ``Volume``
-    A multiscale scalar image, levels ``s0`` (coarsest, one chunk) to ``sK``
-    (native). Every pyramid level reads from the same store.
+    A multiscale scalar image: pyramid level ``k`` of ``K`` is OME-Zarr
+    dataset ``K - k``, so dataset ``0`` is full resolution as OME-Zarr expects.
+    Every pyramid level reads from the same store.
 
 ``Field``
     A displacement field for one subject at one level, stored on a lattice
@@ -17,6 +18,15 @@ Three store types cover everything the pipeline writes:
 Sharding is chosen so that **one shard is one chunk core**. That is what makes
 every downstream pass owner-computes: a task writes only the shards it owns,
 no two tasks touch the same file, and no locking is required anywhere.
+
+Volumes and fields are OME-Zarr 0.5 groups: a zarr v3 group whose attributes
+hold the ``ome`` multiscales metadata, so napari, neuroglancer and any other
+OME-Zarr reader opens them directly, plus a ``chunkreg`` block with what the
+pipeline needs on top (level count, intensity window, provenance). A volume's
+full-resolution level can be *linked*: read in place from the scan it came
+from rather than copied, with only the coarser levels written here. Stores in
+the earlier layout (``meta.json`` beside ``s0 .. sK``, a field's metadata in
+``<path>.meta.json``) still open.
 """
 
 from __future__ import annotations
@@ -43,10 +53,76 @@ __all__ = [
     "lattice_box",
     "ingest_array",
     "ingest_source",
+    "link_source",
     "check_volume",
 ]
 
 _META = "meta.json"
+"""Metadata file of a volume in the earlier layout."""
+_GROUP = "zarr.json"
+"""A zarr v3 group document. Holds the OME and chunkreg attributes."""
+_UNIT = "millimeter"
+
+
+def _write_group(path, attributes: dict, backend) -> None:
+    _backend.write_json(
+        Path(path) / _GROUP,
+        {"zarr_format": 3, "node_type": "group", "attributes": attributes},
+        backend,
+    )
+
+
+def _group_attrs(path, backend) -> dict | None:
+    """The attributes of a zarr v3 group at ``path``, or ``None``."""
+    doc_path = Path(path) / _GROUP
+    if not _backend.json_exists(doc_path, backend):
+        return None
+    try:
+        doc = _backend.read_json(doc_path, backend)
+    except (OSError, ValueError):
+        return None
+    if doc.get("node_type") != "group":
+        return None
+    return dict(doc.get("attributes") or {})
+
+
+def _chunkreg_meta(path, backend, kind: str) -> dict | None:
+    attrs = _group_attrs(path, backend)
+    meta = (attrs or {}).get("chunkreg")
+    if isinstance(meta, dict) and meta.get("kind") == kind:
+        return dict(meta)
+    return None
+
+
+def _space_axes() -> list[dict]:
+    return [{"name": a, "type": "space", "unit": _UNIT} for a in "zyx"]
+
+
+def _transforms(grid: GridSpec, lead: int = 0) -> list[dict]:
+    """OME scale and translation: voxel ``i`` sits at ``origin + spacing * i``."""
+    return [
+        {"type": "scale", "scale": [1.0] * lead + [grid.spacing_mm] * 3},
+        {"type": "translation", "translation": [0.0] * lead + list(grid.origin_mm)},
+    ]
+
+
+def _refuse_foreign(path, backend) -> None:
+    """Never overwrite a zarr that chunkreg did not write.
+
+    Creating a store with ``overwrite`` removes whatever is at its path first.
+    A subject's ``path`` pointed at the scan itself would otherwise delete it.
+    """
+    if not _backend.json_exists(Path(path) / _GROUP, backend):
+        return
+    attrs = _group_attrs(path, backend) or {}
+    legacy = _backend.json_exists(Path(path) / _META, backend) or _backend.json_exists(
+        Path(str(path) + _backend._SIDECAR), backend
+    )
+    if "chunkreg" not in attrs and not legacy:
+        raise FileExistsError(
+            f"{path} is a zarr that chunkreg did not write; refusing to "
+            f"overwrite it. Choose another path for the store."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -144,9 +220,10 @@ def lattice_box(
 class Volume:
     """A scalar image as a multiscale pyramid of sharded arrays.
 
-    Levels are named ``s0`` (coarsest) through ``sK`` (native), matching the
+    Level ``k`` counts from the coarsest (0) to full resolution (``K``), the
     pyramid index used everywhere else, so level ``k`` of a run reads
-    ``volume.array(k)`` with no translation.
+    ``volume.array(k)`` with no translation. On disk it is OME-Zarr dataset
+    ``K - k``.
     """
 
     def __init__(self, path, meta: dict, backend=None) -> None:
@@ -167,14 +244,21 @@ class Volume:
         overwrite: bool = False,
         provenance: dict | None = None,
         n_levels: int | None = None,
+        linked_native: str | None = None,
     ) -> "Volume":
         """Create a multiscale store.
 
         ``n_levels`` overrides the pyramid depth. A template belongs to exactly
         one pyramid level, so its store is created with one level rather than a
         pyramid of its own.
+
+        ``linked_native`` names a zarr to read the full-resolution level from
+        in place. That level is then not created here, and is never written.
         """
         b = _backend.get_backend(backend)
+        if overwrite:
+            _refuse_foreign(path, b)
+            b.remove(path)
         if n_levels is None:
             grids = pyramid(native, profile)
         else:
@@ -193,33 +277,87 @@ class Volume:
             "norm_lo": None,
             "norm_hi": None,
             "provenance": provenance or {},
+            "layout": "ome-zarr",
+            "linked": {},
         }
+        top = len(grids) - 1
+        if linked_native is not None:
+            meta["linked"] = {str(top): str(linked_native)}
+        vol = cls(path, meta, b)
         for k, g in enumerate(grids):
+            if vol.is_linked(k):
+                continue
             chunk = [min(profile.inner_chunk, n) for n in g.shape]
             shard = [min(profile.core, n) for n in g.shape]
             shard = [int(math.ceil(s / c) * c) for s, c in zip(shard, chunk)]
             b.create(
-                Path(path) / f"s{k}",
+                vol.level_path(k),
                 g.shape,
                 dtype,
                 chunks=chunk,
                 shards=shard,
                 overwrite=overwrite,
             )
-        _backend.write_json(Path(path) / _META, meta, b)
-        return cls(path, meta, b)
+        vol._save()
+        return vol
 
     @classmethod
     def open(cls, path, backend=None) -> "Volume":
         b = _backend.get_backend(backend)
-        meta = _backend.read_json(Path(path) / _META, b)
-        if meta.get("kind") != "volume":
-            raise ValueError(f"{path} is not a volume store")
+        meta = _chunkreg_meta(path, b, "volume")
+        if meta is None:
+            if not _backend.json_exists(Path(path) / _META, b):
+                raise FileNotFoundError(f"no chunkreg volume at {path}")
+            meta = _backend.read_json(Path(path) / _META, b)
+            if meta.get("kind") != "volume":
+                raise ValueError(f"{path} is not a volume store")
+            meta["layout"] = "legacy"
         return cls(path, meta, b)
 
     @classmethod
     def exists(cls, path, backend=None) -> bool:
-        return _backend.json_exists(Path(path) / _META, _backend.get_backend(backend))
+        b = _backend.get_backend(backend)
+        return (
+            _chunkreg_meta(path, b, "volume") is not None
+            or _backend.json_exists(Path(path) / _META, b)
+        )
+
+    def _save(self) -> None:
+        """Write the metadata: the OME group document, or the legacy file."""
+        if self.meta.get("layout") == "legacy":
+            meta = {k: v for k, v in self.meta.items() if k != "layout"}
+            _backend.write_json(self.path / _META, meta, self._backend)
+            return
+        n = self.n_levels
+        datasets = [
+            {"path": str(n - 1 - k), "coordinateTransformations": _transforms(self.grid(k))}
+            for k in reversed(range(n))
+            if not self.is_linked(k)
+        ]
+        ome = {
+            "version": "0.5",
+            "multiscales": [{
+                "name": self.path.name,
+                "axes": _space_axes(),
+                "datasets": datasets,
+                "type": "local_mean",
+            }],
+        }
+        _write_group(self.path, {"ome": ome, "chunkreg": self.meta}, self._backend)
+
+    def level_path(self, level: int) -> Path:
+        """Where level ``level`` is stored inside this volume."""
+        k = self._check_level(level)
+        if self.meta.get("layout") == "legacy":
+            return self.path / f"s{k}"
+        return self.path / str(self.n_levels - 1 - k)
+
+    def is_linked(self, level: int) -> bool:
+        """Is this level read in place from the scan instead of stored here?"""
+        return str(int(level)) in (self.meta.get("linked") or {})
+
+    def linked_source(self, level: int) -> str | None:
+        return (self.meta.get("linked") or {}).get(str(int(level)))
 
     # -- geometry ----------------------------------------------------------- #
     @property
@@ -259,7 +397,17 @@ class Volume:
         k = self._check_level(level)
         key = (k, str(mode))
         if key not in self._cache:
-            self._cache[key] = self._backend.open(self.path / f"s{k}", mode=mode)
+            if self.is_linked(k):
+                if mode != "r":
+                    raise PermissionError(
+                        f"level {k} of {self.path} is read in place from "
+                        f"{self.linked_source(k)} and is never written"
+                    )
+                from .io_formats import open_zarr_in_place
+
+                self._cache[key] = open_zarr_in_place(self.linked_source(k))
+            else:
+                self._cache[key] = self._backend.open(self.level_path(k), mode=mode)
         return self._cache[key]
 
     # -- normalisation ------------------------------------------------------ #
@@ -274,7 +422,7 @@ class Volume:
             raise ValueError(f"need hi > lo, got lo={lo} hi={hi}")
         self.meta["norm_lo"] = float(lo)
         self.meta["norm_hi"] = float(hi)
-        _backend.write_json(self.path / _META, self.meta, self._backend)
+        self._save()
 
     @property
     def normalisation(self) -> tuple[float, float] | None:
@@ -389,6 +537,9 @@ class Field:
     coarsening it loses high-frequency detail in the *field*, never the
     physical meaning of its values, and promoting between pyramid levels is
     exact.
+
+    On disk an OME-Zarr group with one dataset, ``0``, of axes ``c, z, y, x``:
+    the three displacement components are the channels.
     """
 
     def __init__(self, path, meta: dict, backend=None) -> None:
@@ -408,6 +559,9 @@ class Field:
         subject: str | None = None,
     ) -> "Field":
         b = _backend.get_backend(backend)
+        if overwrite:
+            _refuse_foreign(path, b)
+            b.remove(path)
         f = profile.lattice_factor
         lat = level.coarsened(f)
         inner = max(1, profile.inner_chunk // f)
@@ -417,8 +571,10 @@ class Field:
             int(math.ceil(min(shard, n) / c) * c)
             for n, c in zip(lat.shape, chunks[1:])
         )
+        # The array first and the group document last: a field only exists
+        # once both do, which is what lets two creators race safely.
         b.create(
-            path,
+            Path(path) / "0",
             (3,) + lat.shape,
             _fields.DISP_DTYPE,
             chunks=chunks,
@@ -432,22 +588,41 @@ class Field:
             "level_origin_mm": list(level.origin_mm),
             "lattice_factor": int(f),
             "subject": subject,
+            "layout": "ome-zarr",
+            "components": "x, y, z displacement in millimetres",
         }
-        _backend.write_json(Path(str(path) + ".meta.json"), meta, b)
+        ome = {
+            "version": "0.5",
+            "multiscales": [{
+                "name": Path(path).name,
+                "axes": [{"name": "c", "type": "channel"}] + _space_axes(),
+                "datasets": [
+                    {"path": "0", "coordinateTransformations": _transforms(lat, lead=1)}
+                ],
+            }],
+        }
+        _write_group(path, {"ome": ome, "chunkreg": meta}, b)
         return cls(path, meta, b)
 
     @classmethod
     def open(cls, path, backend=None) -> "Field":
         b = _backend.get_backend(backend)
-        meta = _backend.read_json(Path(str(path) + ".meta.json"), b)
-        if meta.get("kind") != "field":
-            raise ValueError(f"{path} is not a field store")
+        meta = _chunkreg_meta(path, b, "field")
+        if meta is None:
+            sidecar = Path(str(path) + _backend._SIDECAR)
+            if not _backend.json_exists(sidecar, b):
+                raise FileNotFoundError(f"no chunkreg field at {path}")
+            meta = _backend.read_json(sidecar, b)
+            if meta.get("kind") != "field":
+                raise ValueError(f"{path} is not a field store")
+            meta["layout"] = "legacy"
         return cls(path, meta, b)
 
     @classmethod
     def exists(cls, path, backend=None) -> bool:
-        return _backend.json_exists(
-            Path(str(path) + ".meta.json"), _backend.get_backend(backend)
+        b = _backend.get_backend(backend)
+        return _chunkreg_meta(path, b, "field") is not None or _backend.json_exists(
+            Path(str(path) + _backend._SIDECAR), b
         )
 
     # -- geometry ----------------------------------------------------------- #
@@ -470,7 +645,8 @@ class Field:
     @property
     def array(self):
         if self._array is None:
-            self._array = self._backend.open(self.path, mode="r+")
+            where = self.path if self.meta.get("layout") == "legacy" else self.path / "0"
+            self._array = self._backend.open(where, mode="r+")
         return self._array
 
     # -- reads and writes --------------------------------------------------- #
@@ -848,6 +1024,45 @@ def ingest_source(
     return vol
 
 
+def link_source(
+    source_path,
+    path,
+    spacing_mm: float,
+    profile: Profile,
+    origin_mm: Sequence[float] = (0.0, 0.0, 0.0),
+    backend=None,
+    overwrite: bool = False,
+    percentiles=(0.5, 99.5),
+    provenance: dict | None = None,
+) -> Volume:
+    """Use a zarr scan in place as a volume's full-resolution level.
+
+    For a scan already on the run grid, copying it would only duplicate it.
+    The store instead records where the scan is, reads that level from it, and
+    writes only the coarser levels, an eighth of the scan's size in total.
+    The scan is opened read-only and never written.
+    """
+    from .io_formats import open_zarr_in_place
+
+    arr = open_zarr_in_place(source_path)
+    shape = tuple(int(n) for n in arr.shape)
+    if len(shape) != 3:
+        raise ValueError(f"expected a 3D volume at {source_path}, got shape {shape}")
+    vol = Volume.create(
+        path,
+        GridSpec(shape, spacing_mm, tuple(origin_mm)),
+        profile,
+        dtype=str(_output_dtype("auto", arr.dtype)),
+        backend=backend,
+        overwrite=overwrite,
+        provenance=provenance,
+        linked_native=str(source_path),
+    )
+    vol.build_pyramid()
+    vol.compute_normalisation(level=0, percentiles=percentiles)
+    return vol
+
+
 def ingest_array(
     data: np.ndarray,
     path,
@@ -901,8 +1116,27 @@ def check_volume(vol: Volume, profile: Profile) -> tuple[list[str], list[str]]:
         )
         return errors, warnings
     for k, g in enumerate(grids):
-        arr = vol.array(k)
+        try:
+            arr = vol.array(k)
+        except (OSError, ValueError, KeyError) as exc:
+            errors.append(f"level {k} cannot be opened: {exc}")
+            continue
+        if tuple(int(n) for n in arr.shape) != g.shape:
+            errors.append(f"level {k} is {tuple(arr.shape)}, expected {g.shape}")
+            continue
         chunks = tuple(getattr(arr, "chunks", ()) or ())
+        if vol.is_linked(k):
+            # The scan's own layout is not ours to change. What matters is that
+            # a chunk read does not decompress far more than the chunk.
+            big = [c for c in chunks if c > 2 * profile.core]
+            if big:
+                warnings.append(
+                    f"level {k} is read in place from {vol.linked_source(k)}, "
+                    f"whose chunks {chunks} are much larger than the "
+                    f"{profile.core}-voxel core; rechunking the scan would "
+                    f"speed up every read"
+                )
+            continue
         shards = getattr(arr, "shards", None)
         want_chunk = tuple(min(profile.inner_chunk, n) for n in g.shape)
         want_shard = tuple(
@@ -910,14 +1144,14 @@ def check_volume(vol: Volume, profile: Profile) -> tuple[list[str], list[str]]:
             for n, c in zip(g.shape, want_chunk)
         )
         if shards is None:
-            warnings.append(f"level s{k} is not sharded")
+            warnings.append(f"level {k} is not sharded")
         elif tuple(shards) != want_shard:
             warnings.append(
-                f"level s{k} has shards {tuple(shards)}, expected {want_shard} "
+                f"level {k} has shards {tuple(shards)}, expected {want_shard} "
                 f"(one shard per {profile.core}-voxel chunk core)"
             )
         if chunks and chunks != want_chunk:
             warnings.append(
-                f"level s{k} has inner chunks {chunks}, expected {want_chunk}"
+                f"level {k} has inner chunks {chunks}, expected {want_chunk}"
             )
     return errors, warnings

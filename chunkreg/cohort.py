@@ -278,6 +278,18 @@ class ResampledSource:
     def mode(self) -> str:
         return "copy" if self._copy else "resample"
 
+    @property
+    def is_identity(self) -> bool:
+        """Is the scan exactly the run grid: same spacing, shape and position?
+
+        Such a scan needs no copy at all; its voxels can be read where they are.
+        """
+        return (
+            self._copy
+            and tuple(self.placement.shape) == tuple(self.grid.shape)
+            and all(abs(p) <= _REL for p in self._p0)
+        )
+
     def __getitem__(self, key) -> np.ndarray:
         if not isinstance(key, tuple) or len(key) != 3:
             raise IndexError("index a resampled source with three slices")

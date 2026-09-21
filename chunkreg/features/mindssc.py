@@ -69,7 +69,7 @@ def _shift(vol: np.ndarray, offset, dilation: int) -> np.ndarray:
 
 
 class MindSSCFeatures:
-    """Twelve self-similarity channels, computed on the CPU."""
+    """Twelve self-similarity channels, on the CPU or, through anatomix, the GPU."""
 
     name = "mindssc"
     channels = 12
@@ -96,11 +96,10 @@ class MindSSCFeatures:
         return None
 
     def __call__(self, patch, spacing_mm: float, mask=None) -> np.ndarray:
-        if type(patch).__module__.split(".", 1)[0] == "torch":
-            raise NotImplementedError(
-                "MIND-SSC has no GPU implementation; on a GPU run use the "
-                "anatomix or intensity features"
-            )
+        from .. import xp as _xp
+
+        if _xp.is_tensor(patch) or _xp.uses_torch():
+            return self._on_device(_xp.put(patch), mask)
         a = np.asarray(patch, dtype=np.float32)
         if a.ndim != 3:
             raise ValueError(f"expected a (Z, Y, X) patch, got {a.shape}")
@@ -129,3 +128,71 @@ class MindSSCFeatures:
         if mask is not None:
             out = out * np.asarray(mask, dtype=np.float32)[None]
         return np.ascontiguousarray(out.astype(np.float32))
+
+    def _on_device(self, a, mask=None):
+        """MIND-SSC in PyTorch, on whatever device ``a`` is on.
+
+        Uses anatomix's own GPU implementation (the ConvexAdam reference, with
+        its channel order and variance normalisation), so a run registers the
+        same MIND channels anatomix's ``anatomix+mindssc`` registration does.
+        Without anatomix installed, falls back to a port of the NumPy path.
+        """
+        import torch
+
+        from .. import xp as _xp
+
+        a = a.to(torch.float32)
+        if a.ndim != 3:
+            raise ValueError(f"expected a (Z, Y, X) patch, got {tuple(a.shape)}")
+        try:
+            from anatomix.registration.registration_infrastructure.mindssc import MINDSSC
+        except ImportError:
+            out = self._port(a)
+        else:
+            with torch.no_grad():
+                out = MINDSSC(a[None, None], self.radius, self.dilation)[0]
+        out = normalise_channels(out, self.normalisation)
+        if mask is not None:
+            out = out * _xp.put(mask).to(out.device)[None]
+        return out.contiguous()
+
+    def _port(self, a):
+        """The NumPy descriptor in PyTorch, for when anatomix is not installed.
+
+        Edge replication stands in for the NumPy path's roll-and-patch, and a
+        replicate-padded average pool for ``uniform_filter(mode="nearest")``;
+        both give the same numbers as :meth:`__call__` on the CPU.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        from .. import gpu_ops
+
+        d = self.dilation
+        shape = a.shape
+        padded = F.pad(a[None, None], (d,) * 6, mode="replicate")[0, 0]
+
+        def shifted(offset):
+            # Voxel i reads i - d * offset, clamped at the edge.
+            sl = tuple(
+                slice(d - o * d, d - o * d + n) for o, n in zip(offset, shape)
+            )
+            return padded[sl]
+
+        views = [shifted(o) for o in SIX_NEIGHBOURS]
+        r = self.radius
+        size = 2 * r + 1
+        dist = torch.empty((12,) + tuple(shape), dtype=torch.float32, device=a.device)
+        for c, (i, j) in enumerate(SSC_PAIRS):
+            diff = views[i] - views[j]
+            sq = (diff * diff)[None, None]
+            if r > 0:
+                sq = F.avg_pool3d(F.pad(sq, (r,) * 6, mode="replicate"), size, stride=1)
+            dist[c] = sq[0, 0]
+
+        var = dist.mean(dim=0)
+        hi = gpu_ops.percentile(var, 99.9) or 1.0
+        var = var.clamp_min(1e-6 * max(hi, 1e-6))
+
+        out = torch.exp(-dist / var[None])
+        return out / out.amax(dim=0, keepdim=True).clamp_min(1e-8)

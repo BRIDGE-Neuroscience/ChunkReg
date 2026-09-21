@@ -1,0 +1,22 @@
+{
+  "root": "/SAN/external/bridge_project_data/results/chunkreg/anatomix_one_50um",
+  "runner": "local",
+  "device": "cuda",
+  "engine": "fireants",
+  "backend": "zarr",
+  "profile": "a16",
+  "gpu_mem_gb": 80,
+
+  "spacing_mm": 0.05,
+  "grid": {"spacing_mm": "finest", "align": "centre"},
+
+  "ingest": {
+    "dtype": "auto",
+    "median_radius": null,
+    "percentiles": [0.5, 99.5]
+  },
+
+  "subjects": [
+    {"id": "AUMC_2025_044", "source": "/SAN/external/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr"}
+  ]
+}

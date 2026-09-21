@@ -47,9 +47,17 @@ Each subject needs an `id` and a `source`:
 ]
 ```
 
-`setup` converts each source into a sharded zarr store at
-`<root>/subjects/<id>.zarr`, one chunk core at a time, so a subject never has to
-fit in memory. Set `path` to put the store somewhere else.
+`setup` makes an OME-Zarr store for each subject at
+`<root>/subjects/<id>.zarr`, holding the scan at every pyramid level. Set
+`path` to put the store somewhere else.
+
+- **A zarr already exactly on the run grid is read in place.** Only the coarser
+  levels are written (about 1/7 of the scan's size), and the scan itself is
+  opened read-only and never changed. `setup` prints the scan's chunk layout.
+  Set `"ingest": {"link": false}` to copy it instead, into one file per
+  256-voxel block, if the scan's storage is slow or badly chunked.
+- **Anything else is copied**, resampled onto the run grid one block at a
+  time, so a subject never has to fit in memory.
 
 Accepted sources:
 
@@ -206,6 +214,48 @@ level has been seeded from it.
 To redo work on purpose, use `chunkreg run run.json --from-level N`. This
 discards the progress at level N and every finer level, then runs them again.
 
+## Storage format
+
+Every store is OME-Zarr 0.5 (zarr v3), so napari, neuroglancer and other
+OME-Zarr viewers open subjects, templates and fields directly:
+
+- **Volumes:** dataset `0` is full resolution and each further dataset halves
+  it. The scale and translation of each dataset are in millimetres.
+- **Fields:** one dataset with axes `c, z, y, x`. The three channels are the x,
+  y and z displacements in millimetres.
+- **chunkreg's own metadata** (intensity window, provenance, and where a
+  linked scan lives) is in the group's `chunkreg` attribute.
+- **Blocks:** every level chunkreg writes has one file (shard) per 256-voxel
+  block, so parallel workers never write the same file.
+
+Stores written by earlier versions (`meta.json` beside `s0 … sK`) still open.
+
+## Features: anatomix with MIND-SSC
+
+Anatomix profiles register on anatomix's 16 learned channels together with the
+12 MIND-SSC channels, as anatomix's own `anatomix+mindssc` registration does.
+On a GPU, MIND-SSC is anatomix's own GPU implementation.
+
+That is 28 channels, but by default each template pass registers a random 16
+of them, so memory and per-pass cost stay what 16 channels cost. The draw:
+
+- **changes every pass,** so over a level every channel contributes;
+- **is split between anatomix and MIND** in proportion (9 and 7 of 16);
+- **is the same for every chunk and every GPU** in a pass, because it depends
+  only on `seed`, the level and the pass.
+
+```json
+"features": {"mind": true, "sample_channels": 16}
+```
+
+| Key | Meaning |
+|---|---|
+| `features.mind` | Add the MIND-SSC channels. Default: on for anatomix profiles. |
+| `features.sample_channels` | Channels registered per pass. Default: the profile's count (16) when MIND is on. `null` registers all 28, about 100 GB per chunk. |
+
+`setup` and the plan show the resulting spec, for example
+`anatomix+mindssc@16`.
+
 ## Other config settings
 
 | Key | Meaning |
@@ -220,7 +270,10 @@ discards the progress at level N and every finer level, then runs them again.
 | `engine` | `fireants`, `demons`, or `auto` (FireANTs on a GPU). |
 | `gpus` | How many GPUs a local run uses. Default `all`. |
 | `levels.caps` | Maximum passes per level. Levels usually stop earlier on their own. |
-| `ingest.median_radius` | Optional median denoise at ingest. |
+| `ingest.median_radius` | Optional median denoise at ingest. A scan with one is always copied. |
+| `ingest.link` | Read zarr scans that are already on the run grid in place. Default `true`. |
+| `features.*` | MIND-SSC and channel sampling; see [Features](#features-anatomix-with-mind-ssc). |
+| `seed` | Seeds the per-pass channel draw. |
 | `template_subject` | Hold one subject fixed as the target instead of building a template. |
 | `slurm.*` | Partition and per-pass resources, plus `max_wait_s` to fail instead of waiting forever. |
 
@@ -237,15 +290,16 @@ With several GPUs in one job, `chunkreg run` starts one worker per GPU listed in
 keeps the NumPy reference path, and the `CHUNKREG_DEVICE` environment variable
 overrides the config for one process.
 
-Ingest still resamples on the CPU when a scan is not already on the run
-spacing. It does this once per scan, one block at a time.
+Ingest still resamples on the CPU when a scan is not already on the run grid.
+It does this once per scan, one block at a time. A scan that is already on the
+grid needs no resampling, only the coarser levels.
 
 ## Outputs
 
 | What | Where |
 |---|---|
-| Final template | `<root>/levels/L<k>/template.zarr`, for the last level run |
-| Final fields | `<root>/fields/<id>.zarr`, at the last level run's resolution |
+| Final template | `<root>/levels/L<k>/template.zarr` (OME-Zarr), for the last level run |
+| Final fields | `<root>/fields/<id>.zarr` (OME-Zarr), at the last level run's resolution |
 | Per-pass records | `<root>/levels/L<k>/pass_it<n>.json` |
 
 Fields map template coordinates to subject coordinates, in millimetres. To use

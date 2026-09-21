@@ -435,6 +435,10 @@ class IngestSpec:
     """Radius of an optional median denoise, in voxels. ``None`` disables it."""
     percentiles: tuple[float, float] = (0.5, 99.5)
     """Intensity window, measured once at the coarsest level of each subject."""
+    link: bool = True
+    """Read a zarr scan that is already exactly on the run grid in place,
+    writing only the coarser levels, instead of copying it. ``false`` always
+    copies, for scans on storage too slow or too far away to read from."""
 
 
 # --------------------------------------------------------------------------- #
@@ -645,7 +649,10 @@ class RunConfig:
                         f"sigmas, or raise the profile's k, sigma_g, sigma_w and "
                         f"halo to match."
                     )
-                    if left < MIN_D_MAX_VOX:
+                    # Refuse only when the halo covers no displacement at all;
+                    # a smaller real clamp than advertised is a warning, as
+                    # small test profiles run with default stages hit it.
+                    if left <= 0:
                         raise ConfigError(msg)
                     warnings.append(msg)
 
@@ -953,6 +960,53 @@ def _read_raw(source: str | Path) -> dict:
         raise ConfigError(f"{path} is not valid YAML: {exc}") from None
 
 
+def _with_features(profile: Profile, block) -> Profile:
+    """Apply the ``features`` block: MIND-SSC alongside, and channel sampling.
+
+    ``mind`` adds the twelve MIND-SSC channels to the profile's extractor. It
+    defaults to on for anatomix, as anatomix's own registration uses them.
+    ``sample_channels`` registers only that many channels per template pass,
+    a new stratified draw each pass. It defaults to the profile's channel
+    count for anatomix profiles whenever MIND makes the total larger, so
+    adding MIND leaves device memory and per-pass cost where the profile put
+    them.
+    """
+    from .features import describe
+
+    feat = dict(block or {})
+    _check_keys(feat, {"mind", "sample_channels"}, "the 'features' block")
+    spec, _, _ = str(profile.features).partition("@")
+    parts = [p for p in spec.split("+") if p]
+    has_anatomix = any(p == "anatomix" for p in parts)
+    mind = bool(feat.get("mind", has_anatomix))
+    if mind and "mindssc" not in parts:
+        parts.append("mindssc")
+    if not mind and "mindssc" in parts and len(parts) > 1:
+        parts.remove("mindssc")
+    spec = "+".join(parts)
+    total, r_f = describe(spec)
+    sample = feat.get("sample_channels", "default")
+    if sample == "default":
+        # Only the heavy learned profiles are held to their channel budget;
+        # thirteen intensity-plus-MIND channels cost next to nothing.
+        sample = profile.channels if has_anatomix and total > profile.channels else None
+    if sample is not None:
+        sample = int(sample)
+        if not 1 <= sample <= total:
+            raise ConfigError(
+                f"features.sample_channels is {sample}, but {spec} has {total} channels"
+            )
+        if sample < total:
+            spec = f"{spec}@{sample}"
+        total = sample
+    if spec == profile.features and total == profile.channels:
+        return profile
+    try:
+        return replace(profile, features=spec, channels=total, r_f=max(profile.r_f, r_f))
+    except ValueError as exc:
+        raise ConfigError(f"features block: {exc}") from None
+
+
 def load_config(source: str | Path | dict) -> RunConfig:
     """Read a run configuration from a JSON or YAML file, or a mapping."""
     raw = _read_raw(source) if isinstance(source, (str, Path)) else dict(source)
@@ -963,7 +1017,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         "root", "subjects", "profile", "profile_overrides", "spacing_mm", "grid",
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
-        "backbone", "ingest", "template_subject", "device", "engine", "gpus",
+        "backbone", "ingest", "template_subject", "features", "device", "engine", "gpus",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -989,6 +1043,8 @@ def load_config(source: str | Path | dict) -> RunConfig:
         raise ConfigError(
             f"bad profile_overrides for profile {profile_name!r}: {exc}"
         ) from None
+
+    profile = _with_features(profile, raw.get("features"))
 
     runner_name = raw.get("runner", "local")
     if runner_name not in ("local", "slurm"):
@@ -1078,7 +1134,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
     )
 
     ing = dict(raw.get("ingest") or {})
-    _check_keys(ing, {"dtype", "median_radius", "percentiles"}, "the 'ingest' block")
+    _check_keys(
+        ing, {"dtype", "median_radius", "percentiles", "link"}, "the 'ingest' block"
+    )
     median = ing.get("median_radius", IngestSpec.median_radius)
     ingest = IngestSpec(
         dtype=str(ing.get("dtype", IngestSpec.dtype)),
@@ -1086,6 +1144,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         percentiles=tuple(
             float(v) for v in ing.get("percentiles", IngestSpec.percentiles)
         ),
+        link=bool(ing.get("link", IngestSpec.link)),
     )
 
     rt = dict(raw.get("retry") or {})

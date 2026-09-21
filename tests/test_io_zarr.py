@@ -174,7 +174,7 @@ def test_ingested_stores_are_sharded_one_shard_per_core(tmp_path):
     vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE)
     errors, warnings = check_volume(vol, PROFILE)
     assert errors == [] and warnings == []
-    native = zarr.open_array(str(tmp_path / "s.zarr" / f"s{vol.n_levels - 1}"), mode="r")
+    native = zarr.open_array(str(vol.level_path(vol.n_levels - 1)), mode="r")
     assert native.shards == (32, 32, 32)
     assert native.chunks == (8, 8, 8)
 
@@ -197,7 +197,7 @@ def test_an_unsharded_store_is_flagged(tmp_path):
     vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE)
     k = vol.n_levels - 1
     g = vol.grid(k)
-    zarr.create_array(str(tmp_path / "s.zarr" / f"s{k}"), shape=g.shape,
+    zarr.create_array(str(vol.level_path(k)), shape=g.shape,
                       dtype="uint16", chunks=(8, 8, 8), overwrite=True)
     _, warnings = check_volume(Volume.open(tmp_path / "s.zarr"), PROFILE)
     assert any("not sharded" in w for w in warnings)
@@ -218,8 +218,10 @@ def cohort_config(tmp_path, **over) -> str:
                               "sigma_g": 0.5, "sigma_w": 0.5, "scales": [2, 1]},
         "subjects": [{"id": f"s{i}", "source": f"raw/s{i}.ome.zarr"} for i in range(1, 3)],
         "levels": {"caps": [1, 1],
-                   "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [6, 4]}}],
-                   "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3]}}],
+                   "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [6, 4],
+                                                 "cc_kernel": 3, "smooth_grad_sigma": 0.5}}],
+                   "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3],
+                                                 "cc_kernel": 3, "smooth_grad_sigma": 0.5}}],
                    "sharpen_laplacian_levels": []},
     }
     cfg.update(over)
@@ -275,3 +277,143 @@ def test_a_run_completes_on_the_zarr_backend(tmp_path, capsys):
     assert "settling the final fields" in out
     assert (tmp_path / "levels" / "L0" / "template.zarr").exists()
     assert main(["status", path]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Stores are OME-Zarr
+# --------------------------------------------------------------------------- #
+def test_a_volume_store_is_an_ome_zarr(tmp_path):
+    vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE)
+    root = zarr.open_group(str(tmp_path / "s.zarr"), mode="r")
+    ms = root.attrs["ome"]["multiscales"][0]
+    paths = [d["path"] for d in ms["datasets"]]
+    assert paths == [str(i) for i in range(vol.n_levels)]
+    scales = [d["coordinateTransformations"][0]["scale"][0] for d in ms["datasets"]]
+    assert scales == sorted(scales) and scales[0] == pytest.approx(0.05)
+    assert [a["unit"] for a in ms["axes"]] == ["millimeter"] * 3
+    assert root["0"].shape == vol.native_grid.shape
+    # Any OME-Zarr reader sees full resolution and its voxel size.
+    src = open_source(tmp_path / "s.zarr")
+    assert src.shape == vol.native_grid.shape and src.voxel_mm == pytest.approx((0.05,) * 3)
+    np.testing.assert_array_equal(src.read(), volume())
+
+
+def test_translation_matches_every_level_grid(tmp_path):
+    vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE, origin_mm=(1.0, -2.0, 0.5))
+    ms = zarr.open_group(str(tmp_path / "s.zarr"), mode="r").attrs["ome"]["multiscales"][0]
+    for d in ms["datasets"]:
+        k = vol.n_levels - 1 - int(d["path"])
+        assert d["coordinateTransformations"][1]["translation"] == pytest.approx(
+            list(vol.grid(k).origin_mm)
+        )
+
+
+def test_a_field_is_an_ome_zarr(tmp_path):
+    from chunkreg.grid import GridSpec
+    from chunkreg.store import Field
+
+    grid = GridSpec((40, 36, 44), 0.05)
+    f = Field.create(tmp_path / "f.zarr", grid, PROFILE, subject="s1")
+    f.write_lattice((0, 0, 0), np.ones((3, 4, 4, 4), np.float32))
+    root = zarr.open_group(str(tmp_path / "f.zarr"), mode="r")
+    ms = root.attrs["ome"]["multiscales"][0]
+    assert [a["name"] for a in ms["axes"]] == ["c", "z", "y", "x"]
+    assert root["0"].shape == (3, 20, 18, 22)
+    again = Field.open(tmp_path / "f.zarr")
+    assert again.level_grid == grid
+    assert np.all(again.read_lattice((0, 0, 0), (4, 4, 4)) == 1)
+
+
+def test_stores_in_the_earlier_layout_still_open(tmp_path):
+    import json
+
+    from chunkreg.grid import GridSpec
+    from chunkreg.store import Field
+
+    old = tmp_path / "old.zarr"
+    arr = zarr.create_array(str(old / "s0"), shape=(8, 8, 8), dtype="uint16", chunks=(8, 8, 8))
+    arr[:] = 7
+    (old / "meta.json").write_text(json.dumps({
+        "kind": "volume", "native_shape": [8, 8, 8], "spacing_mm": 0.1,
+        "origin_mm": [0, 0, 0], "n_levels": 1, "dtype": "uint16", "core": 32,
+        "inner_chunk": 8, "norm_lo": 0, "norm_hi": 10, "provenance": {},
+    }))
+    vol = Volume.open(old)
+    assert int(vol.array(0)[0, 0, 0]) == 7
+    vol.set_normalisation(0.0, 20.0)
+    assert json.loads((old / "meta.json").read_text())["norm_hi"] == 20.0
+
+    zarr.create_array(str(tmp_path / "f.zarr"), shape=(3, 4, 4, 4), dtype="float32", chunks=(3, 4, 4, 4))
+    (tmp_path / "f.zarr.meta.json").write_text(json.dumps({
+        "kind": "field", "level_shape": [8, 8, 8], "level_spacing_mm": 0.1,
+        "level_origin_mm": [0, 0, 0], "lattice_factor": 2, "subject": "a",
+    }))
+    f = Field.open(tmp_path / "f.zarr")
+    assert Field.exists(tmp_path / "f.zarr")
+    assert f.array.shape == (3, 4, 4, 4)
+    assert f.level_grid == GridSpec((8, 8, 8), 0.1)
+
+
+def test_a_foreign_zarr_is_never_overwritten(tmp_path):
+    from chunkreg.grid import GridSpec
+
+    path = write_ome(tmp_path / "scan.ome.zarr", volume())
+    with pytest.raises(FileExistsError, match="did not write"):
+        Volume.create(path, GridSpec(SHAPE, 0.05), PROFILE, overwrite=True)
+    plain = zarr.create_array(str(tmp_path / "plain.zarr"), shape=(4, 4, 4), dtype="uint8")
+    with pytest.raises(FileExistsError):
+        Volume.create(tmp_path / "plain.zarr", GridSpec((4, 4, 4), 0.05), PROFILE, overwrite=True)
+    assert open_source(path).shape == SHAPE
+
+
+# --------------------------------------------------------------------------- #
+# Scans on the run grid are read in place
+# --------------------------------------------------------------------------- #
+def _tree(path):
+    import hashlib
+
+    h = hashlib.sha256()
+    for f in sorted(p for p in path.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(path)).encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def test_setup_links_a_scan_already_on_the_grid(tmp_path, capsys):
+    path = cohort_config(tmp_path)
+    before = _tree(tmp_path / "raw/s1.ome.zarr")
+    assert main(["setup", path, *QUICK]) == 0
+    out = capsys.readouterr().out
+    assert "read in place" in out
+    vol = Volume.open(tmp_path / "subjects/s1.zarr")
+    top = vol.n_levels - 1
+    assert vol.is_linked(top)
+    assert not vol.level_path(top).exists(), "the full resolution was copied"
+    np.testing.assert_array_equal(vol.array(top)[:], np.roll(volume(), 1, axis=0))
+    with pytest.raises(PermissionError):
+        vol.array(top, "r+")
+    # Reingesting rebuilds the store and leaves the scan alone.
+    assert main(["setup", path, "--reingest", *QUICK]) == 0
+    assert _tree(tmp_path / "raw/s1.ome.zarr") == before
+    root = zarr.open_group(str(tmp_path / "subjects/s1.zarr"), mode="r")
+    listed = [d["path"] for d in root.attrs["ome"]["multiscales"][0]["datasets"]]
+    assert "0" not in listed and listed == [str(i) for i in range(1, vol.n_levels)]
+
+
+def test_link_false_copies(tmp_path, capsys):
+    path = cohort_config(tmp_path, ingest={"link": False})
+    assert main(["setup", path, *QUICK]) == 0
+    assert "read in place" not in capsys.readouterr().out
+    vol = Volume.open(tmp_path / "subjects/s1.zarr")
+    assert not vol.is_linked(vol.n_levels - 1)
+    assert vol.level_path(vol.n_levels - 1).exists()
+
+
+def test_a_run_on_linked_scans_writes_nothing_into_them(tmp_path, capsys):
+    path = cohort_config(tmp_path)
+    before = [_tree(tmp_path / f"raw/s{i}.ome.zarr") for i in (1, 2)]
+    assert main(["setup", path, *QUICK]) == 0
+    assert main(["run", path]) == 0
+    assert [_tree(tmp_path / f"raw/s{i}.ome.zarr") for i in (1, 2)] == before
+    root = zarr.open_group(str(tmp_path / "fields/s1.zarr"), mode="r")
+    assert "ome" in root.attrs

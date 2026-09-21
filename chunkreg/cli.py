@@ -395,8 +395,8 @@ def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
     """
     from . import backend as _backend
     from .cohort import Placement, ResampledSource, placement_notes, resolve_run_grid
-    from .io_formats import is_zarr, open_source
-    from .store import Volume, ingest_source
+    from .io_formats import is_chunkreg_store, is_zarr, open_source
+    from .store import Volume, ingest_source, link_source
 
     todo, kept = [], []
     for spec in cfg.subjects:
@@ -410,7 +410,8 @@ def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
                 raise SystemExit(
                     f"subject {spec.id!r}: {dst} is a zarr but not a chunkreg "
                     f"store. Name it as the subject's 'source' and let 'path' "
-                    f"default, and setup will convert it into a sharded store."
+                    f"default; setup then reads it in place, or copies it if it "
+                    f"is not on the run grid."
                 )
             raise SystemExit(
                 f"subject {spec.id!r} has no store at {dst} and no 'source' to "
@@ -489,23 +490,59 @@ def _ingest_subjects(cfg, reingest: bool = False) -> tuple[list, list]:
         src_path, source = sources[spec.id]
         placement = placements[spec.id]
         how, notes = placement_notes(grid, placement)
-        vol = ingest_source(
-            ResampledSource(source, placement, grid),
-            dst,
-            grid.spacing_mm,
-            cfg.profile,
-            origin_mm=grid.origin_mm,
-            dtype=cfg.ingest.dtype,
-            backend=cfg.backend,
-            overwrite=True,
-            percentiles=cfg.ingest.percentiles,
-            median_radius=cfg.ingest.median_radius,
-            provenance={
-                "source": str(src_path),
-                "config": cfg.fingerprint(),
-                "placement": placement.to_json(),
-            },
+        view = ResampledSource(source, placement, grid)
+        provenance = {
+            "source": str(src_path),
+            "config": cfg.fingerprint(),
+            "placement": placement.to_json(),
+        }
+        # A zarr already exactly on the run grid is read where it is: copying
+        # it would only duplicate the largest level. Anything that changes the
+        # voxels on the way in (a median, another dtype) needs the copy.
+        linkable = (
+            cfg.ingest.link
+            and view.is_identity
+            and is_zarr(src_path)
+            and not is_chunkreg_store(src_path)
+            and cfg.ingest.median_radius is None
+            and cfg.ingest.dtype in ("auto", str(source.dtype))
         )
+        if linkable:
+            from .io_formats import open_zarr_in_place
+
+            arr = open_zarr_in_place(src_path)
+            layout = f"chunks {tuple(getattr(arr, 'chunks', ()) or ())}"
+            shards = getattr(arr, "shards", None)
+            layout += f", shards {tuple(shards)}" if shards else ", not sharded"
+            how = (
+                f"read in place, full resolution not copied ({layout}; set "
+                f"ingest.link false to copy it into {cfg.profile.core}-voxel shards)"
+            )
+            vol = link_source(
+                src_path,
+                dst,
+                grid.spacing_mm,
+                cfg.profile,
+                origin_mm=grid.origin_mm,
+                backend=cfg.backend,
+                overwrite=True,
+                percentiles=cfg.ingest.percentiles,
+                provenance=provenance,
+            )
+        else:
+            vol = ingest_source(
+                view,
+                dst,
+                grid.spacing_mm,
+                cfg.profile,
+                origin_mm=grid.origin_mm,
+                dtype=cfg.ingest.dtype,
+                backend=cfg.backend,
+                overwrite=True,
+                percentiles=cfg.ingest.percentiles,
+                median_radius=cfg.ingest.median_radius,
+                provenance=provenance,
+            )
         lo, hi = vol.normalisation
         print(
             f"  {spec.id}: {source.description} -> {dst}\n"

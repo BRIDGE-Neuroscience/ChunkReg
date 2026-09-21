@@ -1,5 +1,5 @@
 {
-  "root": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um",
+  "root": "/SAN/external/bridge_project_data/results/chunkreg/atlas_50um",
   "runner": "local",
   "device": "cuda",
   "engine": "fireants",
@@ -9,6 +9,7 @@
 
   "spacing_mm": 0.05,
   "grid": {"spacing_mm": "finest", "align": "centre"},
+  "features": {"mind": false, "sample_channels": 8},
 
   "bytes_per_voxel_channel": 90,
   "throughput_ch_vox_per_s": 1.5e6,
@@ -20,10 +21,10 @@
   },
 
   "subjects": [
-    {"id": "AUMC_2025_044", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr"},
-    {"id": "LADAF_2020_27", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr"},
-    {"id": "LADAF_2021_17", "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr"},
-    {"id": "S_21_46",       "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr"}
+    {"id": "AUMC_2025_044", "source": "/SAN/external/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr"},
+    {"id": "LADAF_2020_27", "source": "/SAN/external/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr"},
+    {"id": "LADAF_2021_17", "source": "/SAN/external/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr"},
+    {"id": "S_21_46",       "source": "/SAN/external/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr"}
   ],
 
   "levels": {

@@ -21,7 +21,16 @@ import numpy as np
 
 from .grid import GridSpec
 
-__all__ = ["VolumeSource", "open_source", "read_volume", "write_volume", "is_zarr"]
+__all__ = [
+    "VolumeSource",
+    "SpatialArray",
+    "open_source",
+    "open_zarr_in_place",
+    "is_chunkreg_store",
+    "read_volume",
+    "write_volume",
+    "is_zarr",
+]
 
 _TIFF = {".tif", ".tiff", ".btf"}
 _NIFTI = {".nii", ".mgz", ".mgh"}
@@ -184,7 +193,11 @@ def _spacing(zyx: Sequence[float]) -> float | tuple[float, float, float]:
     return v
 
 
-def _open_zarr(p: Path) -> VolumeSource:
+def _resolve_zarr(p: Path):
+    """The full-resolution array of a zarr source, with its axis names.
+
+    Returns ``(array, axis names, spacing, description)``.
+    """
     import zarr
 
     node = zarr.open(str(p), mode="r")
@@ -192,8 +205,7 @@ def _open_zarr(p: Path) -> VolumeSource:
         names = list(_SPATIAL) if node.ndim == 3 else (
             [f"dim{i}" for i in range(node.ndim - 3)] + list(_SPATIAL)
         )
-        shape, read = _spatial_reader(node, names)
-        return VolumeSource(shape, np.dtype(node.dtype), None, f"zarr array {p}", read)
+        return node, names, None, f"zarr array {p}"
 
     attrs = dict(node.attrs)
     ome = attrs.get("ome", attrs)
@@ -209,23 +221,82 @@ def _open_zarr(p: Path) -> VolumeSource:
         else:  # NGFF 0.3 and earlier carry no axes: assume trailing z, y, x
             names = [f"dim{i}" for i in range(arr.ndim - 3)] + list(_SPATIAL)
             spacing = None
-        shape, read = _spatial_reader(arr, names)
-        return VolumeSource(
-            shape,
-            np.dtype(arr.dtype),
-            spacing,
-            f"OME-Zarr {p} (dataset {dataset['path']!r})",
-            read,
-        )
+        return arr, names, spacing, f"OME-Zarr {p} (dataset {dataset['path']!r})"
 
     keys = sorted(node.array_keys())
     if len(keys) == 1:
-        return _open_zarr(p / keys[0])
+        return _resolve_zarr(p / keys[0])
     raise ValueError(
         f"{p} is a zarr group with {len(keys)} arrays ({keys[:6]}) and no OME "
         f"multiscales metadata, so it is not clear which one is the subject. "
         f"Point 'source' at the array itself, e.g. {p / keys[0] if keys else p}"
     )
+
+
+def _open_zarr(p: Path) -> VolumeSource:
+    arr, names, spacing, description = _resolve_zarr(p)
+    shape, read = _spatial_reader(arr, names)
+    return VolumeSource(shape, np.dtype(arr.dtype), spacing, description, read)
+
+
+class SpatialArray:
+    """A zarr array seen as ``(z, y, x)``, whatever axes it stores.
+
+    What a linked subject store hands out as its full-resolution level: it has
+    the ``shape``, ``dtype`` and slicing every pass reads through, and it is
+    read-only.
+    """
+
+    def __init__(self, arr, names: Sequence[str]) -> None:
+        self._arr = arr
+        self.shape, self._read = _spatial_reader(arr, names)
+        self.dtype = np.dtype(arr.dtype)
+        lowered = [str(n).lower() for n in names]
+        spatial = [lowered.index(a) for a in _SPATIAL]
+        inner = tuple(getattr(arr, "chunks", ()) or ())
+        self.chunks = tuple(inner[i] for i in spatial) if inner else ()
+        outer = getattr(arr, "shards", None)
+        self.shards = None if outer is None else tuple(outer[i] for i in spatial)
+        self.ndim = 3
+
+    def __getitem__(self, key) -> np.ndarray:
+        if not isinstance(key, tuple):
+            key = (key,)
+        key = key + (slice(None),) * (3 - len(key))
+        return np.asarray(self._read(key))
+
+    def __array__(self, dtype=None, copy=None):
+        a = self[(slice(None),) * 3]
+        return a if dtype is None else a.astype(dtype)
+
+
+def open_zarr_in_place(path):
+    """A zarr source's full-resolution array, for reading where it is.
+
+    A plain ``(z, y, x)`` array comes back as the zarr array itself; anything
+    with extra singleton axes or another axis order is wrapped.
+    """
+    arr, names, _, _ = _resolve_zarr(Path(path))
+    if [str(n).lower() for n in names] == list(_SPATIAL):
+        return arr
+    return SpatialArray(arr, names)
+
+
+def is_chunkreg_store(path) -> bool:
+    """A directory holding a chunkreg volume, in either layout."""
+    import json
+
+    p = Path(path)
+    if (p / "meta.json").exists():
+        return True
+    doc = p / "zarr.json"
+    if not doc.exists():
+        return False
+    try:
+        attrs = json.loads(doc.read_text(encoding="utf-8")).get("attributes") or {}
+    except (OSError, ValueError):
+        return False
+    return (attrs.get("chunkreg") or {}).get("kind") == "volume"
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +310,7 @@ def open_source(path) -> VolumeSource:
     TIFF, a directory of single-slice TIFFs, or a NIfTI/MGH file.
     """
     p = Path(path)
-    if p.is_dir() and (p / "meta.json").exists():
+    if p.is_dir() and is_chunkreg_store(p):
         from .store import Volume
 
         v = Volume.open(p)

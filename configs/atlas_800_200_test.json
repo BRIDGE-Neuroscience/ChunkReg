@@ -1,5 +1,5 @@
 {
-  "root": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_800_200_test",
+  "root": "/SAN/external/bridge_project_data/results/chunkreg/atlas_800_200_test",
   "runner": "local",
   "device": "cuda",
   "engine": "fireants",
@@ -21,17 +21,17 @@
 
   "subjects": [
     {"id": "AUMC_2025_044",
-     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr",
-     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/AUMC_2025_044.zarr"},
+     "source": "/SAN/external/bridge_project_data/data/atlas/AUMC_2025_044/AUMC_2025_044.zarr",
+     "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_50um/subjects/AUMC_2025_044.zarr"},
     {"id": "LADAF_2020_27",
-     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr",
-     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2020_27.zarr"},
+     "source": "/SAN/external/bridge_project_data/data/atlas/LADAF_2020_27/LADAF_2020_27.zarr",
+     "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2020_27.zarr"},
     {"id": "LADAF_2021_17",
-     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr",
-     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2021_17.zarr"},
+     "source": "/SAN/external/bridge_project_data/data/atlas/LADAF_2021_17/LADAF_2021_17.zarr",
+     "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2021_17.zarr"},
     {"id": "S_21_46",
-     "source": "/home/akeenlys/storage_main/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr",
-     "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/S_21_46.zarr"}
+     "source": "/SAN/external/bridge_project_data/data/atlas/S_21_46/S_21_46.zarr",
+     "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_50um/subjects/S_21_46.zarr"}
   ],
 
   "levels": {
