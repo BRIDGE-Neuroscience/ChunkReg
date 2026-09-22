@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from .. import fields as _fields
+from .. import qc as _qc
 from .. import stats as _stats
 from .. import xp as _xp
 from ..config import RunConfig
@@ -108,6 +109,7 @@ def register_chunk(
     if frac < cfg.levels.min_tissue_fraction:
         return {
             "field": _xp.to_float32(seed),
+            "residual": None,
             "skipped": True,
             "reason": "tissue",
             "tissue_fraction": frac,
@@ -146,6 +148,7 @@ def register_chunk(
         elif step == "emit_seed":
             return {
                 "field": _xp.to_float32(seed),
+                "residual": None,
                 "skipped": True,
                 "reason": "folds",
                 "tissue_fraction": frac,
@@ -172,6 +175,7 @@ def register_chunk(
 
     return {
         "field": total,
+        "residual": residual,
         "skipped": False,
         "reason": None,
         "tissue_fraction": frac,
@@ -252,6 +256,9 @@ def run_register_task(
         )
         lat_origin, lat_shape = entry.lattice(cfg.profile.lattice_factor)
         array.write(i, _to_lattice(rec.pop("field"), lat_shape, cfg.profile.lattice_factor))
+        # The residual's magnitude over the core goes to the level's QC map.
+        # Popped so a device tensor never reaches the JSON record.
+        _qc.write_residual_core(cfg, manifest, entry, rec.pop("residual"), rec.get("reason"))
         records.append({"subject": entry.subject, "chunk_id": entry.chunk_id, **rec})
 
     array.meta["records"] = records

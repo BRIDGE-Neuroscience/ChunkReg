@@ -285,6 +285,8 @@ shape bias decays rather than accumulates.
 | Final template | `<root>/levels/L<k>/template.zarr` (OME-Zarr), for the last level run |
 | Final fields | `<root>/fields/<id>.zarr` (OME-Zarr), at the last level run's resolution |
 | Per-pass records | `<root>/levels/L<k>/pass_it<n>.json` |
+| Per-pass QC sheet | `<root>/levels/L<k>/qc/it<n>.png` |
+| Residual map | `<root>/levels/L<k>/qc/residual_<id>.zarr` (OME-Zarr) |
 
 Fields map template coordinates to subject coordinates, in millimetres. To use
 them:
@@ -314,6 +316,54 @@ whole array — the process stays bounded, but the volume passes through the
 page cache and needs the space on disk twice for the duration. NIfTI also
 stores each dimension in 16 bits, so an axis over 32767 voxels is refused
 rather than truncated; past that size, write a TIFF or keep the OME-Zarr.
+
+## Where a level is failing
+
+A pass reports `d99`, which is a percentile over the whole level: it says one
+voxel in a hundred is worse than some distance, and nothing about whether
+those voxels are in the cortex, the cerebellum or the edge of the scan. Two
+things a run writes on its own answer that.
+
+**A sheet per pass**, at `levels/L<k>/qc/it<n>.png`. Template mid-slices on
+top, axial, coronal and sagittal; the residual below. About 250 kB, so it
+reads over SSH without pulling a volume:
+
+```bash
+ls   <root>/levels/L2/qc/
+scp  pryor:<root>/levels/L2/qc/it3.png .
+```
+
+The residual is the part of the correspondence a pass could **not** explain,
+which is the quantity the stopping rule watches, rather than the total field.
+The panel is the maximum over subjects, so a region any one subject failed in
+shows rather than being averaged away. Its colour scale is pinned to the
+level's displacement clamp, so the same colour is the same millimetres from
+pass to pass and levels can be compared by eye; the label carries the actual
+99th percentile of what is drawn.
+
+Two readings the colours are chosen to keep apart:
+
+- **Black is a converged chunk, and also a chunk with no tissue in it.** A
+  chunk skipped for lack of foreground writes zero, which is true: there was
+  nothing there to register.
+- **Magenta is a chunk that exhausted the fold retry ladder.** It writes NaN
+  rather than zero, because zero would read as "converged" in the one place
+  where the truth is "no acceptable solution was found". Magenta over anatomy
+  means the regularisation is being asked for a correspondence that does not
+  exist.
+
+**A residual map per subject**, at `levels/L<k>/qc/residual_<id>.zarr`,
+overwritten each pass so it always holds the latest. It is an ordinary
+single-level store on the displacement lattice, so it exports like anything
+else:
+
+```bash
+chunkreg export levels/L2/qc/residual_s01.zarr residual_s01.nii.gz
+```
+
+Rendering never stops a run: a sheet that cannot be written is reported and
+the pass carries on, since the template and the fields are the outputs and the
+sheet only exists so they can be judged without pulling them.
 
 ## Resuming
 

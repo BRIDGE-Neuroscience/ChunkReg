@@ -767,8 +767,7 @@ precisely the cross-column comparison that mode cannot support.
 
 ### Not yet built
 
-`passes/qc.py` (metrics are collected and returned by the passes but not yet
-written to parquet or rendered as thumbnails), and
+the parquet mirror and gate of `passes/qc.py` (a residual map per subject per level and a slice sheet per pass now exist in `chunkreg/qc.py`; the per-subject similarity, gradient energy and the level gate do not), and
 `engines/fireants.py` is written against the documented FireANTs API but has
 never been executed, since this machine has no GPU. Run `chunkreg selftest
 --engine fireants` first on a machine that does; it is designed to catch

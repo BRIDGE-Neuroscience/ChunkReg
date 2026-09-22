@@ -48,6 +48,7 @@ from ..features import get_extractor
 from ..grid import GridSpec, pyramid
 from ..passes import blend as _blend
 from ..passes import promote as _promote
+from .. import qc as _qc
 from ..passes import register as _register
 from ..passes import update as _update
 from ..passes.manifest import Manifest, build_manifest
@@ -270,6 +271,14 @@ def build_template(
             )
             if not replayed:
                 _record_pass(cfg, pr)
+                # A failed sheet is a warning, never a dead run: the run's
+                # outputs are the template and fields, and the sheet is
+                # only there so they can be judged without pulling them.
+                try:
+                    png = _qc.render_pass(cfg, level, iteration, grid, manifest.d_max_mm)
+                    say(f"  qc sheet {png}")
+                except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                    say(f"  qc sheet not written: {type(exc).__name__}: {exc}")
                 _cleanup(cfg, manifest)
             if stopped:
                 break
@@ -320,6 +329,7 @@ def _run_pass(
     # on the race-tolerance inside the task, and so a blend that starts while
     # register is still running finds them there.
     _blend.ensure_accumulators(cfg, manifest)
+    _qc.ensure_residual_stores(cfg, manifest)
     register_ids = range(manifest.n_tasks)
     blend_ids = range(len(manifest.chunks))
 
