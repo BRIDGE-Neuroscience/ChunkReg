@@ -644,3 +644,31 @@ def test_save_config_writes_a_file_that_loads(tmp_path):
     path = save_config(cfg, tmp_path / "nested" / "config.json")
     assert path.exists()
     assert load_config(path) == cfg
+
+
+def test_the_coarse_rerun_config_resolves_as_intended():
+    """v3: levels 0 and 1 only, flexible, and no chunk allowed to give up."""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "configs" / "atlas_v3.json"
+    loaded = load_config(path)
+    assert loaded.levels.stop_at == 0.8, "800um is normalised to mm at load"
+    assert [loaded.levels.cap(k) for k in (0, 1)] == [20, 15]
+
+    # The point of the run: every chunk returns a residual. Without emit_seed
+    # the retry ladder runs out and the chunk keeps its last solution rather
+    # than falling back to its seed and contributing nothing.
+    assert "emit_seed" not in loaded.retry.ladder
+    assert loaded.retry.ladder == ("sigma_w_x2", "clamp_x0.5")
+    assert loaded.retry.fold_frac == 0.01
+
+    coarse, seeded = loaded.levels.stages(0)[-1], loaded.levels.stages(1)[-1]
+    assert coarse.lr == 2.0 and seeded.lr == 1.5, "amplitude falls coarse to fine"
+    assert coarse.smooth_warp_sigma == 0.30 and seeded.smooth_warp_sigma == 0.30
+    # Flexibility costs nothing from the halo: a narrower kernel and smaller
+    # sigmas need less of it than the profile budgets.
+    need = seeded.s_max * (
+        (seeded.cc_kernel - 1) / 2 + 3 * max(seeded.smooth_grad_sigma,
+                                             seeded.smooth_warp_sigma)
+    )
+    assert need < loaded.profile.support_vox()

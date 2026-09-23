@@ -156,17 +156,38 @@ _RAMP = np.array(
     dtype=np.float32,
 )
 _NAN_RGB = np.array([255, 0, 255], dtype=np.uint8)
+_PARTIAL_TINT = 0.35
+"""How far toward magenta a voxel goes when only some subjects gave up."""
 
 
-def _heat(a: np.ndarray, vmax: float) -> np.ndarray:
-    """``0 .. vmax`` on a dark-to-light ramp; NaN in magenta, ``(H, W, 3)``."""
+def _heat(a: np.ndarray, vmax: float, gave_up: np.ndarray | None = None) -> np.ndarray:
+    """``0 .. vmax`` on a dark-to-light ramp, tinted where chunks gave up.
+
+    ``gave_up`` is the *fraction* of subjects whose chunk emitted its seed at
+    each voxel, and the colour is blended that far toward magenta. A voxel no
+    subject could solve is fully magenta; one where three of four succeeded is
+    the residual those three left, faintly tinted.
+
+    The alternative -- one failing subject making the voxel magenta outright --
+    throws away everything the others found. At a level where half the pairs
+    gave up that erased the whole map and made a partly-working level look
+    like a total collapse.
+    """
     t = np.clip(np.nan_to_num(a, nan=0.0) / max(float(vmax), 1e-9), 0.0, 1.0)
     pos = t * (len(_RAMP) - 1)
     i = np.clip(np.floor(pos).astype(np.int64), 0, len(_RAMP) - 2)
     w = (pos - i)[..., None]
     rgb = _RAMP[i] * (1 - w) + _RAMP[i + 1] * w
+    if gave_up is not None:
+        # Full magenta is reserved for "no subject solved this voxel", so it
+        # stays unmissable. A partial give-up is marked but kept light enough
+        # to read the residual through: a straight blend by the fraction put a
+        # third of the way to magenta over an entire panel and buried it.
+        f = np.clip(gave_up, 0.0, 1.0)
+        f = np.where(f >= 1.0, 1.0, _PARTIAL_TINT * f)[..., None]
+        rgb = rgb * (1 - f) + _NAN_RGB.astype(np.float32) * f
     out = rgb.astype(np.uint8)
-    out[~np.isfinite(a)] = _NAN_RGB
+    out[~np.isfinite(a)] = _NAN_RGB  # no subject solved here
     return out
 
 
@@ -179,6 +200,41 @@ def _fit(rgb: np.ndarray, box: int):
     return im.resize((max(1, int(round(w * s))), max(1, int(round(h * s)))), Image.BILINEAR)
 
 
+def _residual_label(report, r_slices, stale: bool, n_subjects: int,
+                    vmax: float, p99: float) -> str:
+    """What the residual row is, said plainly enough to act on.
+
+    An all-magenta panel is ambiguous on its own: every chunk may have
+    exhausted the fold ladder, or nothing may have been computed. The counts
+    from the pass settle it, so they are on the sheet rather than only in the
+    JSON beside it.
+    """
+    if stale:
+        return (
+            "residual: NOT recomputed this pass -- every register task was "
+            "reused from an earlier attempt, so no chunk re-solved. Clear the "
+            "level's scratch, or allow another pass, to get a fresh map."
+        )
+    if r_slices is None:
+        return "residual: no map written this pass"
+
+    counts = ""
+    if report is not None and getattr(report, "entries", 0):
+        gave_up = getattr(report, "seeded_folds", 0)
+        air = getattr(report, "seeded_tissue", 0)
+        solved = report.entries - gave_up - air
+        counts = f"; {solved}/{report.entries} subject-chunks solved"
+        if gave_up:
+            counts += f", {gave_up} gave up on folds"
+        if air:
+            counts += f", {air} had no tissue (black)"
+    return (
+        f"residual |u| mm, max over {n_subjects} subject(s) that solved, "
+        f"scale 0-{vmax:.2f}, p99 {p99:.2f}{counts}"
+        "; magenta = no subject solved it, tint = some did not"
+    )
+
+
 def render_pass(
     cfg: RunConfig,
     level: int,
@@ -186,6 +242,7 @@ def render_pass(
     grid: GridSpec,
     d_max_mm: float | None,
     subjects=None,
+    report=None,
 ) -> Path:
     """Write the pass's slice sheet and return its path.
 
@@ -201,13 +258,31 @@ def render_pass(
     t_slices = _mid_slices(template.array(0))
 
     subjects = list(subjects) if subjects is not None else list(cfg.registered_ids)
+    # A pass whose register tasks were all reused wrote no residual, so
+    # whatever the stores hold belongs to an earlier pass. Drawing it would
+    # present stale data as this pass's, and an all-NaN map from a level that
+    # collapsed looks identical to one that was never computed.
+    stale = report is not None and not getattr(report, "residual_written", True)
     r_slices: list[np.ndarray] | None = None
+    gave_up: list[np.ndarray] | None = None
+    n_read = 0
     for subject in subjects:
         path = residual_path(cfg, level, subject)
         if not Volume.exists(path, cfg.backend):
             continue
         s = _mid_slices(Volume.open(path, cfg.backend).array(0))
-        r_slices = s if r_slices is None else [np.maximum(a, b) for a, b in zip(r_slices, s)]
+        n_read += 1
+        # fmax, not maximum: a subject whose chunk gave up is NaN there, and
+        # maximum would let that one NaN discard what the others solved.
+        # Where they gave up is carried alongside instead, as a fraction.
+        miss = [np.isnan(x).astype(np.float32) for x in s]
+        if r_slices is None:
+            r_slices, gave_up = s, miss
+        else:
+            r_slices = [np.fmax(a, b) for a, b in zip(r_slices, s)]
+            gave_up = [g + m for g, m in zip(gave_up, miss)]
+    if gave_up is not None and n_read:
+        gave_up = [g / n_read for g in gave_up]
 
     vmax = float(d_max_mm) if d_max_mm else 1.0
     if r_slices is not None:
@@ -220,8 +295,10 @@ def render_pass(
         p99 = float("nan")
 
     panels = [_fit(_grey(s), PANEL_PX) for s in t_slices]
-    if r_slices is not None:
-        panels += [_fit(_heat(s, vmax), PANEL_PX) for s in r_slices]
+    if r_slices is not None and not stale:
+        panels += [
+            _fit(_heat(s, vmax, g), PANEL_PX) for s, g in zip(r_slices, gave_up)
+        ]
     else:
         panels += [Image.new("RGB", (PANEL_PX, PANEL_PX), (40, 40, 40))] * 3
 
@@ -237,12 +314,7 @@ def render_pass(
     labels = [
         f"L{level} pass {iteration}  template @ {spacing_um:g} um  "
         f"(axial | coronal | sagittal)",
-        (
-            f"residual |u| mm, max over {len(subjects)} subject(s), "
-            f"scale 0-{vmax:.2f}, p99 {p99:.2f}; magenta = fold ladder exhausted"
-            if r_slices is not None
-            else "residual: not written this pass"
-        ),
+        _residual_label(report, r_slices, stale, len(subjects), vmax, p99),
     ]
     y = margin
     for row in range(2):

@@ -1,0 +1,58 @@
+{
+  "root": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_v3",
+  "runner": "local",
+  "device": "cuda",
+  "engine": "fireants",
+  "backend": "zarr",
+  "profile": "a16",
+  "profile_overrides": {"halo": 56, "r_f": 32},
+  "gpu_mem_gb": 80,
+
+  "spacing_mm": 0.05,
+  "grid": {"spacing_mm": "finest", "align": "centre"},
+  "features": {"mind": true, "sample_channels": 8},
+
+  "bytes_per_voxel_channel": 103,
+  "throughput_ch_vox_per_s": 22574655,
+
+  "subjects": [
+    {"id": "AUMC_2025_044", "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/AUMC_2025_044.zarr"},
+    {"id": "LADAF_2020_27", "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2020_27.zarr"},
+    {"id": "LADAF_2021_17", "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/LADAF_2021_17.zarr"},
+    {"id": "S_21_46",       "path": "/home/akeenlys/storage_main/bridge_project_data/results/chunkreg/atlas_50um/subjects/S_21_46.zarr"}
+  ],
+
+  "levels": {
+    "stop_at": "800um",
+    "caps": [20, 15],
+
+    "level0_stages": [
+      "moments",
+      {"rigid":  {"scales": [4, 2, 1], "iterations": [400, 300, 200], "lr": 0.02}},
+      {"affine": {"scales": [4, 2, 1], "iterations": [400, 300, 200], "lr": 0.02}},
+      {"greedy": {"scales": [8, 4, 2, 1], "iterations": [400, 300, 250, 200],
+                  "lr": 2.0, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30,
+                  "cc_kernel": 5, "tolerance": 1e-4}}
+    ],
+
+    "seeded_stages": [
+      {"greedy": {"scales": [2, 1], "iterations": [300, 200]}}
+    ],
+
+    "level_params": {
+      "1": {"iterations": [300, 200], "lr": 1.50, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
+    },
+
+    "stop": {"residual_frac": 0.5, "ubar_vox": 1.0, "percentile": 99.0},
+
+    "shape_update_step": 0.40,
+    "sharpen_laplacian_levels": [0, 1],
+    "min_tissue_fraction": 0.02,
+    "level0_max_disp_frac": 0.25
+  },
+
+  "retry": {"fold_frac": 0.01, "ladder": ["sigma_w_x2", "clamp_x0.5"]},
+  "retention": {"keep_history_levels": [0, 1], "delete_task_arrays": true, "delete_accumulators": true},
+
+  "slurm": {"register": {"chunks_per_task": 1}}
+}

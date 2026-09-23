@@ -80,6 +80,25 @@ class PassReport:
     seconds: float
     stopped: bool = False
     reason: str = ""
+    entries: int = 0
+    """(subject, chunk) pairs the pass covered."""
+    seeded_folds: int = 0
+    """Pairs that emitted their seed because the retry ladder ran out.
+
+    Split from ``skipped`` because the two causes are not comparable. A chunk
+    with no tissue in it contributes nothing and should not: there is nothing
+    there. A chunk that exhausted the ladder contributes nothing and should
+    have: no acceptable solution was found for real anatomy. A level where
+    that second number approaches the pair count is not registering at all,
+    and its residual plateauing is the symptom rather than the cause."""
+    seeded_tissue: int = 0
+    """Pairs that emitted their seed for lack of foreground."""
+    residual_written: bool = True
+    """False when every register task was reused from an earlier attempt.
+
+    A reused task does not re-solve, so it writes no residual, and the QC map
+    then holds whatever an earlier pass left. Saying so is what stops the
+    sheet presenting stale data as this pass's."""
 
 
 @dataclass
@@ -117,7 +136,7 @@ class RunResult:
         rows = [
             f"{'lvl':>3} {'spacing':>8} {'pass':>5} {'d99 mm':>9} "
             + (f"{'step mm':>9} " if step else "")
-            + f"{'folds':>8} {'exit':>28}"
+            + f"{'folds':>8} {'gave up':>9} {'exit':>28}"
         ]
         for lv in self.levels:
             for p in lv.passes:
@@ -126,7 +145,8 @@ class RunResult:
                     f"{p.d99_mm:>9.4f} "
                     + (f"{p.step_mm:>9.4f} " if step else "")
                     + f"{p.fold_frac:>8.2%} "
-                    f"{(p.reason if p.stopped else ''):>28}"
+                    + f"{(f'{p.seeded_folds}/{p.entries}' if p.entries else '-'):>9} "
+                    + f"{(p.reason if p.stopped else ''):>28}"
                 )
         return "\n".join(rows)
 
@@ -267,6 +287,11 @@ def build_template(
                 + f"d99 {pr.d99_mm:.4f} mm, "
                 + ("" if cfg.template_subject else f"step {pr.step_mm:.4f} mm, ")
                 + f"folds {pr.fold_frac:.2%}"
+                + (
+                    f", {pr.seeded_folds}/{pr.entries} chunks gave up on folds"
+                    if pr.seeded_folds
+                    else ""
+                )
                 + (f" -> {reason}" if stopped else "")
             )
             if not replayed:
@@ -275,7 +300,9 @@ def build_template(
                 # outputs are the template and fields, and the sheet is
                 # only there so they can be judged without pulling them.
                 try:
-                    png = _qc.render_pass(cfg, level, iteration, grid, manifest.d_max_mm)
+                    png = _qc.render_pass(
+                        cfg, level, iteration, grid, manifest.d_max_mm, report=pr
+                    )
                     say(f"  qc sheet {png}")
                 except Exception as exc:  # noqa: BLE001 - reported, never fatal
                     say(f"  qc sheet not written: {type(exc).__name__}: {exc}")
@@ -361,6 +388,12 @@ def _run_pass(
         )
     reg.raise_for_failures()
     bl.raise_for_failures()
+    # A task that short-circuits on a complete task array does not re-solve,
+    # so it writes no residual. If every one did, the QC map is an earlier
+    # pass's and must not be shown as this one's.
+    residual_written = any(
+        not (r or {}).get("skipped") for r in reg.results()
+    ) or not reg.statuses
 
     # A template held fixed is not estimated, so there is no intensity average
     # to write and no shape bias to recentre away. Skipping the pass is what
@@ -386,6 +419,7 @@ def _run_pass(
         time.perf_counter() - t0,
         cfg.levels.stop_percentile,
         cfg.levels.shape_update_step,
+        residual_written=residual_written,
     )
     return pr, manifest
 
@@ -580,7 +614,8 @@ def register_pair(
     )
 
 
-def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float) -> PassReport:
+def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float,
+             residual_written: bool = True) -> PassReport:
     records = [r for res in reg.results() for r in (res.get("records") or [])]
     stats = [s for res in bl.results() for s in (res.get("stats") or [])]
     # Percentiles are read off summed histograms, so they are exact over the
@@ -591,6 +626,7 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float) -> Pa
     steps = _stats.merge(r.get("step_hist") for r in up.results())
     folds = max((s["folds"] for s in stats), default=0.0)
     step = _stats.percentile(steps, q)
+    reasons = [r.get("reason") for r in records if r.get("skipped")]
     return PassReport(
         level=level,
         iteration=iteration,
@@ -599,7 +635,11 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float) -> Pa
         step_mm=float(step),
         fold_frac=float(folds),
         retries=sum(int(r.get("retries", 0)) for r in records),
-        skipped=sum(1 for r in records if r.get("skipped")),
+        skipped=len(reasons),
+        entries=len(records),
+        seeded_folds=sum(1 for x in reasons if x == "folds"),
+        seeded_tissue=sum(1 for x in reasons if x == "tissue"),
+        residual_written=bool(residual_written),
         seconds=float(seconds),
     )
 
