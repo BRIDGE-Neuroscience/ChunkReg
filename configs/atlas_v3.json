@@ -23,8 +23,8 @@
   ],
 
   "levels": {
-    "stop_at": "800um",
-    "caps": [20, 15],
+    "stop_at": "100um",
+    "caps": [20, 15, 8, 5, 3],
 
     "level0_stages": [
       "moments",
@@ -40,7 +40,10 @@
     ],
 
     "level_params": {
-      "1": {"iterations": [300, 200], "lr": 1.50, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
+      "1": {"iterations": [300, 200], "lr": 1.50, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "2": {"iterations": [250, 150], "lr": 1.25, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "3": {"iterations": [200, 120], "lr": 1.00, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "4": {"iterations": [150, 100], "lr": 0.75, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
     },
 
     "stop": {"residual_frac": 0.5, "ubar_vox": 1.0, "percentile": 99.0},

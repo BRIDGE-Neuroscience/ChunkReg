@@ -90,10 +90,18 @@ mkdir -p "$CACHE/torch" "$CACHE/mpl"
 # APPTAINERENV_*, older SingularityCE reads SINGULARITYENV_*.
 pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
 
-# The GPUs Grid Engine gave this job. Unset means the node did not restrict
-# them, and then every GPU the container sees is used.
+# The GPUs Grid Engine gave this job, as the GPU prolog set them. Unset inside
+# a job means the prolog allocated none ("Not enough GPUs available ...,
+# rescheduling job") and the job started anyway. Every card on the node is then
+# visible, other people's included, so stop instead of using them. Outside Grid
+# Engine, unset means every GPU the container sees is used.
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+elif [ -n "${JOB_ID:-}" ]; then
+    echo "FATAL: Grid Engine started this job without allocating it any GPUs" >&2
+    echo "  (CUDA_VISIBLE_DEVICES is unset; see the GPU prolog lines above)." >&2
+    echo "  Nothing has run. Submit the job again." >&2
+    exit 1
 fi
 pass TMPDIR                "$TMPDIR"
 pass XDG_CACHE_HOME        "$CACHE"
@@ -151,6 +159,13 @@ if not torch.cuda.is_available():
     sys.exit("FATAL: torch sees no GPU inside the container (is --nv working?)")
 n = torch.cuda.device_count()
 print(f"torch {torch.__version__}, {n} GPU(s): {torch.cuda.get_device_name(0)}")
+# Naming a GPU does not open a context on it, so a card that another process
+# holds in exclusive mode only fails later, mid-setup. Open one on each now.
+for i in range(n):
+    try:
+        torch.zeros(1, device=f"cuda:{i}")
+    except RuntimeError as exc:
+        sys.exit(f"FATAL: GPU {i} of {n} cannot be used: {str(exc).splitlines()[0]}")
 cfg = load_config(sys.argv[1])
 if cfg.runner != "local":
     sys.exit(
