@@ -121,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--levels", default=None,
         help="comma-separated level numbers (0 is full resolution), default all",
     )
+    p.add_argument(
+        "--size-vox", type=int, default=None,
+        help="box width in level voxels, the same at every level, so the boxes "
+             "nest (overrides --size-mm)",
+    )
     p.add_argument("--subjects", default=None, help="comma-separated, default all")
     p.add_argument("--plane", default="axial", choices=["axial", "coronal", "sagittal", "all"])
     p.add_argument(
@@ -538,6 +543,7 @@ def cmd_features(args) -> int:
             cfg,
             centre_world=centre,
             size_mm=args.size_mm,
+            size_vox=args.size_vox,
             levels=ints(args.levels),
             subjects=strs(args.subjects),
             plane=plane,

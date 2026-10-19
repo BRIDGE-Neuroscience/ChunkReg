@@ -178,6 +178,7 @@ def build_feature_report(
     centre_world: Sequence[float] | None = None,
     size_mm: float | None = None,
     levels: Sequence[int] | None = None,
+    size_vox: int | None = None,
     subjects: Sequence[str] | None = None,
     plane: str = "axial",
     warped: bool = False,
@@ -185,7 +186,14 @@ def build_feature_report(
     basis_mode: str = "shared",
     min_box_vox: int = 8,
 ) -> FeatureReport:
-    """Sample every (subject, level) and fit one shared colour projection."""
+    """Sample every (subject, level) and fit one shared colour projection.
+
+    ``size_mm`` makes every level's box the same physical size (the default,
+    one chunk core at native resolution); ``size_vox`` instead makes it the
+    same number of *level* voxels, so the boxes nest -- 512 voxels is 10 mm at
+    20 um and 655 mm at 1280 um -- and each tile shows what the extractor sees
+    at that scale over the same field of view it registers with.
+    """
     subject_ids = list(subjects) if subjects else list(cfg.subject_ids)
     if not subject_ids:
         raise ValueError("no subjects to report on")
@@ -222,7 +230,9 @@ def build_feature_report(
         centre_world = tuple(native.world(np.asarray(native.shape, float) / 2.0 - 0.5))
     centre_world = tuple(float(v) for v in centre_world)
 
-    if size_mm is None:
+    if size_vox is not None:
+        size_mm = int(size_vox) * native.spacing_mm  # the finest level's box; coarser ones nest
+    elif size_mm is None:
         # One chunk core at native resolution: the box the finest level's
         # registration actually operates on.
         size_mm = cfg.profile.core * native.spacing_mm
@@ -231,10 +241,17 @@ def build_feature_report(
     extractor = get_extractor(name)
     extractor.setup()
 
-    raw: list[tuple[str, int, np.ndarray, np.ndarray, float]] = []
+    raw: list[tuple[str, int, np.ndarray, np.ndarray, float, float]] = []
     for level in level_ids:
         grid = grids[level]
-        size_vox = max(int(round(size_mm / grid.spacing_mm)), min_box_vox)
+        box_vox = (
+            int(size_vox) if size_vox is not None
+            else max(int(round(size_mm / grid.spacing_mm)), min_box_vox)
+        )
+        box_vox = min(box_vox, int(max(grid.shape)))
+        # The label says what was asked for: the same physical box at every
+        # level, or this level's voxel box.
+        extent = box_vox * grid.spacing_mm if size_vox is not None else float(size_mm)
         for sid in subject_ids:
             f = None
             if warped:
@@ -242,9 +259,9 @@ def build_feature_report(
                 if Field.exists(path, cfg.backend):
                     f = Field.open(path, cfg.backend)
             block, feats = sample_box(
-                vols[sid], level, grid, centre_world, size_vox, extractor, f
+                vols[sid], level, grid, centre_world, box_vox, extractor, f
             )
-            raw.append((sid, level, block, feats, grid.spacing_mm))
+            raw.append((sid, level, block, feats, grid.spacing_mm, extent))
 
     if basis_mode not in ("shared", "per-level"):
         raise ValueError(
@@ -255,20 +272,20 @@ def build_feature_report(
         # One projection over every tile, which is what makes the colours mean
         # the same thing in every panel and is the only mode in which the
         # columns can honestly be compared.
-        shared = _viz.fit_rgb_basis([f for _, _, _, f, _ in raw])
+        shared = _viz.fit_rgb_basis([f for _, _, _, f, _, _ in raw])
         bases = {k: shared for k in level_ids}
     else:
         # Each level at its own best contrast. Use this to check whether a
         # level that renders dead under the shared basis has structure in its
         # own subspace; do not use it to compare levels.
         bases = {
-            k: _viz.fit_rgb_basis([f for _, lv, _, f, _ in raw if lv == k])
+            k: _viz.fit_rgb_basis([f for _, lv, _, f, _, _ in raw if lv == k])
             for k in level_ids
         }
     basis = bases[level_ids[0]] if basis_mode == "per-level" else shared
 
     tiles = []
-    for sid, level, block, feats, spacing in raw:
+    for sid, level, block, feats, spacing, extent in raw:
         b = bases[level]
         metrics = _viz.feature_metrics(feats, b, tissue=block > 0.05)
         rgb_vol = b.to_rgb(feats)
@@ -277,7 +294,7 @@ def build_feature_report(
                 subject=sid,
                 level=level,
                 spacing_mm=spacing,
-                extent_mm=size_mm,
+                extent_mm=extent,
                 intensity=_viz.orthoslice(block, plane),
                 rgb=_viz.orthoslice(rgb_vol, plane),
                 metrics=metrics,

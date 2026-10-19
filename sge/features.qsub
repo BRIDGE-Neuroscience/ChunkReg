@@ -1,0 +1,34 @@
+#!/bin/bash
+# chunkreg features on one GPU: anatomix channels as RGB per subject per level.
+#
+#   qsub -v CONFIG=/path/run.json,ARGS="--size-vox 512 --plane all --basis shared" sge/features.qsub
+#
+# Writes to <root>/qc/features unless ARGS carries --out. Same container and
+# bind conventions as sge/bigbrain_s2146_20um.qsub.
+#$ -N chunkreg_features
+#$ -l h_rt=04:00:00
+#$ -l gpu=true,gpu_type=h100|a100_80|a6000|a40|l40s|rtx6000ada
+#$ -pe gpu 1
+#$ -l tmem=48G
+#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log
+#$ -S /bin/bash
+#$ -cwd
+#$ -j y
+set -euo pipefail
+P="${P:-/home/akeenlys/storage_main/bridge_project_data}"
+SIF="${SIF:-$P/containers/chunkreg.sif}"
+CHUNKREG_SRC="${CHUNKREG_SRC:-$P/chunkreg}"
+CONFIG="${CONFIG:?set CONFIG=/path/to/config.json}"
+ARGS="${ARGS:-}"
+RUNTIME=$(command -v apptainer || command -v singularity)
+export TMPDIR="${TMPDIR:-/tmp/chunkreg.$$}"; mkdir -p "$TMPDIR/cache"
+pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
+[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+pass TMPDIR "$TMPDIR"; pass XDG_CACHE_HOME "$TMPDIR/cache"; pass MPLCONFIGDIR "$TMPDIR/cache"
+pass PATH "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"; pass HF_HOME "/opt/hf"; pass HF_HUB_OFFLINE "1"
+pass PYTHONNOUSERSITE "1"; pass PYTHONUNBUFFERED "1"; pass PYTHONPATH "/opt/chunkreg-dev"
+bind="$TMPDIR,$P,$(readlink -f "$P"),$CHUNKREG_SRC:/opt/chunkreg-dev:ro"
+echo "job ${JOB_ID:-?} on $(hostname) gpus=${CUDA_VISIBLE_DEVICES:-?}  config=$CONFIG  args=$ARGS"
+# shellcheck disable=SC2086
+"$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" chunkreg features "$CONFIG" $ARGS
+echo "done $(date -Is)"
