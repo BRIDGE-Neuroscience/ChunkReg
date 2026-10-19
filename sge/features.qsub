@@ -35,6 +35,6 @@ pass PATH "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"; pass HF_HOME "/opt/hf"; 
 pass PYTHONNOUSERSITE "1"; pass PYTHONUNBUFFERED "1"; pass PYTHONPATH "/opt/chunkreg-dev"
 bind="$TMPDIR,$P,$(readlink -f "$P"),$CHUNKREG_SRC:/opt/chunkreg-dev:ro"
 echo "job ${JOB_ID:-?} on $(hostname) gpus=${CUDA_VISIBLE_DEVICES:-?}  config=$CONFIG  args=$ARGS"
-# shellcheck disable=SC2086
-"$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" chunkreg features "$CONFIG" $ARGS
+eval "set -- $ARGS"   # honour quotes inside ARGS, e.g. --subjects "a b"
+"$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" chunkreg features "$CONFIG" "$@"
 echo "done $(date -Is)"
