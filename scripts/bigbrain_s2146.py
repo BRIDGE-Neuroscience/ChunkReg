@@ -181,6 +181,8 @@ def prepare_one(root: Path, core: int, args, grid: GridSpec, fixed_ds: dict,
         "gpu_mem_gb": args.gpu_mem_gb,
         "grid": {"reference": "fixed"},
         "ingest": {"percentiles": list(PERCENTILES)},
+        # Residual QC maps down to 80 um only: the 20 um one is ~200 GB.
+        "retention": {"residual_map_max_voxels": 2**30},
         "levels": {
             # Plateau: once the anneal schedule has run, stop when d99 has not
             # fallen by 5% over the last 3 passes (it wanders once converged).
@@ -191,6 +193,10 @@ def prepare_one(root: Path, core: int, args, grid: GridSpec, fixed_ds: dict,
             "anneal": {str(k): v for k, v in anneal.items()},
         },
     }
+    if args.scratch:
+        # Transient task arrays on node-local disk: a 20 um pass writes ~1 TB
+        # of them and deletes them again once blended.
+        raw["scratch"] = str(Path(args.scratch) / root.name)
     cfg = load_config(raw)
     for w in cfg.validate():
         say(f"  warning: {w}")
@@ -368,6 +374,9 @@ def main(argv=None) -> int:
     p.add_argument("--core", type=int, nargs="+", default=[256, 192])
     p.add_argument("--trust-pyramid", action="store_true",
                    help="link the fixed scan's coarser levels without checking they are 2x means")
+    p.add_argument("--scratch", default=None,
+                   help="node-local directory for the transient task arrays, e.g. /scratch0/$USER/bb_s2146 "
+                        "(a subdirectory per core is made); default: <root>/c<core>/scratch")
     tuning(p)
 
     p = sub.add_parser("estimate", help="chunk counts and a time projection")

@@ -203,7 +203,31 @@ def settle_fields(
     run always leaves its fields in the same place.
 
     With a runner that spreads work over GPUs, each core is a task there.
+
+    A template held fixed never moves, so there is no motion to fold in and
+    the settled field would be a copy of the level's: at 20 um a second
+    hundreds-of-gigabytes store. On a filesystem that has links, the final
+    path is made a symbolic link to the level field instead.
     """
+    if cfg.template_subject is not None and _recentre(cfg, level) is None and cfg.backend == "zarr":
+        out: dict[str, Field] = {}
+        for subject in cfg.registered_ids:
+            src = cfg.field_path(level, subject)
+            dst = cfg.final_field_path(subject)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink() or dst.exists():
+                if dst.is_symlink():
+                    dst.unlink()
+                else:
+                    from .. import backend as _backend
+
+                    _backend.get_backend(cfg.backend).remove(dst)
+            try:
+                dst.symlink_to(os.path.relpath(src, dst.parent), target_is_directory=True)
+            except OSError:
+                return _carry_fields(cfg, level, level, grid, final=True, runner=runner)
+            out[subject] = Field.open(dst, cfg.backend)
+        return out
     return _carry_fields(cfg, level, level, grid, final=True, runner=runner)
 
 

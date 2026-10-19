@@ -421,6 +421,10 @@ class Retention:
     keep_history_levels: tuple[int, ...] = (0, 1)
     delete_task_arrays: bool = True
     delete_accumulators: bool = True
+    residual_map_max_voxels: int | None = None
+    """Keep a level's residual QC map only while its lattice has at most this
+    many voxels. ``None`` keeps every level's. At 20 um the map is a
+    3700-cubed float32 volume; ``2**30`` keeps the maps down to 80 um."""
 
 
 @dataclass(frozen=True)
@@ -551,6 +555,14 @@ class RunConfig:
     unbiasing update pass is skipped: there is nothing to unbias when the
     target is one particular anatomy rather than a population mean."""
 
+    scratch: str | None = None
+    """Where the transient objects of a pass (task arrays, accumulators) are
+    written: a directory, absolute or relative to ``root``. Default
+    ``<root>/scratch``. A pass at 20 um writes a terabyte of task arrays and
+    deletes them again once blended, so on a node that has local scratch this
+    points there and the shared filesystem never sees them. Every worker of a
+    local run is on the one node, which is what makes that safe; a resumed
+    run on another node simply redoes the unfinished pass."""
     gpu_mem_gb: float = 80.0
     bytes_per_voxel_channel: float = 90.0
     """Measured during ``chunkreg setup``; 90 is anatomix-on-FireANTs with
@@ -661,6 +673,9 @@ class RunConfig:
     @property
     def scratch_root(self) -> Path:
         """Everything a finished pass may delete lives under here."""
+        if self.scratch:
+            p = Path(self.scratch)
+            return p if p.is_absolute() else self.root_path / p
         return self.root_path / "scratch"
 
     def scratch_dir(self, level: int, iteration: int) -> Path:
@@ -1052,6 +1067,7 @@ class RunConfig:
             ("gpu_mem_gb", self.gpu_mem_gb, 80.0),
             ("bytes_per_voxel_channel", self.bytes_per_voxel_channel, 90.0),
             ("throughput_ch_vox_per_s", self.throughput_ch_vox_per_s, 1.5e6),
+            ("scratch", self.scratch, None),
         ):
             if value != default:
                 out[key] = value
@@ -1471,7 +1487,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
         "backbone", "ingest", "template_subject", "features", "device", "engine", "gpus",
-        "workers_per_gpu",
+        "workers_per_gpu", "scratch",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -1661,6 +1677,10 @@ def load_config(source: str | Path | dict) -> RunConfig:
         delete_accumulators=bool(
             rn.get("delete_accumulators", Retention.delete_accumulators)
         ),
+        residual_map_max_voxels=(
+            None if rn.get("residual_map_max_voxels") is None
+            else int(rn["residual_map_max_voxels"])
+        ),
     )
 
     sl = dict(raw.get("slurm") or {})
@@ -1721,6 +1741,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         retry=retry,
         retention=retention,
         slurm=slurm,
+        scratch=None if raw.get("scratch") is None else str(raw["scratch"]),
         gpu_mem_gb=float(raw.get("gpu_mem_gb", 80.0)),
         bytes_per_voxel_channel=float(raw.get("bytes_per_voxel_channel", 90.0)),
         throughput_ch_vox_per_s=float(raw.get("throughput_ch_vox_per_s", 1.5e6)),

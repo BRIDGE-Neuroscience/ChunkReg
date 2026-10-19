@@ -43,6 +43,7 @@ __all__ = [
     "slices_path",
     "ensure_residual_stores",
     "write_residual_core",
+    "wants_residual_map",
     "render_pass",
 ]
 
@@ -65,6 +66,19 @@ def _lattice_grid(cfg: RunConfig, grid: GridSpec) -> GridSpec:
     return grid.coarsened(cfg.profile.lattice_factor)
 
 
+def wants_residual_map(cfg: RunConfig, grid: GridSpec) -> bool:
+    """Is a residual map kept at this level?
+
+    ``retention.residual_map_max_voxels`` caps the map's lattice size: at
+    20 um the map is a 3700-cubed float32 volume, two hundred gigabytes for a
+    picture, so a run short of disk keeps the maps at the levels where they
+    can be looked at whole and drops them at the finest. The slice sheet then
+    says "no map written this pass" rather than showing a stale one.
+    """
+    cap = cfg.retention.residual_map_max_voxels
+    return cap is None or _lattice_grid(cfg, grid).n_voxels <= int(cap)
+
+
 def ensure_residual_stores(cfg: RunConfig, manifest: Manifest) -> None:
     """Create the per-subject residual stores for a level, once.
 
@@ -72,6 +86,8 @@ def ensure_residual_stores(cfg: RunConfig, manifest: Manifest) -> None:
     state, so the pipeline makes them before dispatching and a task that
     finds one missing tolerates losing the race.
     """
+    if not wants_residual_map(cfg, manifest.grid):
+        return
     lattice = _lattice_grid(cfg, manifest.grid)
     for subject in manifest.subjects:
         path = residual_path(cfg, manifest.level, subject)
@@ -106,6 +122,8 @@ def write_residual_core(
     for a chunk that emitted its seed; ``reason`` then says why, and decides
     between zero (nothing to register) and NaN (nothing acceptable found).
     """
+    if not wants_residual_map(cfg, manifest.grid):
+        return
     chunk = manifest.chunk(entry.chunk_id)
     f = int(cfg.profile.lattice_factor)
     lat_origin = tuple(int(o) // f for o in chunk.core_origin)

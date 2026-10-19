@@ -8,6 +8,8 @@
 #       --moving $DATA/BigBrain2015_coronal_20um.ome.zarr \
 #       --pair   $DATA/T_pair_zyx_um.json --core 256 192
 #
+# (add --scratch /scratch0/$USER/bb_s2146 to keep the ~1 TB of transient task
+# arrays per 20 um pass on the node's local disk; the config remembers it),
 # which makes $RUNS/c256 and $RUNS/c192 (one per chunk core). This job runs
 # setup on c256 -- its calibration registers one full padded chunk, which is
 # the memory check on the real card -- and falls back to c192 if that does not
