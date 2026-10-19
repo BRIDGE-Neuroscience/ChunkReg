@@ -307,6 +307,18 @@ class LevelPolicy:
     sub-voxel (or at the cap), not as soon as it would fit the next level's
     halo. For a weak similarity signal at the coarse levels, where the point is
     to converge there before handing a stable field down."""
+    plateau_passes: int | None = None
+    """With a template held fixed, stop a level once its residual percentile
+    has fallen by less than ``plateau_rel`` (relative) over this many passes.
+    For a cross-modal pair whose residual never goes sub-voxel: Dice stops
+    improving long before the stopping rule would otherwise fire, and the
+    level would run to its cap. ``None`` disables it."""
+    plateau_rel: float = 0.05
+    plateau_after: int | None = None
+    """The pass from which the plateau test may fire. ``None`` means after the
+    level's ``anneal`` schedule has run its course (or from the first pass
+    without one): while the smoothing is still changing, the residual moves
+    for reasons that have nothing to do with convergence."""
     anneal: dict[int, dict[str, Any]] = field(default_factory=dict)
     """Per-level smoothing schedule over the passes of that level, keyed by
     level number (``0`` = full resolution): ``{"smooth_grad_sigma": [start, end], "smooth_warp_sigma":
@@ -485,6 +497,10 @@ class Retention:
     ``None`` is the two coarsest levels."""
     delete_task_arrays: bool = True
     delete_accumulators: bool = True
+    residual_map_max_voxels: int | None = None
+    """Keep a level's residual QC map only while its lattice has at most this
+    many voxels. ``None`` keeps every level's. At 20 um the map is a
+    3700-cubed float32 volume; ``2**30`` keeps the maps down to 80 um."""
 
 
 @dataclass(frozen=True)
@@ -526,6 +542,22 @@ class SubjectSpec:
     """This scan's voxel size as ``(z, y, x)`` millimetres, for a source that
     does not state one or states it wrongly. Overrides the top-level
     ``spacing_mm`` for this subject."""
+    warm_start: dict | None = None
+    """Start this subject from a known alignment instead of from scratch.
+
+    ``affine_um``: a 4x4 (or 3x4) matrix, or the path of a JSON file holding
+    one, mapping this scan's physical micrometres to the fixed scan's physical
+    micrometres (the pairwise affine as it is usually estimated, moving to
+    fixed). The scan is then *not* resampled onto the run grid: its store reads
+    the scan in place through the affine at every level
+    (:mod:`chunkreg.affine_view`), which is what makes a 20 um run of a
+    7000-cubed scan start in seconds. Needs ``grid.reference`` (or
+    ``template_subject``) to name the fixed subject, whose own sampling is the
+    run grid. ``background``: ``[threshold, value]``, source voxels at or above
+    the threshold become ``value`` before interpolation (BigBrain's white
+    background: ``[250, 0]``). ``field``: a chunkreg field store to seed the
+    coarsest level from, in the run grid's world frame; its vectors are
+    millimetres, so only its lattice is resampled."""
 
 
 @dataclass(frozen=True)
@@ -599,6 +631,14 @@ class RunConfig:
     unbiasing update pass is skipped: there is nothing to unbias when the
     target is one particular anatomy rather than a population mean."""
 
+    scratch: str | None = None
+    """Where the transient objects of a pass (task arrays, accumulators) are
+    written: a directory, absolute or relative to ``root``. Default
+    ``<root>/scratch``. A pass at 20 um writes a terabyte of task arrays and
+    deletes them again once blended, so on a node that has local scratch this
+    points there and the shared filesystem never sees them. Every worker of a
+    local run is on the one node, which is what makes that safe; a resumed
+    run on another node simply redoes the unfinished pass."""
     gpu_mem_gb: float = 80.0
     bytes_per_voxel_channel: float = 90.0
     """Measured during ``chunkreg setup``; 90 is anatomix-on-FireANTs with
@@ -775,6 +815,9 @@ class RunConfig:
     @property
     def scratch_root(self) -> Path:
         """Everything a finished pass may delete lives under here."""
+        if self.scratch:
+            p = Path(self.scratch)
+            return p if p.is_absolute() else self.root_path / p
         return self.root_path / "scratch"
 
     def scratch_dir(self, level: int, iteration: int) -> Path:
@@ -904,6 +947,26 @@ class RunConfig:
         if len(set(ids)) != len(ids):
             dupes = sorted({i for i in ids if ids.count(i) > 1})
             raise ConfigError(f"duplicate subject ids: {dupes}")
+        fixed_id = self.grid.reference or self.template_subject
+        for s in self.subjects:
+            ws = s.warm_start or {}
+            if "affine_um" not in ws:
+                continue
+            if s.source is None:
+                raise ConfigError(
+                    f"subject {s.id!r} has a warm_start affine but no 'source'; the "
+                    f"affine says where to read the scan, so the scan has to be named"
+                )
+            if fixed_id is None or fixed_id == s.id:
+                raise ConfigError(
+                    f"subject {s.id!r} has a warm_start affine, which maps it onto the "
+                    f"fixed subject's frame, but no other subject is named by "
+                    f"grid.reference or template_subject"
+                )
+            if (self.subjects[[x.id for x in self.subjects].index(fixed_id)].warm_start or {}).get("affine_um"):
+                raise ConfigError(
+                    f"the fixed subject {fixed_id!r} cannot itself have a warm_start affine"
+                )
 
         mem = p.mem_gb(self.bytes_per_voxel_channel)
         if mem > 0.8 * self.gpu_mem_gb:
@@ -1161,6 +1224,7 @@ class RunConfig:
                         "spacing_mm",
                         None if sub.spacing_mm is None else list(sub.spacing_mm),
                     ),
+                    ("warm_start", None if sub.warm_start is None else dict(sub.warm_start)),
                 )
                 if v is not None
             }
@@ -1215,6 +1279,7 @@ class RunConfig:
             ("gpu_mem_gb", self.gpu_mem_gb, 80.0),
             ("bytes_per_voxel_channel", self.bytes_per_voxel_channel, 90.0),
             ("throughput_ch_vox_per_s", self.throughput_ch_vox_per_s, 1.5e6),
+            ("scratch", self.scratch, None),
         ):
             if value != default:
                 out[key] = value
@@ -1269,6 +1334,11 @@ class RunConfig:
         }
         if self.levels.require_subvoxel:
             stop["require_subvoxel"] = True
+        if self.levels.plateau_passes is not None:
+            plateau = {"passes": int(self.levels.plateau_passes), "rel": self.levels.plateau_rel}
+            if self.levels.plateau_after is not None:
+                plateau["after"] = int(self.levels.plateau_after)
+            stop["plateau"] = plateau
         if stop:
             out["stop"] = stop
 
@@ -1591,6 +1661,40 @@ def save_config(cfg: "RunConfig", path: str | Path) -> Path:
     return out
 
 
+def _warm_start(obj, sid: str) -> dict | None:
+    """Normalise a subject's ``warm_start`` block; the matrix stays a path or a list."""
+    if obj is None:
+        return None
+    if not isinstance(obj, dict):
+        raise ConfigError(f"subject {sid!r}: warm_start must be a mapping")
+    _check_keys(obj, {"affine_um", "background", "field"}, f"subject {sid!r} warm_start")
+    out: dict[str, Any] = {}
+    aff = obj.get("affine_um")
+    if aff is not None:
+        if isinstance(aff, str):
+            out["affine_um"] = aff
+        else:
+            rows = [[float(v) for v in row] for row in aff]
+            if len(rows) not in (3, 4) or any(len(r) != 4 for r in rows):
+                raise ConfigError(
+                    f"subject {sid!r}: warm_start.affine_um must be a 4x4 or 3x4 matrix "
+                    f"or the path of a JSON file holding one"
+                )
+            if len(rows) == 3:
+                rows.append([0.0, 0.0, 0.0, 1.0])
+            out["affine_um"] = rows
+    bg = obj.get("background")
+    if bg is not None:
+        if not (isinstance(bg, (list, tuple)) and len(bg) == 2):
+            raise ConfigError(f"subject {sid!r}: warm_start.background must be [threshold, value]")
+        out["background"] = [float(bg[0]), float(bg[1])]
+    if obj.get("field") is not None:
+        out["field"] = str(obj["field"])
+    if not out:
+        raise ConfigError(f"subject {sid!r}: warm_start names neither affine_um nor field")
+    return out
+
+
 def load_config(source: str | Path | dict) -> RunConfig:
     """Read a run configuration from a JSON or YAML file, or a mapping."""
     raw = _read_raw(source) if isinstance(source, (str, Path)) else dict(source)
@@ -1602,7 +1706,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         "runner", "backend", "levels", "retry", "retention", "slurm", "gpu_mem_gb",
         "bytes_per_voxel_channel", "throughput_ch_vox_per_s", "seed", "channels",
         "backbone", "ingest", "template_subject", "features", "device", "engine", "gpus",
-        "workers_per_gpu",
+        "workers_per_gpu", "scratch",
     }
     if unknown:
         raise ConfigError(f"unknown configuration keys: {sorted(unknown)}")
@@ -1649,7 +1753,8 @@ def load_config(source: str | Path | dict) -> RunConfig:
                 f"each subject must be a mapping with an 'id', got {entry!r}"
             )
         _check_keys(
-            entry, {"id", "path", "source", "spacing_mm"}, f"subject {entry.get('id')!r}"
+            entry, {"id", "path", "source", "spacing_mm", "warm_start"},
+            f"subject {entry.get('id')!r}",
         )
         sid = str(entry["id"])
         src = entry.get("source")
@@ -1659,6 +1764,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
                 path=str(entry.get("path") or f"subjects/{sid}.zarr"),
                 source=None if src is None else str(src),
                 spacing_mm=_voxel(entry.get("spacing_mm"), f"subject {sid!r} spacing_mm"),
+                warm_start=_warm_start(entry.get("warm_start"), sid),
             )
         )
     subjects = tuple(subjects)
@@ -1677,9 +1783,26 @@ def load_config(source: str | Path | dict) -> RunConfig:
     )
     _check_keys(
         stop,
-        {"residual_frac", "ubar_vox", "residual_vox", "percentile", "require_subvoxel"},
+        {"residual_frac", "ubar_vox", "residual_vox", "percentile", "require_subvoxel", "plateau"},
         "'levels.stop'",
     )
+    plateau = stop.get("plateau")
+    plateau_kw: dict[str, Any] = {}
+    if plateau is not None:
+        if not isinstance(plateau, dict):
+            raise ConfigError("levels.stop.plateau must be a mapping {passes, rel, after}")
+        _check_keys(plateau, {"passes", "rel", "after"}, "'levels.stop.plateau'")
+        if "passes" not in plateau or int(plateau["passes"]) < 1:
+            raise ConfigError("levels.stop.plateau needs 'passes' >= 1")
+        plateau_kw["plateau_passes"] = int(plateau["passes"])
+        rel = float(plateau.get("rel", LevelPolicy.plateau_rel))
+        if not 0.0 <= rel < 1.0:
+            raise ConfigError(f"levels.stop.plateau.rel must be in [0, 1), got {rel}")
+        plateau_kw["plateau_rel"] = rel
+        if plateau.get("after") is not None:
+            if int(plateau["after"]) < 0:
+                raise ConfigError("levels.stop.plateau.after must be >= 0")
+            plateau_kw["plateau_after"] = int(plateau["after"])
     anneal = {}
     for k, v in (lv.get("anneal") or {}).items():
         level = _level_key(k, "levels.anneal")
@@ -1733,6 +1856,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
             lv.get("coarsest_max_disp_frac", LevelPolicy.coarsest_max_disp_frac)
         ),
         require_subvoxel=bool(stop.get("require_subvoxel", LevelPolicy.require_subvoxel)),
+        **plateau_kw,
         anneal=anneal,
         level_stages=level_stages,
         level_params=level_params,
@@ -1772,6 +1896,10 @@ def load_config(source: str | Path | dict) -> RunConfig:
         ),
         delete_accumulators=bool(
             rn.get("delete_accumulators", Retention.delete_accumulators)
+        ),
+        residual_map_max_voxels=(
+            None if rn.get("residual_map_max_voxels") is None
+            else int(rn["residual_map_max_voxels"])
         ),
     )
 
@@ -1833,6 +1961,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         retry=retry,
         retention=retention,
         slurm=slurm,
+        scratch=None if raw.get("scratch") is None else str(raw["scratch"]),
         gpu_mem_gb=float(raw.get("gpu_mem_gb", 80.0)),
         bytes_per_voxel_channel=float(raw.get("bytes_per_voxel_channel", 90.0)),
         throughput_ch_vox_per_s=float(raw.get("throughput_ch_vox_per_s", 1.5e6)),

@@ -31,6 +31,29 @@ def test_anneal_schedule_is_geometric_then_held(tmp_path):
     assert cfg.levels.stages_for_pass(1, 7, coarsest=4) == cfg.levels.stages(1, coarsest=4)
 
 
+def test_plateau_stop_round_trips_and_waits_for_the_anneal(tmp_path):
+    from chunkreg.pipelines.groupwise import _plateaued
+
+    cfg = load_config(_raw(tmp_path, levels={
+        "anneal": {"0": {"smooth_warp_sigma": [3.0, 1.0], "passes": 4}},
+        "stop": {"plateau": {"passes": 2, "rel": 0.1}},
+    }))
+    assert (cfg.levels.plateau_passes, cfg.levels.plateau_rel, cfg.levels.plateau_after) == (2, 0.1, None)
+    again = load_config(cfg.to_config_dict())
+    assert again.levels.plateau_passes == 2 and again.levels.plateau_rel == 0.1
+    flat = [5.0, 4.0, 3.0, 3.0, 2.95, 2.9, 2.9]
+    # the anneal runs 4 passes, so the first pass that may plateau is 4 + 2 = 6
+    assert not _plateaued(cfg, 0, 5, flat[:6])
+    assert _plateaued(cfg, 0, 6, flat[:7])
+    # a level without a schedule can plateau from pass `passes`
+    assert _plateaued(cfg, 1, 2, [3.0, 3.0, 3.0])
+    assert not _plateaued(cfg, 1, 2, [3.0, 2.0, 1.0])
+    # a rising residual is a plateau too
+    assert _plateaued(cfg, 1, 2, [3.0, 3.5, 4.0])
+    with pytest.raises(ConfigError):
+        load_config(_raw(tmp_path, levels={"stop": {"plateau": {"rel": 0.1}}}))
+
+
 def test_anneal_and_require_subvoxel_round_trip(tmp_path):
     cfg = load_config(_raw(tmp_path, levels={
         "anneal": {"0": {"smooth_warp_sigma": [3.0, 1.0], "passes": 10}},

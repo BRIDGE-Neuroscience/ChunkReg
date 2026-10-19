@@ -295,7 +295,8 @@ def build_template(
                     cfg, runner, engine, extractor, level, iteration, grid,
                     config_path, coarsest,
                 )
-            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap)
+            history = [p.d99_mm for p in report.passes] + [pr.d99_mm]
+            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap, history)
             pr.stopped, pr.reason = stopped, reason
             report.passes.append(pr)
             say(
@@ -373,7 +374,8 @@ def _run_pass(
     # Created before anything is dispatched, so the common path does not rely
     # on the race-tolerance inside the task, and so a blend that starts while
     # register is still running finds them there.
-    _blend.ensure_accumulators(cfg, manifest)
+    if cfg.template_subject is None:
+        _blend.ensure_accumulators(cfg, manifest)  # only the update pass reads them
     _qc.ensure_residual_stores(cfg, manifest)
     register_ids = range(manifest.n_tasks)
     blend_ids = range(len(manifest.chunks))
@@ -383,12 +385,25 @@ def _run_pass(
         # the whole register pass, so the two run as one dependency-ordered
         # dispatch. The barrier they replace is where most of a node's GPUs
         # sit idle behind the last few register tasks of every pass.
+        #
+        # A task array is deleted as soon as the last blend that reads it is
+        # done, not at the end of the pass: the records the stopping rule
+        # needs came back with the task's result, and the residual map was
+        # written separately, so nothing else ever opens it again. Without
+        # this, one pass at 20 um holds about a terabyte of them at its peak.
+        free_upstream = None
+        if cfg.retention.delete_task_arrays:
+            from .. import backend as _backend
+
+            b = _backend.get_backend(cfg.backend)
+            free_upstream = lambda tid: b.remove(cfg.task_path(level, iteration, tid))
         reg, bl = runner.run_chain(
             "register",
             register_ids,
             "blend",
             blend_ids,
             _blend.blend_depends(cfg, manifest),
+            free_upstream=free_upstream,
         )
     else:
         reg = runner.run(
@@ -665,8 +680,30 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float,
     )
 
 
+def _plateaued(cfg: RunConfig, level: int, iteration: int, history: Sequence[float]) -> bool:
+    """Has the residual stopped falling, by ``levels.stop.plateau``?
+
+    ``history`` is the level's d99 per pass so far, this pass last. The test
+    waits until the anneal schedule (if any) has run, then compares this pass
+    with the one ``passes`` earlier: no fall of at least ``rel`` means a
+    plateau. A rise counts as a plateau too -- the residual is a histogram
+    percentile and wanders once the level has converged.
+    """
+    n = cfg.levels.plateau_passes
+    if not n or len(history) <= n:
+        return False
+    after = cfg.levels.plateau_after
+    if after is None:
+        after = int((cfg.levels.anneal.get(int(level)) or {}).get("passes", 0))
+    if iteration < after + n:
+        return False
+    old, new = float(history[-1 - n]), float(history[-1])
+    return (old - new) < cfg.levels.plateau_rel * old
+
+
 def _should_stop(
-    cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap
+    cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap,
+    history: Sequence[float] = (),
 ) -> tuple[bool, str]:
     """Has this level finished?
 
@@ -694,6 +731,8 @@ def _should_stop(
             return True, "every chunk gave up on folds (field kept from the previous pass)"
         if pr.d99_mm < cfg.levels.residual_vox * grid.spacing_mm:
             return True, "residual is sub-voxel"
+        if _plateaued(cfg, pr.level, iteration, history):
+            return True, f"residual plateaued over {cfg.levels.plateau_passes} passes"
         if cfg.levels.require_subvoxel:
             fits_next_halo = False
         if fits_next_halo:

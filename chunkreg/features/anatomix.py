@@ -154,6 +154,45 @@ class AnatomixFeatures:
         self._tile_from: int | None = None
         self._model: Any = None
 
+    @property
+    def stride(self) -> int | None:
+        """The sliding-window step, as MONAI derives it from the overlap."""
+        if self.window is None:
+            return None
+        return max(1, int(self.window * (1.0 - self.overlap)))
+
+    def aligned_box(self, origin, shape) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """The box to extract over so the features over a box are chunk-independent.
+
+        Windowed features at a voxel depend on which windows cover it and
+        where their edges fall. With the tiling anchored at each padded chunk's
+        own origin, neighbouring chunks tile the same voxel differently and so
+        disagree about its features in their overlap, before either has
+        registered anything; the blend then has to average two answers to
+        different questions, and the residual map shows every chunk edge.
+
+        Anchoring the tiling to the run grid instead makes the features a
+        function of position alone: every window whose start is a multiple of
+        the stride and which reaches into ``[origin, origin + shape)`` is
+        included, and the box is widened to hold them whole. Its size minus the
+        window is then a multiple of the stride, which is exactly the condition
+        under which MONAI places windows at the stride without clamping the
+        last one. The caller extracts over the returned box and crops back.
+        Costs about twice the feature compute of the bare box; the engine's
+        cost, which dominates, is unchanged.
+        """
+        if self.window is None:
+            return tuple(int(o) for o in origin), tuple(int(s) for s in shape)
+        w, step = int(self.window), int(self.stride)
+        lo = np.asarray(origin, dtype=np.int64)
+        hi = lo + np.asarray(shape, dtype=np.int64)
+        first = step * np.ceil((lo - (w - 1)) / step).astype(np.int64)  # earliest window reaching lo
+        last = step * np.floor((hi - 1) / step).astype(np.int64)  # latest window starting inside
+        last = np.maximum(last, first)
+        new_lo = first
+        new_hi = last + w
+        return tuple(int(v) for v in new_lo), tuple(int(v) for v in new_hi - new_lo)
+
     def setup(self, device: str | None = None) -> None:
         """Load weights once per worker, never once per chunk."""
         if self._model is None:

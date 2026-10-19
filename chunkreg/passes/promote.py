@@ -13,7 +13,9 @@ genuinely only what the finer resolution newly reveals.
 
 from __future__ import annotations
 
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -204,7 +206,31 @@ def settle_fields(
     run always leaves its fields in the same place.
 
     With a runner that spreads work over GPUs, each core is a task there.
+
+    A template held fixed never moves, so there is no motion to fold in and
+    the settled field would be a copy of the level's: at 20 um a second
+    hundreds-of-gigabytes store. On a filesystem that has links, the final
+    path is made a symbolic link to the level field instead.
     """
+    if cfg.template_subject is not None and _recentre(cfg, level) is None and cfg.backend == "zarr":
+        out: dict[str, Field] = {}
+        for subject in cfg.registered_ids:
+            src = cfg.field_path(level, subject)
+            dst = cfg.final_field_path(subject)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink() or dst.exists():
+                if dst.is_symlink():
+                    dst.unlink()
+                else:
+                    from .. import backend as _backend
+
+                    _backend.get_backend(cfg.backend).remove(dst)
+            try:
+                dst.symlink_to(os.path.relpath(src, dst.parent), target_is_directory=True)
+            except OSError:
+                return _carry_fields(cfg, level, level, grid, final=True, runner=runner)
+            out[subject] = Field.open(dst, cfg.backend)
+        return out
     return _carry_fields(cfg, level, level, grid, final=True, runner=runner)
 
 
@@ -290,8 +316,37 @@ def _carry_field(
         _carry_core(cfg, src, dst, grid, motion, chunk.core_origin, chunk.core_shape)
 
 
+TEMPLATE_LINK_MIN_VOXELS = int(os.environ.get("CHUNKREG_TEMPLATE_LINK_MIN_VOXELS", 2**30))
+"""A held template at least this large is linked to the subject's own level
+instead of being copied. (The environment variable exists so a small test can
+exercise the linked path.)
+
+The copy is the subject's level normalised and stored as float32: at 20 um
+that is 1.6 TB written by the driver alone, one core at a time, before the
+level can start, for a volume that already exists on disk as uint8. Linking
+reads the subject's level in place and carries the subject's window as the
+template's normalisation, so every read returns the same values the copy
+would have held. Small levels keep the copy: it costs seconds, and tools that
+read ``template.zarr/0`` as a normalised array keep working there."""
+
+
+def _template_source(src: Volume, level: int) -> str | None:
+    """A zarr array path a template can be linked to, or ``None`` to copy."""
+    if src.affine_spec is not None:
+        return None  # sampled through an affine: there is no array to link
+    if src.is_linked(level):
+        return src.linked_source(level)
+    if src.meta.get("layout") == "legacy" or getattr(src._backend, "name", "") != "zarr":
+        return None
+    return str(src.level_path(level))
+
+
 def template_from_subject(cfg: RunConfig, level: int, grid: GridSpec) -> Volume:
-    """Write one subject's own level as the template for that level."""
+    """Write one subject's own level as the template for that level.
+
+    Large levels are linked rather than copied; see
+    :data:`TEMPLATE_LINK_MIN_VOXELS`.
+    """
     src = Volume.open(cfg.subject_path(cfg.template_subject), cfg.backend)
     if level >= src.n_levels:
         raise ValueError(
@@ -299,6 +354,27 @@ def template_from_subject(cfg: RunConfig, level: int, grid: GridSpec) -> Volume:
             f"levels but the run has at least {level + 1}; re-ingest it with "
             f"the profile this run uses so the pyramids match"
         )
+    path = cfg.template_path(level)
+    if Volume.exists(path, cfg.backend):
+        return Volume.open(path, cfg.backend)
+    source = _template_source(src, level) if grid.n_voxels >= TEMPLATE_LINK_MIN_VOXELS else None
+    if source is not None:
+        dst = Volume.create(
+            path,
+            grid,
+            cfg.profile,
+            dtype=str(src.array(level).dtype),
+            backend=cfg.backend,
+            overwrite=True,
+            n_levels=1,
+            provenance={"config": cfg.fingerprint(), "level": level, "linked_from": source},
+            linked_native=source,
+        )
+        # The copy would have held the subject's level through its window,
+        # clipped to [0, 1]; reading the raw level through that same window
+        # gives the same values.
+        dst.set_normalisation(*_normalisation(src))
+        return dst
     dst = _template_store(cfg, level, grid)
     for chunk in tile(grid, cfg.profile):
         dst.write_block(
@@ -354,7 +430,7 @@ def seed_coarsest(
     if cfg.template_subject is not None:
         template = template_from_subject(cfg, level, grid)
         for subject in cfg.registered_ids:
-            Field.create(
+            field = Field.create(
                 cfg.field_path(level, subject),
                 grid,
                 cfg.profile,
@@ -362,6 +438,7 @@ def seed_coarsest(
                 overwrite=True,
                 subject=subject,
             )
+            _seed_from_warm_start(cfg, subject, field, grid)
         return template
 
     template = _template_store(cfg, level, grid)
@@ -376,7 +453,7 @@ def seed_coarsest(
     template.write_block(0, (0, 0, 0), _xp.to_float32(acc))
     template.set_normalisation(0.0, 1.0)
     for subject in cfg.registered_ids:
-        Field.create(
+        field = Field.create(
             cfg.field_path(level, subject),
             grid,
             cfg.profile,
@@ -384,4 +461,42 @@ def seed_coarsest(
             overwrite=True,
             subject=subject,
         )
+        _seed_from_warm_start(cfg, subject, field, grid)
     return template
+
+
+def _seed_from_warm_start(cfg: RunConfig, subject: str, dst: Field, grid: GridSpec) -> bool:
+    """Fill a subject's coarsest-level field from its ``warm_start.field``.
+
+    The warm field's vectors are millimetres in the run grid's world frame, so
+    seeding is a resample of its lattice onto this level's, core by core, the
+    same resampling promotion does. Its world extent has to be the run grid's
+    (within one of its own lattice voxels): a field made for another frame
+    would be applied at the wrong place and nothing downstream could tell.
+    """
+    spec = next(s for s in cfg.subjects if s.id == subject)
+    path = (spec.warm_start or {}).get("field")
+    if not path:
+        return False
+    p = Path(path)
+    if not p.is_absolute():
+        p = cfg.root_path / p
+    src = Field.open(p, cfg.backend)
+    src_grid = src.level_grid
+    tol = src.lattice_grid.spacing_mm
+    lo_src = np.asarray(src_grid.origin_mm) - src_grid.spacing_mm / 2
+    hi_src = lo_src + np.asarray(src_grid.extent_mm)
+    lo_dst = np.asarray(grid.origin_mm) - grid.spacing_mm / 2
+    hi_dst = lo_dst + np.asarray(grid.extent_mm)
+    if np.any(np.abs(lo_src - lo_dst) > tol) or np.any(np.abs(hi_src - hi_dst) > tol):
+        raise ValueError(
+            f"warm-start field {p} covers world box {lo_src.round(3).tolist()} to "
+            f"{hi_src.round(3).tolist()} mm, but the run grid covers "
+            f"{lo_dst.round(3).tolist()} to {hi_dst.round(3).tolist()} mm. The field "
+            f"has to be in the run grid's frame (see grid.json origin_mm)."
+        )
+    for chunk in tile(grid, cfg.profile):
+        dst.write_dense(
+            chunk.core_origin, src.read_dense_on(grid, chunk.core_origin, chunk.core_shape)
+        )
+    return True

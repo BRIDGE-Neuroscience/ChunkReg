@@ -31,6 +31,7 @@ from .. import xp as _xp
 from ..config import RunConfig
 from ..engines import get_engine
 from ..features import get_extractor
+from ..features.base import aligned_box
 from ..store import Field, TaskArray, TaskEntry, Volume
 from ._common import tissue_fraction, warped_subject_block
 from .manifest import Manifest
@@ -39,9 +40,9 @@ __all__ = ["run_register_task", "register_chunk"]
 
 
 def _seed_block(
-    cfg: RunConfig, manifest: Manifest, entry: TaskEntry, shape
+    cfg: RunConfig, manifest: Manifest, subject: str, origin, shape
 ) -> np.ndarray:
-    """The seed for a chunk: the current field, recentred onto the template.
+    """The seed over a box: the current field, recentred onto the template.
 
     The previous pass moved the template by ``-eps * u_bar`` to remove its
     shape bias. The stored field still points at where the template used to be,
@@ -51,16 +52,25 @@ def _seed_block(
     converging on the fields.
     """
     level = manifest.level
-    path = cfg.field_path(level, entry.subject)
+    path = cfg.field_path(level, subject)
     if not Field.exists(path, cfg.backend):
         return _xp.zeros((3,) + tuple(shape))
-    seed = Field.open(path, cfg.backend).read_dense(entry.pad_origin, shape)
+    seed = Field.open(path, cfg.backend).read_dense(origin, shape)
 
     recentre = cfg.recentre_path(level)
     if manifest.iteration > 0 and Field.exists(recentre, cfg.backend):
-        motion = Field.open(recentre, cfg.backend).read_dense(entry.pad_origin, shape)
+        motion = Field.open(recentre, cfg.backend).read_dense(origin, shape)
         seed = _fields.compose(motion, seed, manifest.grid.spacing_mm)
     return seed
+
+
+def _crop(block, box: tuple[slice, ...]):
+    """A contiguous copy of a ``(C, Z, Y, X)`` or ``(Z, Y, X)`` block over a box."""
+    lead = (slice(None),) * (block.ndim - 3)
+    out = block[lead + tuple(box)]
+    if _xp.is_tensor(out):
+        return out.contiguous()
+    return np.ascontiguousarray(out)
 
 
 def register_chunk(
@@ -84,23 +94,33 @@ def register_chunk(
     level = manifest.level
     spacing = manifest.grid.spacing_mm
     shape = tuple(entry.pad_shape)
+    origin = tuple(int(o) for o in entry.pad_origin)
     stages = list(
         cfg.levels.stages_for_pass(level, manifest.iteration, coarsest=manifest.coarsest)
     )
 
     if seed is None:
-        seed = _seed_block(cfg, manifest, entry, shape)
+        seed = _seed_block(cfg, manifest, entry.subject, origin, shape)
 
-    key = (entry.chunk_id, tuple(entry.pad_origin), shape)
+    # Features are extracted over the box the extractor asks for -- for
+    # windowed anatomix, widened so its windows sit on a grid-anchored tiling
+    # -- and cropped back to the padded chunk. A voxel's features are then the
+    # same in every chunk that holds it, so neighbouring chunks disagree only
+    # about the registration, never about what they are registering.
+    f_origin, f_shape = aligned_box(extractor, origin, shape)
+    widened = (f_origin, f_shape) != (origin, shape)
+    crop = tuple(slice(o - fo, o - fo + s) for o, fo, s in zip(origin, f_origin, shape))
+
+    key = (entry.chunk_id, origin, shape)
     cached = None if fixed_cache is None else fixed_cache.get(key)
     if cached is None:
-        fixed_img = template.read_padded(0, entry.pad_origin, shape, normalise=True)
-        frac = tissue_fraction(fixed_img)
-        fixed = (
-            extractor(fixed_img, spacing)
-            if frac >= cfg.levels.min_tissue_fraction
-            else None
-        )
+        fixed_img = template.read_padded(0, f_origin, f_shape, normalise=True)
+        frac = tissue_fraction(_crop(fixed_img, crop) if widened else fixed_img)
+        fixed = None
+        if frac >= cfg.levels.min_tissue_fraction:
+            fixed = extractor(fixed_img, spacing)
+            if widened:
+                fixed = _crop(fixed, crop)
         del fixed_img
         cached = (frac, fixed)
         if fixed_cache is not None:
@@ -121,11 +141,19 @@ def register_chunk(
             "retries": 0,
         }
 
-    moving_img = warped_subject_block(
-        subject, level, entry.pad_origin, shape, seed, spacing, normalise=True
+    # The moving block is warped by the seed over the widened box too, so the
+    # features at its edge see the same warped anatomy a neighbour sees there.
+    wide_seed = (
+        _seed_block(cfg, manifest, entry.subject, f_origin, f_shape) if widened else seed
     )
+    moving_img = warped_subject_block(
+        subject, level, f_origin, f_shape, wide_seed, spacing, normalise=True
+    )
+    del wide_seed
 
     moving = extractor(moving_img, spacing)
+    if widened:
+        moving = _crop(moving, crop)
     del moving_img
 
     d_max = manifest.d_max_mm

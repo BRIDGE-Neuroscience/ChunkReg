@@ -40,7 +40,47 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .base import RunReport, TaskStatus
 
-__all__ = ["MultiGPURunner", "visible_gpus"]
+__all__ = ["MultiGPURunner", "visible_gpus", "ReleaseTracker"]
+
+
+class ReleaseTracker:
+    """Which first-pass items no second-pass item still needs.
+
+    A register task's array is read by the handful of blend cores whose padded
+    boxes overlap it, and by nothing else. Once those have all finished the
+    array is dead weight, and at a 20 um level the arrays of one pass come to
+    about a terabyte; waiting for the end of the pass to delete them is what
+    sets the run's peak disk use. This tracks, for every first-pass item, the
+    second-pass items still to come, so the driver can free each array the
+    moment its last reader is done -- with the chunk-major task order that
+    keeps a thin front of live arrays rather than the whole pass.
+    """
+
+    def __init__(self, blocked_on: Mapping[tuple[str, int], set[tuple[str, int]]]) -> None:
+        self._deps_of: dict[tuple[str, int], set[tuple[str, int]]] = {
+            item: set(deps) for item, deps in blocked_on.items() if deps
+        }
+        self._users_of: dict[tuple[str, int], set[tuple[str, int]]] = {}
+        for item, deps in self._deps_of.items():
+            for d in deps:
+                self._users_of.setdefault(d, set()).add(item)
+
+    def done(self, item: tuple[str, int]) -> list[tuple[str, int]]:
+        """A second-pass item finished (or was abandoned); the first-pass items now free."""
+        freed = []
+        for d in self._deps_of.pop(item, ()):
+            users = self._users_of.get(d)
+            if users is None:
+                continue
+            users.discard(item)
+            if not users:
+                del self._users_of[d]
+                freed.append(d)
+        return freed
+
+    def pending(self) -> int:
+        """First-pass items that still have readers to come."""
+        return len(self._users_of)
 
 
 def visible_gpus() -> list[str]:
@@ -198,6 +238,7 @@ class MultiGPURunner:
         second: str,
         second_ids: Sequence[int],
         depends: Mapping[int, Iterable[int]],
+        free_upstream: Callable[[int], None] | None = None,
         **kwargs: Any,
     ) -> tuple[RunReport, RunReport]:
         """Run two passes at once, each item of the second gated on the first.
@@ -211,13 +252,18 @@ class MultiGPURunner:
         A dependency that fails abandons everything downstream of it rather
         than letting a task read a result that was never written; the abandoned
         items come back as failures naming the one that failed.
+
+        ``free_upstream`` is called with a first-pass id once every second-pass
+        item that reads it has finished, so what that item wrote can be deleted
+        while the pass is still running (see :class:`ReleaseTracker`).
         """
         blocked = {
             (second, int(i)): {(first, int(d)) for d in deps}
             for i, deps in depends.items()
         }
         reports = self._dispatch(
-            [(first, list(first_ids)), (second, list(second_ids))], blocked, kwargs
+            [(first, list(first_ids)), (second, list(second_ids))], blocked, kwargs,
+            free_upstream=free_upstream,
         )
         return reports[first], reports[second]
 
@@ -227,6 +273,7 @@ class MultiGPURunner:
         stages: Sequence[tuple[str, Sequence[int]]],
         blocked_on: Mapping[tuple[str, int], set[tuple[str, int]]],
         params: dict,
+        free_upstream: Callable[[int], None] | None = None,
     ) -> dict[str, RunReport]:
         """Run several passes' items over the workers, honouring dependencies.
 
@@ -250,6 +297,19 @@ class MultiGPURunner:
 
         pending = set(items)
         waiting = {it: set(d) for it, d in blocked_on.items() if it in pending and d}
+        tracker = ReleaseTracker(blocked_on) if free_upstream is not None else None
+        succeeded: set[tuple[str, int]] = set()
+
+        def free(item: tuple[str, int]) -> None:
+            """Delete what an upstream item wrote once nothing will read it."""
+            if tracker is None:
+                return
+            for up in tracker.done(item):
+                if up in succeeded:
+                    try:
+                        free_upstream(up[1])
+                    except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                        print(f"    could not free {up[0]} task {up[1]}: {exc}", flush=True)
         waiters: dict[tuple[str, int], list[tuple[str, int]]] = {}
         for it, deps in waiting.items():
             for d in deps:
@@ -293,6 +353,9 @@ class MultiGPURunner:
                 result=payload if ok else None,
                 error=None if ok else str(payload),
             )
+            if ok:
+                succeeded.add(item)
+            free(item)
 
         def release(item: tuple[str, int], ok: bool) -> None:
             """Queue, or abandon, whatever was waiting on a finished item."""
