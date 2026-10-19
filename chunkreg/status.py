@@ -43,11 +43,13 @@ def _iteration_of(path: Path) -> int:
 
 
 def _manifests(cfg: RunConfig):
-    """Every manifest on disk, ordered by level then pass.
+    """Every manifest on disk, in run order: coarsest level first, then pass.
 
-    Sorted numerically rather than lexicographically: with ten or more levels
-    or passes, ``L10`` sorts before ``L2`` as text, which put the wrong pass
-    last and so named the wrong outstanding task ids.
+    Levels run from the highest number (the coarsest) down to ``0`` (full
+    resolution), so the most recent pass is last. Sorted numerically rather
+    than lexicographically: with ten or more levels or passes, ``L10`` sorts
+    before ``L2`` as text, which put the wrong pass last and so named the
+    wrong outstanding task ids.
     """
     root = cfg.root_path / "levels"
     if not root.exists():
@@ -60,7 +62,7 @@ def _manifests(cfg: RunConfig):
             continue
         for path in level_dir.glob("manifest_it*.json"):
             found.append((level, _iteration_of(path), path))
-    for level, _, path in sorted(found):
+    for level, _, path in sorted(found, key=lambda f: (-f[0], f[1])):
         yield level, path
 
 
@@ -118,6 +120,7 @@ def collect(cfg: RunConfig) -> list[LevelStatus]:
 
 
 def status(cfg: RunConfig) -> str:
+    cfg.check_level_order()  # an old coarse-first root would be misread
     rows = collect(cfg)
     if not rows:
         return (
@@ -125,7 +128,8 @@ def status(cfg: RunConfig) -> str:
             f"check the configuration, then 'chunkreg run' to begin."
         )
     head = f"{'lvl':>3} {'pass':>5} {'tasks':>13} {'template':>9} {'fields':>7}"
-    out = [head, "-" * len(head)]
+    out = ["level 0 is full resolution; levels run from the coarsest down", head,
+           "-" * len(head)]
     for r in rows:
         bar = f"{r.tasks_done}/{r.tasks_total}"
         out.append(

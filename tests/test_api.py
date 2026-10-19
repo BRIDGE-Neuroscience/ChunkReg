@@ -82,7 +82,7 @@ def test_apply_field_matches_a_whole_volume_warp(small_profile):
     field.write_dense((0, 0, 0), u)
 
     out = chunkreg.apply_field(volume, field, "warped.zarr", profile=small_profile)
-    got = np.asarray(out.read_padded(out.n_levels - 1, (0, 0, 0), grid.shape))
+    got = np.asarray(out.read_padded(0, (0, 0, 0), grid.shape))
     # Against the field as *stored*, not as written: a field lives on a coarser
     # lattice in float16, so comparing with `u` would measure that quantisation
     # rather than the thing under test, which is whether reading each block
@@ -110,7 +110,7 @@ def test_apply_field_refuses_a_level_that_is_not_on_the_fields_grid(small_profil
     )
     assert volume.n_levels > 1, "test needs a pyramid"
     with pytest.raises(ValueError, match="is on"):
-        chunkreg.apply_field(volume, field, "warped.zarr", level=0,
+        chunkreg.apply_field(volume, field, "warped.zarr", level=volume.n_levels - 1,
                              profile=small_profile)
 
 
@@ -124,13 +124,15 @@ def test_export_can_pull_a_coarse_level_out_of_a_pyramid(small_profile, tmp_path
     vol = ingest_array(data, "subjects/s01.zarr", 0.05, small_profile)
     assert vol.n_levels > 1, "test needs a pyramid"
 
+    top = vol.n_levels - 1  # the coarsest; 0 is full resolution
     coarse, fine = tmp_path / "coarse.nii.gz", tmp_path / "fine.nii.gz"
-    assert main(["export", "subjects/s01.zarr", str(coarse), "--level", "0"]) == 0
+    assert main(["export", "subjects/s01.zarr", str(coarse), "--level", str(top)]) == 0
     assert main(["export", "subjects/s01.zarr", str(fine)]) == 0
 
     got = nibabel.load(str(coarse)).shape
-    assert sorted(got) == sorted(vol.grid(0).shape)
+    assert sorted(got) == sorted(vol.grid(top).shape)
     assert got != nibabel.load(str(fine)).shape, "the default is the finest level"
+    assert sorted(nibabel.load(str(fine)).shape) == sorted(vol.grid(0).shape)
 
 
 def test_export_rejects_a_level_the_store_does_not_have(small_profile, tmp_path, capsys):

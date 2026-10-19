@@ -52,8 +52,8 @@ def manifest_cfg(small_profile):
     )
     # Four cores per axis, so an interior chunk exists whose read set is a
     # small fraction of the level rather than all of it.
-    grid = pyramid(GridSpec((128, 128, 128), 0.05), small_profile)[-1]
-    return cfg, build_manifest(cfg, 2, 0, grid)
+    grid = pyramid(GridSpec((128, 128, 128), 0.05), small_profile)[0]
+    return cfg, build_manifest(cfg, 0, 0, grid)
 
 
 # --------------------------------------------------------------------------- #

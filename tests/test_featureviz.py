@@ -296,13 +296,14 @@ def test_levels_come_from_the_store_not_the_config_profile(report_cfg):
     """The config's profile has core 256, so its pyramid would be one level.
 
     The volumes were ingested at core 16 and have several. Indexing them by the
-    config's depth read level 0 of a multi-level store as if it were native,
-    landed outside it, and returned an all-zero box with zero contrast.
+    config's depth once read the coarsest level of a multi-level store as if it
+    were native, landed outside it, and returned an all-zero box with zero
+    contrast.
     """
     rep = build_feature_report(report_cfg, extractor_name="mindssc", size_mm=0.8)
     n_store_levels = Volume.open(report_cfg.subject_path("s01"), "memory").n_levels
     assert n_store_levels > 1
-    assert rep.levels == list(range(n_store_levels))
+    assert rep.levels == list(reversed(range(n_store_levels))), "coarsest first"
     assert all(t.metrics["contrast"] > 0 for t in rep.tiles), (
         "a zero-contrast tile means the box was read outside the array"
     )
@@ -313,7 +314,7 @@ def test_the_box_is_the_same_anatomy_at_every_level(report_cfg):
     assert {t.extent_mm for t in rep.tiles} == {0.8}
     by_level = {t.level: t for t in rep.tiles if t.subject == "s01"}
     # Same millimetres, so finer levels hold proportionally more voxels.
-    coarse, fine = min(by_level), max(by_level)
+    coarse, fine = max(by_level), min(by_level)  # level 0 is full resolution
     assert by_level[coarse].spacing_mm > by_level[fine].spacing_mm
 
 
@@ -325,10 +326,10 @@ def test_every_subject_and_level_gets_a_tile(report_cfg):
 def test_features_are_extracted_with_a_margin_then_cropped(report_cfg):
     """Otherwise the border of every tile is the extractor seeing zero padding."""
     vol = Volume.open(report_cfg.subject_path("s01"), "memory")
-    grid = vol.grids()[-1]
+    grid = vol.grids()[0]
     ex = get_extractor("mindssc")
     ex.setup()
-    block, feats = sample_box(vol, vol.n_levels - 1, grid, (1.6, 1.6, 1.6), 16, ex)
+    block, feats = sample_box(vol, 0, grid, (1.6, 1.6, 1.6), 16, ex)
     assert block.shape == (16, 16, 16)
     assert feats.shape == (12, 16, 16, 16)
     # A cropped interior has no dead border; an uncropped one would.
@@ -388,7 +389,7 @@ def test_subjects_ingested_under_different_profiles_are_refused(tmp_path):
 
 
 def test_out_of_range_level_says_which_end_is_coarse(report_cfg):
-    with pytest.raises(ValueError, match="0 is the coarsest"):
+    with pytest.raises(ValueError, match="0 is native, .* is the coarsest"):
         build_feature_report(report_cfg, levels=[99], extractor_name="intensity")
 
 
@@ -442,7 +443,7 @@ def test_the_legend_names_the_projection_mode(report_cfg, tmp_path):
     per = build_feature_report(
         report_cfg, extractor_name="mindssc", size_mm=0.8, basis_mode="per-level"
     )
-    coarse = min(shared.levels)
+    coarse = max(shared.levels)
     a = next(t for t in shared.tiles if t.level == coarse)
     b = next(t for t in per.tiles if t.level == coarse and t.subject == a.subject)
     assert not np.allclose(a.rgb, b.rgb), (

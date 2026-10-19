@@ -24,8 +24,12 @@ from .test_pipeline import SHAPE, SPACING, cohort, make_cfg  # noqa: F401 - fixt
 PIL = pytest.importorskip("PIL")
 
 
-def _level_and_manifest(cfg, small_profile, level=1):
+TOP = 1  # SHAPE against the small profile's core: levels 0 (native) and 1 (the coarsest)
+
+
+def _level_and_manifest(cfg, small_profile, level=TOP):
     grids = pyramid(GridSpec(SHAPE, SPACING), small_profile)
+    assert len(grids) - 1 == TOP
     return grids[level], build_manifest(cfg, level, 0, grids[level])
 
 
@@ -121,8 +125,8 @@ def test_a_chunk_some_subjects_gave_up_on_is_tinted_not_blanked(cohort, small_pr
     from PIL import Image
 
     cfg = make_cfg(small_profile)
-    grid, m = _level_and_manifest(cfg, small_profile, level=0)
-    _seeded_level_zero(cfg, grid)
+    grid, m = _level_and_manifest(cfg, small_profile, level=TOP)
+    _seeded_coarsest(cfg, grid)
     qc.ensure_residual_stores(cfg, m)
 
     entries = [e for t in m.tasks for e in t.entries]
@@ -131,7 +135,7 @@ def test_a_chunk_some_subjects_gave_up_on_is_tinted_not_blanked(cohort, small_pr
         qc.write_residual_core(cfg, m, e, small, None)
     qc.write_residual_core(cfg, m, entries[-1], None, "folds")  # one of several
 
-    png = qc.render_pass(cfg, 0, 0, grid, 1.0,
+    png = qc.render_pass(cfg, TOP, 0, grid, 1.0,
                          report=_seeded_report(len(entries), 1))
     a = np.asarray(Image.open(png)).astype(np.int16)
     lower = a[a.shape[0] // 2:]
@@ -174,12 +178,12 @@ def test_a_partial_give_up_marks_a_region_without_hiding_its_value():
 def test_a_missing_residual_store_does_not_stop_the_sheet(cohort, small_profile):
     """A sheet with the template alone still beats no sheet."""
     cfg = make_cfg(small_profile)
-    grid, _ = _level_and_manifest(cfg, small_profile, level=0)
-    from chunkreg.passes.promote import seed_level_zero
+    grid, _ = _level_and_manifest(cfg, small_profile, level=TOP)
+    from chunkreg.passes.promote import seed_coarsest
 
-    seed_level_zero(cfg, grid, {s: Volume.open(cfg.subject_path(s), cfg.backend)
-                                for s in cfg.subject_ids})
-    png = qc.render_pass(cfg, 0, 0, grid, d_max_mm=None)
+    seed_coarsest(cfg, TOP, grid, {s: Volume.open(cfg.subject_path(s), cfg.backend)
+                                   for s in cfg.subject_ids})
+    png = qc.render_pass(cfg, TOP, 0, grid, d_max_mm=None)
     assert png.exists()
 
 
@@ -198,7 +202,7 @@ def test_a_resumed_run_that_adds_a_pass_writes_that_pass_s_qc(cohort, small_prof
             small_profile,
             levels=LevelPolicy(
                 caps=caps,
-                level0_stages=(
+                coarsest_stages=(
                     StageSpec(kind="greedy", scales=(4, 2, 1), iterations=(8, 6, 4)),
                 ),
                 seeded_stages=(
@@ -211,11 +215,11 @@ def test_a_resumed_run_that_adds_a_pass_writes_that_pass_s_qc(cohort, small_prof
     first = cfg_with((1, 1))
     result = build_template(first, runner=LocalRunner())
     last = result.levels[-1].level
-    assert last > 0, "test needs a seeded level"
+    assert last != TOP, "test needs a seeded level"
     assert qc.slices_path(first, last, 0).exists()
     assert not qc.slices_path(first, last, 1).exists()
 
-    second = cfg_with((1, 2))
+    second = cfg_with((2, 1))  # one more pass at level 0
     build_template(second, runner=LocalRunner())
 
     assert qc.slices_path(second, last, 1).exists(), (
@@ -238,11 +242,11 @@ def _seeded_report(entries: int, gave_up: int, written: bool = True):
     )
 
 
-def _seeded_level_zero(cfg, grid):
-    from chunkreg.passes.promote import seed_level_zero
+def _seeded_coarsest(cfg, grid):
+    from chunkreg.passes.promote import seed_coarsest
 
-    seed_level_zero(cfg, grid, {s: Volume.open(cfg.subject_path(s), cfg.backend)
-                                for s in cfg.subject_ids})
+    seed_coarsest(cfg, TOP, grid, {s: Volume.open(cfg.subject_path(s), cfg.backend)
+                                   for s in cfg.subject_ids})
 
 
 def test_a_level_where_every_chunk_gave_up_says_so_on_the_sheet(cohort, small_profile):
@@ -254,14 +258,14 @@ def test_a_level_where_every_chunk_gave_up_says_so_on_the_sheet(cohort, small_pr
     from PIL import Image
 
     cfg = make_cfg(small_profile)
-    grid, m = _level_and_manifest(cfg, small_profile, level=0)
-    _seeded_level_zero(cfg, grid)
+    grid, m = _level_and_manifest(cfg, small_profile, level=TOP)
+    _seeded_coarsest(cfg, grid)
     qc.ensure_residual_stores(cfg, m)
     entries = [e for t in m.tasks for e in t.entries]
     for e in entries:
         qc.write_residual_core(cfg, m, e, None, "folds")
 
-    png = qc.render_pass(cfg, 0, 0, grid, 1.0,
+    png = qc.render_pass(cfg, TOP, 0, grid, 1.0,
                          report=_seeded_report(len(entries), len(entries)))
     a = np.asarray(Image.open(png))
     magenta = (a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] > 200)
@@ -284,13 +288,13 @@ def test_a_pass_that_reused_its_tasks_is_not_drawn_as_this_pass_s(cohort, small_
     from PIL import Image
 
     cfg = make_cfg(small_profile)
-    grid, m = _level_and_manifest(cfg, small_profile, level=0)
-    _seeded_level_zero(cfg, grid)
+    grid, m = _level_and_manifest(cfg, small_profile, level=TOP)
+    _seeded_coarsest(cfg, grid)
     qc.ensure_residual_stores(cfg, m)
     for e in (e for t in m.tasks for e in t.entries):
         qc.write_residual_core(cfg, m, e, None, "folds")  # would be magenta
 
-    png = qc.render_pass(cfg, 0, 0, grid, 1.0,
+    png = qc.render_pass(cfg, TOP, 0, grid, 1.0,
                          report=_seeded_report(4, 4, written=False))
     a = np.asarray(Image.open(png))
     magenta = (a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] > 200)
@@ -318,8 +322,8 @@ def test_one_subject_giving_up_does_not_erase_what_the_others_solved(cohort, sma
     from PIL import Image
 
     cfg = make_cfg(small_profile)
-    grid, m = _level_and_manifest(cfg, small_profile, level=0)
-    _seeded_level_zero(cfg, grid)
+    grid, m = _level_and_manifest(cfg, small_profile, level=TOP)
+    _seeded_coarsest(cfg, grid)
     qc.ensure_residual_stores(cfg, m)
 
     entries = [e for t in m.tasks for e in t.entries]
@@ -332,7 +336,7 @@ def test_one_subject_giving_up_does_not_erase_what_the_others_solved(cohort, sma
             u[0] = 0.5
             qc.write_residual_core(cfg, m, e, u, None)         # the rest solved
 
-    png = qc.render_pass(cfg, 0, 0, grid, 1.0,
+    png = qc.render_pass(cfg, TOP, 0, grid, 1.0,
                          report=_seeded_report(len(entries), 1))
     a = np.asarray(Image.open(png))
     lower = a[a.shape[0] // 2:]

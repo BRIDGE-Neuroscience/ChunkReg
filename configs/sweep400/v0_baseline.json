@@ -1,0 +1,218 @@
+{
+  "root": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10_sweep400/v0_baseline",
+  "runner": "local",
+  "device": "cuda",
+  "engine": "fireants",
+  "backend": "zarr",
+  "profile": "a16",
+  "profile_overrides": {
+    "halo": 56,
+    "r_f": 32
+  },
+  "gpu_mem_gb": 80,
+  "spacing_mm": 0.05,
+  "grid": {
+    "spacing_mm": "finest",
+    "align": "centre"
+  },
+  "features": {
+    "mind": true,
+    "sample_channels": 8
+  },
+  "bytes_per_voxel_channel": 103,
+  "throughput_ch_vox_per_s": 22574655,
+  "ingest": {
+    "dtype": "auto",
+    "median_radius": null,
+    "percentiles": [
+      0.5,
+      99.5
+    ]
+  },
+  "subjects": [
+    {
+      "id": "AUMC_2025_044",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/AUMC_2025_044.zarr"
+    },
+    {
+      "id": "LADAF_2020_27",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/LADAF_2020_27.zarr"
+    },
+    {
+      "id": "LADAF_2021_17",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/LADAF_2021_17.zarr"
+    },
+    {
+      "id": "S_21_46",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/S_21_46.zarr"
+    },
+    {
+      "id": "AUMC_116_24",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/AUMC_116_24.zarr"
+    },
+    {
+      "id": "LADAF_2022_49",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/LADAF_2022_49.zarr"
+    },
+    {
+      "id": "LADAF_2022_54",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/LADAF_2022_54.zarr"
+    },
+    {
+      "id": "LADAF_2023_69",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/LADAF_2023_69.zarr"
+    },
+    {
+      "id": "S_21_33",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/S_21_33.zarr"
+    },
+    {
+      "id": "S_22_16",
+      "path": "/SAN/external/bridge_project_data/results/chunkreg/atlas_v3_n10/subjects/S_22_16.zarr"
+    }
+  ],
+  "levels": {
+    "stop_at": "400um",
+    "caps": [3, 3, 5, 8, 15, 20],
+    "coarsest_stages": [
+      "moments",
+      {
+        "rigid": {
+          "scales": [
+            4,
+            2,
+            1
+          ],
+          "iterations": [
+            400,
+            300,
+            200
+          ],
+          "lr": 0.02
+        }
+      },
+      {
+        "affine": {
+          "scales": [
+            4,
+            2,
+            1
+          ],
+          "iterations": [
+            400,
+            300,
+            200
+          ],
+          "lr": 0.02
+        }
+      },
+      {
+        "greedy": {
+          "scales": [
+            8,
+            4,
+            2,
+            1
+          ],
+          "iterations": [
+            400,
+            300,
+            250,
+            200
+          ],
+          "lr": 2.0,
+          "smooth_grad_sigma": 0.6,
+          "smooth_warp_sigma": 0.3,
+          "cc_kernel": 5,
+          "tolerance": 0.0001
+        }
+      }
+    ],
+    "seeded_stages": [
+      {
+        "greedy": {
+          "scales": [
+            2,
+            1
+          ],
+          "iterations": [
+            300,
+            200
+          ]
+        }
+      }
+    ],
+    "level_params": {
+      "4": {
+        "iterations": [
+          300,
+          200
+        ],
+        "lr": 1.5,
+        "smooth_grad_sigma": 0.6,
+        "smooth_warp_sigma": 0.3,
+        "cc_kernel": 5,
+        "tolerance": 0.0001
+      },
+      "3": {
+        "iterations": [
+          250,
+          150
+        ],
+        "lr": 1.25,
+        "smooth_grad_sigma": 0.6,
+        "smooth_warp_sigma": 0.3,
+        "cc_kernel": 5,
+        "tolerance": 0.0001
+      },
+      "2": {
+        "iterations": [
+          200,
+          120
+        ],
+        "lr": 1.0,
+        "smooth_grad_sigma": 0.6,
+        "smooth_warp_sigma": 0.3,
+        "cc_kernel": 5,
+        "tolerance": 0.0001
+      },
+      "1": {
+        "iterations": [
+          150,
+          100
+        ],
+        "lr": 0.75,
+        "smooth_grad_sigma": 0.6,
+        "smooth_warp_sigma": 0.3,
+        "cc_kernel": 5,
+        "tolerance": 0.0001
+      }
+    },
+    "stop": {
+      "residual_frac": 0.5,
+      "ubar_vox": 1.0,
+      "percentile": 99.0
+    },
+    "shape_update_step": 0.4,
+    "sharpen_laplacian_levels": [5, 4],
+    "min_tissue_fraction": 0.02,
+    "coarsest_max_disp_frac": 0.25
+  },
+  "retry": {
+    "fold_frac": 0.01,
+    "ladder": [
+      "sigma_w_x2",
+      "clamp_x0.5"
+    ]
+  },
+  "retention": {
+    "keep_history_levels": [5, 4],
+    "delete_task_arrays": true,
+    "delete_accumulators": true
+  },
+  "slurm": {
+    "register": {
+      "chunks_per_task": 1
+    }
+  }
+}

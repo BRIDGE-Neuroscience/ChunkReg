@@ -1,5 +1,9 @@
 """The level loop: register, blend, update, test, promote.
 
+Levels are numbered as OME-Zarr numbers its datasets: level ``0`` is full
+resolution and level ``K`` the coarsest, the one that fits a single chunk. The
+loop runs ``K, K-1, ..., 0``, promoting each solved level ``l`` to ``l - 1``.
+
 One loop serves both entry points. Pairwise registration is the groupwise loop
 with one subject and the template held fixed, so there is a single manifest
 format, a single task format and a single place where convergence is decided.
@@ -14,7 +18,8 @@ until what it leaves behind is comfortably inside the halo the next level has
 to absorb it with. The second half is template convergence: once the recentring
 step is sub-voxel, further passes cannot move the template by anything it can
 represent. A level that inherits an already-converged shape exits after one
-pass; the first level, which starts from a biased voxelwise mean, uses its cap.
+pass; the first (coarsest) level, which starts from a biased voxelwise mean,
+uses its cap.
 
 Register and blend are one dispatch, not two. A core's blend reads the chunks
 whose padded boxes reach into it and nothing else, so it can start as soon as
@@ -175,7 +180,8 @@ def build_template(
 
     With ``from_level`` left as ``None`` the run resumes from whatever an
     earlier start of it finished. Naming a level discards the progress at that
-    level and every finer one, and redoes them.
+    level and every finer one (every smaller level number, down to ``0``, full
+    resolution), and redoes them.
 
     ``config_path`` is only needed for a scheduler runner, which addresses each
     task by config file rather than shipping a callable to the batch node.
@@ -213,21 +219,31 @@ def build_template(
                 f"needs every subject resampled onto one grid at ingest; "
                 f"'chunkreg setup --reingest' does that."
             )
-    levels = pyramid(native, cfg.profile)
-    run_levels = cfg.levels.run_levels(levels)
+    levels = pyramid(native, cfg.profile)  # indexed by level, 0 = native
+    coarsest = len(levels) - 1
+    # The exact check of per-level overrides, now that the depth is known and
+    # a level number can be told apart from the coarsest level. It raises on
+    # anything unrunnable; its warnings are what 'chunkreg setup' reports.
+    cfg.check_level_overrides(len(levels))
+    cfg.check_level_order()
+    run_levels = cfg.levels.run_levels(levels)  # coarsest first
     if from_level is not None:
         if from_level not in run_levels:
             raise ValueError(
                 f"from_level {from_level} is not one of the levels this config "
-                f"runs: {list(run_levels)}"
+                f"runs: {list(run_levels)} (0 is full resolution, {coarsest} "
+                f"the coarsest)"
             )
-        if from_level > 0 and not _is_seeded(cfg, _previous(run_levels, from_level)):
+        if from_level != coarsest and not _is_seeded(
+            cfg, _previous(run_levels, from_level)
+        ):
             raise ValueError(
                 f"cannot redo from level {from_level}: level "
                 f"{_previous(run_levels, from_level)} before it has not run"
             )
         say(f"discarding progress at level {from_level} and finer")
         _forget(cfg, from_level)
+    cfg.record_level_order()
 
     reports: list[LevelReport] = []
     for position, level in enumerate(run_levels):
@@ -240,14 +256,14 @@ def build_template(
         if not _is_seeded(cfg, level):
             if previous is None:
                 say(
-                    "level 0: initial template from "
+                    f"level {level}: initial template from "
                     + (
                         f"subject {cfg.template_subject!r}"
                         if cfg.template_subject
                         else "the voxelwise mean"
                     )
                 )
-                _promote.seed_level_zero(cfg, grid, volumes)
+                _promote.seed_coarsest(cfg, level, grid, volumes)
             else:
                 say(f"promote level {previous} -> {level}")
                 _promote.promote_level(
@@ -259,7 +275,7 @@ def build_template(
         report = LevelReport(
             level=level,
             grid=grid,
-            d_max_mm=None if level == 0 else cfg.profile.d_max_mm(grid.spacing_mm),
+            d_max_mm=None if level == coarsest else cfg.profile.d_max_mm(grid.spacing_mm),
         )
         threshold = _stop_threshold(
             cfg, None if following is None else levels[following]
@@ -276,7 +292,8 @@ def build_template(
                 if handed_on:
                     break
                 pr, manifest = _run_pass(
-                    cfg, runner, engine, extractor, level, iteration, grid, config_path
+                    cfg, runner, engine, extractor, level, iteration, grid,
+                    config_path, coarsest,
                 )
             stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap)
             pr.stopped, pr.reason = stopped, reason
@@ -313,7 +330,7 @@ def build_template(
         reports.append(report)
 
     last = run_levels[-1]
-    if last < len(levels) - 1:
+    if last > 0:
         say(
             f"stopping at level {last} ({levels[last].spacing_mm * 1000:g} um) "
             f"as the config asks; a later run with finer levels carries on from here"
@@ -340,10 +357,11 @@ def _run_pass(
     iteration: int,
     grid: GridSpec,
     config_path: str | None,
+    coarsest: int,
 ) -> tuple[PassReport, Manifest]:
     """Register, blend and update once at one level."""
     t0 = time.perf_counter()
-    manifest = build_manifest(cfg, level, iteration, grid)
+    manifest = build_manifest(cfg, level, iteration, grid, coarsest=coarsest)
     manifest.save(cfg.level_dir(level) / f"manifest_it{iteration}.json")
     # A scheduler runner cannot receive a closure, so it ships the task's
     # address instead and needs to know which pass it is on. The manifest has
@@ -425,6 +443,7 @@ def _run_pass(
 
 
 def _previous(run_levels: Sequence[int], level: int) -> int:
+    """The level run before this one: the next coarser one that runs."""
     return run_levels[list(run_levels).index(level) - 1]
 
 
@@ -477,6 +496,8 @@ def _load_pass(cfg: RunConfig, level: int, iteration: int) -> PassReport | None:
 def _forget(cfg: RunConfig, from_level: int) -> None:
     """Discard the progress at ``from_level`` and every finer level.
 
+    Finer levels have smaller numbers, so that is every level ``<= from_level``.
+
     Records and seed markers go so the loop redoes those levels, and so do the
     manifests and scratch objects of the passes they describe: a task array
     left from the discarded attempt would otherwise be taken as this
@@ -493,8 +514,8 @@ def _forget(cfg: RunConfig, from_level: int) -> None:
             level = int(level_dir.name[1:])
         except ValueError:
             continue
-        if level < from_level:
-            continue
+        if level > from_level:
+            continue  # coarser: kept
         for path in level_dir.glob("manifest_it*.json"):
             try:
                 manifest = Manifest.load(path)
@@ -666,8 +687,15 @@ def _should_stop(
     fits_next_halo = threshold > 0 and pr.d99_mm < threshold
 
     if cfg.template_subject is not None:
+        solved = pr.entries - pr.seeded_tissue
+        if solved > 0 and pr.seeded_folds >= solved:
+            # Every chunk that had tissue gave up on folds and emitted its seed,
+            # so the residual is empty, not small: report it as what it is.
+            return True, "every chunk gave up on folds (field kept from the previous pass)"
         if pr.d99_mm < cfg.levels.residual_vox * grid.spacing_mm:
             return True, "residual is sub-voxel"
+        if cfg.levels.require_subvoxel:
+            fits_next_halo = False
         if fits_next_halo:
             return True, "residual fits the next halo"
     else:

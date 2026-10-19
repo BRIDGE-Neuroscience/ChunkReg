@@ -1,4 +1,7 @@
-"""The promote pass: carry a solved level down to the next one.
+"""The promote pass: carry a solved level down to the next finer one.
+
+Levels are numbered from full resolution (``0``) up to the coarsest (``K``),
+so promoting goes from level ``l`` to level ``l - 1``.
 
 Upsampling the template is ordinary resampling. Upsampling the fields is the
 step the whole design rests on: because displacements are stored in
@@ -22,7 +25,7 @@ from ..grid import GridSpec, tile
 from ..store import Field, Volume
 from .manifest import Manifest
 
-__all__ = ["promote_level", "seed_level_zero", "settle_fields", "carry_task"]
+__all__ = ["promote_level", "seed_coarsest", "settle_fields", "carry_task"]
 
 
 def _recentre(cfg: RunConfig, level: int) -> Field | None:
@@ -215,19 +218,21 @@ def promote_level(
 ) -> dict[str, Any]:
     """Create a finer level's template and seed fields from a solved level.
 
-    ``to_level`` defaults to the next level. It can be further down when
-    ``levels.run`` skips levels: fields are millimetres, so carrying them
-    across a gap is the same resampling as carrying them one level.
+    ``to_level`` defaults to the next finer level, ``from_level - 1``. It can
+    be finer still when ``levels.run`` skips levels: fields are millimetres,
+    so carrying them across a gap is the same resampling as carrying them one
+    level.
 
     With a runner that spreads work over GPUs, every core of the template and
     of each field is a task there, instead of a loop in this process.
     """
     t0 = time.perf_counter()
-    to_level = from_level + 1 if to_level is None else int(to_level)
-    if to_level <= from_level:
+    to_level = from_level - 1 if to_level is None else int(to_level)
+    if to_level >= from_level or to_level < 0:
         raise ValueError(
             f"cannot promote level {from_level} to level {to_level}; promotion "
-            f"only goes to finer levels"
+            f"only goes to finer levels, which have smaller numbers (0 is full "
+            f"resolution)"
         )
 
     if cfg.template_subject is None:
@@ -313,7 +318,11 @@ def _normalisation(vol: Volume) -> tuple[float, float]:
 
 
 def _template_store(cfg: RunConfig, level: int, grid: GridSpec) -> Volume:
-    """A template is a single-level volume store at its level's grid."""
+    """A template is a single-level volume store at its level's grid.
+
+    Its one dataset is ``0`` whatever run level it belongs to; the run level
+    is in its provenance and in its path, ``levels/L<level>/template.zarr``.
+    """
     path = cfg.template_path(level)
     if Volume.exists(path, cfg.backend):
         return Volume.open(path, cfg.backend)
@@ -329,19 +338,24 @@ def _template_store(cfg: RunConfig, level: int, grid: GridSpec) -> Volume:
     )
 
 
-def seed_level_zero(cfg: RunConfig, grid: GridSpec, volumes: dict) -> Volume:
-    """Build the initial template and the empty fields that seed level 0.
+def seed_coarsest(
+    cfg: RunConfig, level: int, grid: GridSpec, volumes: dict
+) -> Volume:
+    """Build the initial template and the empty fields that seed the coarsest level.
 
-    With no fixed template this is the voxelwise mean of the cohort, which is
-    the most biased the template ever is: it carries the full population shape
-    variance, which is why level 0 budgets the most passes of any level to
-    recentre it away. With ``template_subject`` set it is that subject.
+    ``level`` is that level's number, ``K``, and ``grid`` its grid. With no
+    fixed template this is the voxelwise mean of the cohort, which is the
+    most biased the template ever is: it carries the full population shape
+    variance, which is why the coarsest level budgets the most passes of any
+    level to recentre it away. With ``template_subject`` set it is that
+    subject.
     """
+    level = int(level)
     if cfg.template_subject is not None:
-        template = template_from_subject(cfg, 0, grid)
+        template = template_from_subject(cfg, level, grid)
         for subject in cfg.registered_ids:
             Field.create(
-                cfg.field_path(0, subject),
+                cfg.field_path(level, subject),
                 grid,
                 cfg.profile,
                 backend=cfg.backend,
@@ -350,19 +364,20 @@ def seed_level_zero(cfg: RunConfig, grid: GridSpec, volumes: dict) -> Volume:
             )
         return template
 
-    template = _template_store(cfg, 0, grid)
+    template = _template_store(cfg, level, grid)
     acc = _xp.zeros(grid.shape, dtype=np.float64)
     sources = cfg.registered_ids
     for subject in sources:
         vol = volumes[subject]
-        block = vol.read_padded(0, (0, 0, 0), grid.shape, normalise=True)
+        block = vol.read_padded(level, (0, 0, 0), grid.shape, normalise=True)
         acc += block
     acc /= max(len(sources), 1)
+    # A template store holds one level, its own dataset 0.
     template.write_block(0, (0, 0, 0), _xp.to_float32(acc))
     template.set_normalisation(0.0, 1.0)
     for subject in cfg.registered_ids:
         Field.create(
-            cfg.field_path(0, subject),
+            cfg.field_path(level, subject),
             grid,
             cfg.profile,
             backend=cfg.backend,

@@ -26,7 +26,7 @@ from chunkreg.store import Field, Volume, ingest_array
 
 from .conftest import blob
 
-HIPCT = GridSpec((2500, 2500, 2500), 0.05)  # levels 800, 400, 200, 100, 50 um
+HIPCT = GridSpec((2500, 2500, 2500), 0.05)  # levels 4..0: 800, 400, 200, 100, 50 um
 
 
 def load(run, **levels):
@@ -46,53 +46,58 @@ def resolved(run, **levels):
 # Reading levels.run
 # --------------------------------------------------------------------------- #
 def test_without_run_every_level_runs():
-    assert resolved(None) == (0, 1, 2, 3, 4)
-    assert resolved("all") == (0, 1, 2, 3, 4)
+    """Coarsest first, the order they run in; level 0 is full resolution."""
+    assert resolved(None) == (4, 3, 2, 1, 0)
+    assert resolved("all") == (4, 3, 2, 1, 0)
 
 
 def test_leaving_out_the_finest_levels_stops_early():
-    assert resolved([0, 1, 2]) == (0, 1, 2)
+    assert resolved([4, 3, 2]) == (4, 3, 2)
 
 
 def test_levels_can_be_named_by_spacing():
-    assert resolved([0, "400um", "0.2mm"]) == (0, 1, 2)
-    assert resolved(["800 um", "200µm"]) == (0, 2)
+    assert resolved([4, "400um", "0.2mm"]) == (4, 3, 2)
+    assert resolved(["800 um", "200µm"]) == (4, 2)
 
 
 def test_a_middle_level_can_be_skipped():
-    assert resolved([0, 2, 4]) == (0, 2, 4)
+    assert resolved([4, 2, 0]) == (4, 2, 0)
 
 
-def test_listed_runs_level_zero_and_the_tuned_levels():
-    assert resolved("listed", level_params={"2": {"lr": 0.2}}) == (0, 2)
+def test_listed_runs_the_coarsest_level_and_the_tuned_levels():
+    assert resolved("listed", level_params={"2": {"lr": 0.2}}) == (4, 2)
     assert resolved(
         "listed",
-        level_params={"1": {"lr": 0.2}},
-        level_stages={"3": [{"greedy": {"scales": [1], "iterations": [2]}}]},
-    ) == (0, 1, 3)
+        level_params={"3": {"lr": 0.2}},
+        level_stages={"1": [{"greedy": {"scales": [1], "iterations": [2]}}]},
+    ) == (4, 3, 1)
 
 
 def test_order_and_repeats_do_not_matter():
-    assert resolved([2, 0, 2, "800um"]) == (0, 2)
+    assert resolved([2, 4, 2, "800um"]) == (4, 2)
 
 
-def test_level_zero_cannot_be_left_out():
-    with pytest.raises(ConfigError, match="leaves out level 0"):
-        load([1, 2])
-    with pytest.raises(ConfigError, match="leaves out level 0"):
+def test_the_coarsest_level_cannot_be_left_out():
+    with pytest.raises(ConfigError, match="leaves out level 4"):
+        resolved([1, 2])
+    with pytest.raises(ConfigError, match="leaves out level 4"):
         resolved(["400um"])
+    # Which level is the coarsest follows from the grid, so a list of numbers
+    # is only refused once the depth is known.
+    with pytest.raises(ConfigError, match="leaves out level 4, the coarsest"):
+        load([1, 2]).validate(n_levels=5)
 
 
 def test_a_spacing_the_pyramid_lacks_lists_the_real_levels():
     with pytest.raises(ConfigError) as e:
-        resolved([0, "1mm"])
+        resolved([4, "1mm"])
     assert "1000 um" in str(e.value)
-    assert "0 = 800 um" in str(e.value) and "4 = 50 um" in str(e.value)
+    assert "0 = 50 um" in str(e.value) and "4 = 800 um" in str(e.value)
 
 
 def test_a_level_past_the_pyramid_is_refused():
     with pytest.raises(ConfigError, match="names level 7"):
-        resolved([0, 7])
+        resolved([4, 7])
 
 
 def test_listed_refuses_a_tuned_level_the_pyramid_lacks():
@@ -120,8 +125,8 @@ def test_malformed_run_entries_are_refused(bad, message):
 
 def test_the_planner_costs_only_the_levels_that_run():
     full = plan(load(None), HIPCT)
-    short = plan(load([0, 1, 2]), HIPCT)
-    assert [lv.level for lv in short.levels] == [0, 1, 2]
+    short = plan(load([4, 3, 2]), HIPCT)
+    assert [lv.level for lv in short.levels] == [4, 3, 2]
     assert short.work_ch_vox < full.work_ch_vox / 10
     assert "3 level(s) run of 5 in the pyramid" in short.format()
 
@@ -132,7 +137,7 @@ def test_the_planner_costs_only_the_levels_that_run():
 SPACING = 0.05
 SHAPE = (48, 48, 48)
 # A 16-voxel core against a 48-voxel volume gives three levels, the smallest
-# pyramid with a middle level to skip.
+# pyramid with a middle level to skip: 2 (the coarsest), 1, and 0 (native).
 PROFILE = Profile(core=16, halo=8, inner_chunk=8, lattice_factor=2, channels=1,
                   features="intensity", r_f=0, k=3, sigma_g=0.5, sigma_w=0.5)
 GRIDS = pyramid(GridSpec(SHAPE, SPACING), PROFILE)
@@ -162,7 +167,7 @@ def make_cfg(run) -> RunConfig:
         gpu_mem_gb=1000.0,
         levels=LevelPolicy(
             caps=(1,),
-            level0_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(4, 3)),),
+            coarsest_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(4, 3)),),
             seeded_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(3, 2)),),
             sharpen_laplacian_levels=(),
             run=run,
@@ -174,44 +179,44 @@ def test_the_pyramid_has_a_middle_level():
     assert len(GRIDS) == 3
 
 
-def test_a_run_can_stop_after_level_zero(cohort):
-    cfg = make_cfg((0,))
+def test_a_run_can_stop_after_the_coarsest_level(cohort):
+    cfg = make_cfg((2,))
     result = build_template(cfg, runner=LocalRunner())
-    assert [lv.level for lv in result.levels] == [0]
+    assert [lv.level for lv in result.levels] == [2]
     assert not Volume.exists(cfg.template_path(1), cfg.backend)
-    assert result.template.native_grid.shape == GRIDS[0].shape
+    assert result.template.native_grid.shape == GRIDS[2].shape
     for f in result.fields.values():
-        assert f.level_grid == GRIDS[0], "the deliverable is on the last level run"
+        assert f.level_grid == GRIDS[2], "the deliverable is on the last level run"
 
 
 def test_a_run_can_skip_a_middle_level(cohort):
-    cfg = make_cfg((0, 2))
+    cfg = make_cfg((2, 0))
     result = build_template(cfg, runner=LocalRunner())
-    assert [lv.level for lv in result.levels] == [0, 2]
+    assert [lv.level for lv in result.levels] == [2, 0]
     assert not Volume.exists(cfg.template_path(1), cfg.backend)
     assert not Field.exists(cfg.field_path(1, "a"), cfg.backend)
     assert not (cfg.level_dir(1)).exists(), "nothing is written for a skipped level"
-    assert result.template.native_grid.shape == GRIDS[2].shape
-    assert result.fields["a"].level_grid == GRIDS[2]
+    assert result.template.native_grid.shape == GRIDS[0].shape
+    assert result.fields["a"].level_grid == GRIDS[0]
 
 
 def test_skipping_carries_the_coarse_solution_across_the_gap(cohort):
-    """The finest level is seeded from level 0 directly, not from nothing."""
-    cfg = make_cfg((0, 2))
+    """The finest level is seeded from the coarsest directly, not from nothing."""
+    cfg = make_cfg((2, 0))
     build_template(cfg, runner=LocalRunner())
-    coarse = Field.open(cfg.field_path(0, "a"), cfg.backend).read_dense(
-        (0, 0, 0), GRIDS[0].shape
-    )
-    assert fields.percentile_magnitude(coarse, 99) > 0, "level 0 moved nothing"
-    seeded = Field.open(cfg.field_path(2, "a"), cfg.backend).read_dense(
+    coarse = Field.open(cfg.field_path(2, "a"), cfg.backend).read_dense(
         (0, 0, 0), GRIDS[2].shape
+    )
+    assert fields.percentile_magnitude(coarse, 99) > 0, "level 2 moved nothing"
+    seeded = Field.open(cfg.field_path(0, "a"), cfg.backend).read_dense(
+        (0, 0, 0), GRIDS[0].shape
     )
     assert fields.percentile_magnitude(seeded, 99) > 0
 
 
 def test_resuming_at_a_skipped_level_is_refused(cohort):
     with pytest.raises(ValueError, match="not one of the levels"):
-        build_template(make_cfg((0, 2)), runner=LocalRunner(), from_level=1)
+        build_template(make_cfg((2, 0)), runner=LocalRunner(), from_level=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +247,7 @@ QUICK = ["--no-calibrate", "--no-probe", "--no-selftest"]
 
 
 def test_setup_marks_the_skipped_levels(tmp_path, capsys):
-    path = cli_config(tmp_path, [0, "50um"])  # levels here are 200, 100, 50 um
+    path = cli_config(tmp_path, [2, "50um"])  # levels 2, 1, 0 here are 200, 100, 50 um
     assert main(["setup", path, *QUICK]) == 0
     out = capsys.readouterr().out
     ladder = out[out.index("resolved pyramid"):out.index("stages per level")]
@@ -253,13 +258,13 @@ def test_setup_marks_the_skipped_levels(tmp_path, capsys):
 
 
 def test_setup_warns_about_tuning_a_skipped_level(tmp_path, capsys):
-    path = cli_config(tmp_path, [0, 2], level_params={"1": {"lr": 0.1}})
+    path = cli_config(tmp_path, [2, 0], level_params={"1": {"lr": 0.1}})
     assert main(["setup", path, *QUICK]) == 0
     assert "levels.run leaves those levels out" in capsys.readouterr().out
 
 
 def test_setup_reports_a_bad_spacing_without_a_traceback(tmp_path, capsys):
-    path = cli_config(tmp_path, [0, "1mm"])
+    path = cli_config(tmp_path, [2, "1mm"])
     assert main(["setup", path, *QUICK]) == 1
     err = capsys.readouterr().err
     assert "1000 um" in err and "Traceback" not in err

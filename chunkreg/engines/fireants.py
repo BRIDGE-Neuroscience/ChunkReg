@@ -214,7 +214,8 @@ class FireAntsEngine:
         second-moment match -- so it changes what the estimate costs rather
         than what it is. The stage's finest scale is used, 1 by default: the
         one value that means the same thing however a build reads it. A moments
-        stage only runs at level 0, where the volume is a single chunk.
+        stage only runs at the coarsest level, where the volume is a single
+        chunk.
         """
         import inspect
 

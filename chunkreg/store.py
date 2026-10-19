@@ -3,9 +3,9 @@
 Three store types cover everything the pipeline writes:
 
 ``Volume``
-    A multiscale scalar image: pyramid level ``k`` of ``K`` is OME-Zarr
-    dataset ``K - k``, so dataset ``0`` is full resolution as OME-Zarr expects.
-    Every pyramid level reads from the same store.
+    A multiscale scalar image: pyramid level ``l`` is OME-Zarr dataset ``l``,
+    so level ``0`` is full resolution and level ``K`` the coarsest, exactly as
+    OME-Zarr numbers them. Every pyramid level reads from the same store.
 
 ``Field``
     A displacement field for one subject at one level, stored on a lattice
@@ -92,6 +92,29 @@ def _chunkreg_meta(path, backend, kind: str) -> dict | None:
     if isinstance(meta, dict) and meta.get("kind") == kind:
         return dict(meta)
     return None
+
+
+_LEVEL_ORDER = "ome"
+"""Recorded in a volume's metadata: level ``l`` is OME-Zarr dataset ``l``."""
+
+
+def _ome_level_order(meta: dict) -> dict:
+    """A volume's metadata with its level keys in the OME numbering.
+
+    The datasets themselves were always OME ordered. What a store written
+    before the renumbering keys the other way is the record of a level read
+    in place from its scan: that was keyed by the coarse-first index, under
+    which the linked full-resolution level was ``K``. It is rewritten here so
+    nothing past ``open`` sees the old key.
+    """
+    if meta.get("level_order") == _LEVEL_ORDER:
+        return meta
+    meta = dict(meta)
+    n = int(meta.get("n_levels", 1))
+    linked = meta.get("linked") or {}
+    meta["linked"] = {str(n - 1 - int(k)): v for k, v in linked.items()}
+    meta["level_order"] = _LEVEL_ORDER
+    return meta
 
 
 def _space_axes() -> list[dict]:
@@ -220,10 +243,15 @@ def lattice_box(
 class Volume:
     """A scalar image as a multiscale pyramid of sharded arrays.
 
-    Level ``k`` counts from the coarsest (0) to full resolution (``K``), the
-    pyramid index used everywhere else, so level ``k`` of a run reads
-    ``volume.array(k)`` with no translation. On disk it is OME-Zarr dataset
-    ``K - k``.
+    Level ``l`` is OME-Zarr dataset ``l``: ``volume.array(0)`` is full
+    resolution, ``volume.array(K)`` (``K = n_levels - 1``) the coarsest, and
+    level ``l`` has ``2**l`` times the native spacing. This is the level index
+    used everywhere else in chunkreg, so level ``l`` of a run reads
+    ``volume.array(l)``, which is dataset ``l`` on disk, with no translation.
+
+    Stores written before this numbering (no ``level_order`` in their
+    metadata) are the same OME-Zarr layout on disk; only the record of a
+    linked level was keyed the other way, and it is translated on open.
     """
 
     def __init__(self, path, meta: dict, backend=None) -> None:
@@ -264,7 +292,7 @@ class Volume:
         else:
             if n_levels < 1:
                 raise ValueError(f"n_levels must be >= 1, got {n_levels}")
-            grids = [native.coarsened(2 ** (n_levels - 1 - k)) for k in range(n_levels)]
+            grids = [native.coarsened(2**level) for level in range(n_levels)]
         meta = {
             "kind": "volume",
             "native_shape": list(native.shape),
@@ -278,11 +306,11 @@ class Volume:
             "norm_hi": None,
             "provenance": provenance or {},
             "layout": "ome-zarr",
+            "level_order": _LEVEL_ORDER,
             "linked": {},
         }
-        top = len(grids) - 1
         if linked_native is not None:
-            meta["linked"] = {str(top): str(linked_native)}
+            meta["linked"] = {"0": str(linked_native)}
         vol = cls(path, meta, b)
         for k, g in enumerate(grids):
             if vol.is_linked(k):
@@ -312,7 +340,7 @@ class Volume:
             if meta.get("kind") != "volume":
                 raise ValueError(f"{path} is not a volume store")
             meta["layout"] = "legacy"
-        return cls(path, meta, b)
+        return cls(path, _ome_level_order(meta), b)
 
     @classmethod
     def exists(cls, path, backend=None) -> bool:
@@ -328,10 +356,9 @@ class Volume:
             meta = {k: v for k, v in self.meta.items() if k != "layout"}
             _backend.write_json(self.path / _META, meta, self._backend)
             return
-        n = self.n_levels
         datasets = [
-            {"path": str(n - 1 - k), "coordinateTransformations": _transforms(self.grid(k))}
-            for k in reversed(range(n))
+            {"path": str(k), "coordinateTransformations": _transforms(self.grid(k))}
+            for k in range(self.n_levels)
             if not self.is_linked(k)
         ]
         ome = {
@@ -346,11 +373,15 @@ class Volume:
         _write_group(self.path, {"ome": ome, "chunkreg": self.meta}, self._backend)
 
     def level_path(self, level: int) -> Path:
-        """Where level ``level`` is stored inside this volume."""
+        """Where level ``level`` is stored inside this volume: dataset ``level``.
+
+        The earlier layout's ``s0 .. sK`` counted from the coarsest, so there
+        level ``l`` is ``s{K - l}``.
+        """
         k = self._check_level(level)
         if self.meta.get("layout") == "legacy":
-            return self.path / f"s{k}"
-        return self.path / str(self.n_levels - 1 - k)
+            return self.path / f"s{self.n_levels - 1 - k}"
+        return self.path / str(k)
 
     def is_linked(self, level: int) -> bool:
         """Is this level read in place from the scan instead of stored here?"""
@@ -373,8 +404,9 @@ class Volume:
         )
 
     def grid(self, level: int) -> GridSpec:
+        """Level ``level``'s grid: the native grid pooled by ``2**level``."""
         k = self._check_level(level)
-        return self.native_grid.coarsened(2 ** (self.n_levels - 1 - k))
+        return self.native_grid.coarsened(2**k)
 
     @property
     def placement(self):
@@ -395,7 +427,13 @@ class Volume:
         return None if recorded is None else Placement.from_json(recorded)
 
     def grids(self) -> list[GridSpec]:
+        """Every level's grid, indexed by level: full resolution first."""
         return [self.grid(k) for k in range(self.n_levels)]
+
+    @property
+    def coarsest(self) -> int:
+        """The coarsest level, ``K = n_levels - 1``."""
+        return self.n_levels - 1
 
     def _check_level(self, level: int) -> int:
         k = int(level)
@@ -450,8 +488,11 @@ class Volume:
     def compute_normalisation(
         self, level: int | None = None, percentiles=(0.5, 99.5), mask_frac: float = 0.0
     ) -> tuple[float, float]:
-        """Derive and store the intensity window from a coarse level."""
-        k = 0 if level is None else self._check_level(level)
+        """Derive and store the intensity window from a coarse level.
+
+        ``level`` defaults to the coarsest.
+        """
+        k = self.coarsest if level is None else self._check_level(level)
         if _xp.uses_torch():
             lo, hi = self._window_on_device(k, percentiles, mask_frac)
             self.set_normalisation(lo, hi)
@@ -513,14 +554,14 @@ class Volume:
         write_block(self.array(level, "r+"), origin, block, lead=0)
 
     def build_pyramid(self, block: int = 256) -> None:
-        """Fill levels ``K-1 .. 0`` by 2x mean pooling, coarsest last.
+        """Fill levels ``1 .. K`` from level ``0`` by 2x mean pooling, coarsest last.
 
         Runs blockwise so a volume far larger than memory can be pooled, and
-        pools from the level above rather than from native so each level costs
-        an eighth of the one before it.
+        pools from the next finer level rather than from native so each level
+        costs an eighth of the one before it.
         """
-        for k in range(self.n_levels - 2, -1, -1):
-            src = self.array(k + 1)
+        for k in range(1, self.n_levels):
+            src = self.array(k - 1)
             dst = self.array(k, "r+")
             dshape = dst.shape
             for z0 in range(0, dshape[0], block):
@@ -557,7 +598,8 @@ class Field:
     exact.
 
     On disk an OME-Zarr group with one dataset, ``0``, of axes ``c, z, y, x``:
-    the three displacement components are the channels.
+    the three displacement components are the channels, in the array's own
+    axis order: channel 0 is the z displacement, then y, then x.
     """
 
     def __init__(self, path, meta: dict, backend=None) -> None:
@@ -607,7 +649,7 @@ class Field:
             "lattice_factor": int(f),
             "subject": subject,
             "layout": "ome-zarr",
-            "components": "x, y, z displacement in millimetres",
+            "components": "z, y, x displacement in millimetres (array axis order)",
         }
         ome = {
             "version": "0.5",
@@ -1008,7 +1050,7 @@ def ingest_source(
         overwrite=overwrite,
         provenance=provenance,
     )
-    level = vol.n_levels - 1
+    level = 0  # full resolution
 
     size = int(2 * median_radius + 1) if median_radius else 0
     margin = size // 2
@@ -1038,7 +1080,7 @@ def ingest_source(
                 vol.write_block(level, origin, _cast(block[core], out_dtype))
 
     vol.build_pyramid()
-    vol.compute_normalisation(level=0, percentiles=percentiles)
+    vol.compute_normalisation(level=vol.coarsest, percentiles=percentiles)
     return vol
 
 
@@ -1077,7 +1119,7 @@ def link_source(
         linked_native=str(source_path),
     )
     vol.build_pyramid()
-    vol.compute_normalisation(level=0, percentiles=percentiles)
+    vol.compute_normalisation(level=vol.coarsest, percentiles=percentiles)
     return vol
 
 
@@ -1119,7 +1161,7 @@ def check_volume(vol: Volume, profile: Profile) -> tuple[list[str], list[str]]:
     """Check a subject store against the profile a run will use.
 
     Returns ``(errors, warnings)``. A pyramid of the wrong depth is an error,
-    because level ``k`` of the run would read the wrong resolution. Sharding
+    because the coarsest level of the run would read the wrong resolution. Sharding
     that does not match the chunk core is a warning: the run still works, but
     tasks no longer map one to one onto files, which is what keeps IO and
     file counts bounded on a cluster.

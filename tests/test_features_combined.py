@@ -64,8 +64,8 @@ def test_describe_needs_no_weights():
 # The draw
 # --------------------------------------------------------------------------- #
 def test_the_draw_is_a_function_of_the_pass():
-    a = stratified_pick((16, 12), 16, seed=0, level=2, iteration=1)
-    b = stratified_pick((16, 12), 16, seed=0, level=2, iteration=1)
+    a = stratified_pick((16, 12), 16, seed=0, depth=2, iteration=1)
+    b = stratified_pick((16, 12), 16, seed=0, depth=2, iteration=1)
     np.testing.assert_array_equal(a, b)
     assert len(a) == 16 and len(set(a.tolist())) == 16
     others = {tuple(stratified_pick((16, 12), 16, 0, 2, it)) for it in range(6)}
@@ -150,7 +150,7 @@ def test_a_register_task_selects_the_channels_of_its_pass(small_profile):
     from chunkreg.config import LevelPolicy, RunConfig, StageSpec, SubjectSpec
     from chunkreg.grid import GridSpec, pyramid
     from chunkreg.passes import build_manifest, run_register_task
-    from chunkreg.passes.promote import seed_level_zero
+    from chunkreg.passes.promote import seed_coarsest
     from chunkreg.store import Volume, ingest_array
 
     profile = replace(small_profile, features="intensity+mindssc@4", channels=4, r_f=3,
@@ -164,14 +164,16 @@ def test_a_register_task_selects_the_channels_of_its_pass(small_profile):
         profile=profile, profile_name="test", backend="memory", gpu_mem_gb=1000.0, seed=4,
         levels=LevelPolicy(
             caps=(1,),
-            level0_stages=(StageSpec(kind="greedy", scales=(1,), iterations=(2,), cc_kernel=3,
+            coarsest_stages=(StageSpec(kind="greedy", scales=(1,), iterations=(2,), cc_kernel=3,
                                      smooth_grad_sigma=0.5),),
             sharpen_laplacian_levels=(),
         ),
     )
-    grid = pyramid(GridSpec((32, 32, 32), 0.05), profile)[0]
+    grids = pyramid(GridSpec((32, 32, 32), 0.05), profile)
+    assert len(grids) == 1, "one chunk: level 0 is also the coarsest"
+    grid = grids[0]
     vols = {s: Volume.open(f"subjects/{s}.zarr") for s in ("a", "b")}
-    seed_level_zero(cfg, grid, vols)
+    seed_coarsest(cfg, 0, grid, vols)
 
     ex = get_extractor(profile.features, seed=cfg.seed)
     seen = []
@@ -183,8 +185,8 @@ def test_a_register_task_selects_the_channels_of_its_pass(small_profile):
         def setup(self, device=None):
             ex.setup(device)
 
-        def select(self, level, iteration, seed=None):
-            return ex.select(level, iteration, seed)
+        def select(self, depth, iteration, seed=None):
+            return ex.select(depth, iteration, seed)
 
         def __call__(self, p, spacing, mask=None):
             seen.append(tuple(ex.pick))

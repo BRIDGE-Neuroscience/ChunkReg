@@ -38,8 +38,8 @@ def store(export_profile):
 
 
 def _whole(vol: Volume) -> np.ndarray:
-    grid = vol.grid(vol.n_levels - 1)
-    return np.asarray(vol.read_padded(vol.n_levels - 1, (0, 0, 0), grid.shape))
+    grid = vol.grid(0)  # full resolution
+    return np.asarray(vol.read_padded(0, (0, 0, 0), grid.shape))
 
 
 # --------------------------------------------------------------------------- #

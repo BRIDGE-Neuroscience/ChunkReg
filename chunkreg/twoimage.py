@@ -176,6 +176,12 @@ def register(
     settings instead: ``"finest"``, ``"coarsest"``, a spacing in millimetres,
     or a whole ``grid`` block as a mapping.
 
+    ``stop_at`` is the finest level to run: a level number, counted as
+    OME-Zarr counts datasets (``0`` is full resolution, ``1`` half of it, and
+    so on up to the coarsest), or a spacing such as ``"200um"``.
+    ``from_level`` discards the progress at that level and every finer one
+    (every smaller number) and redoes them.
+
     Safe to call again. Ingest skips a volume already converted and the level
     loop resumes from the last pass that finished, so a run stopped at a time
     limit is continued by calling this with the same arguments.
@@ -183,7 +189,9 @@ def register(
     ``overrides`` reach any other top-level configuration key, for the
     settings a two-image run does not need a named argument for::
 
-        register(..., levels={"caps": [4, 3, 2]}, features={"mind": False})
+        register(..., levels={"caps": [2, 3, 4]}, features={"mind": False})
+
+    (``caps`` is listed from full resolution towards the coarsest.)
 
     Returns a :class:`PairResult`; ``warp_moving`` and ``export_moving`` on it
     are how the moving volume is delivered on the fixed one.

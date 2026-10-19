@@ -26,6 +26,7 @@ __all__ = ["LevelPlan", "Plan", "plan"]
 @dataclass(frozen=True)
 class LevelPlan:
     level: int
+    """The level's number: ``0`` is full resolution."""
     grid: GridSpec
     n_chunks: int
     chunk_grid: tuple[int, int, int]
@@ -60,6 +61,8 @@ class Plan:
     profile_name: str
     n_subjects: int
     levels: tuple[LevelPlan, ...]
+    """The levels that run, in the order they run: coarsest first. Each one's
+    own number is its ``level``."""
     mem_gb: float
     overhead: float
     throughput_ch_vox_per_s: float
@@ -118,6 +121,7 @@ class Plan:
                 else ""
             )
             + f", native {self.native.shape} @ {self.native.spacing_mm:g} mm"
+            + " (level 0)"
         )
         out.append("")
         head = (
@@ -169,24 +173,24 @@ def plan(cfg: RunConfig, native: GridSpec) -> Plan:
     stopping rule normally exits a level earlier, and a seeded level that
     inherits a converged shape exits after one pass.
     """
-    warnings = list(cfg.validate())
     p = cfg.profile
-    grids = pyramid(native, p)
-    run_levels = set(cfg.levels.run_levels(grids))
+    grids = pyramid(native, p)  # indexed by level, 0 = native
+    warnings = list(cfg.validate(n_levels=len(grids)))
     n = max(cfg.n_subjects, 1)
     per_task = max(1, cfg.slurm.register.chunks_per_task)
 
     levels: list[LevelPlan] = []
-    for k, g in enumerate(grids):
-        if k not in run_levels:
-            continue  # levels.run leaves it out, so it costs nothing
+    # Coarsest first, as they run; levels.run leaves the rest out, so they
+    # cost nothing.
+    for k in cfg.levels.run_levels(grids):
+        g = grids[k]
         chunks = tile(g, p)
         cap = cfg.levels.cap(k)
         if len(chunks) == 1:
             # A single-chunk level has no halo, so nothing bounds it by data
             # dependence. It is bounded by the aperture instead: a fraction of
             # the volume's own extent. It also pays no padding overhead.
-            d_mm = cfg.levels.level0_max_disp_frac * min(g.extent_mm)
+            d_mm = cfg.levels.coarsest_max_disp_frac * min(g.extent_mm)
             d_vox = d_mm / g.spacing_mm
             work = g.n_voxels * p.channels * cap * n
         else:
@@ -209,8 +213,8 @@ def plan(cfg: RunConfig, native: GridSpec) -> Plan:
         )
 
     if len(levels) > 1:
-        deepest = levels[-1]
-        if deepest.work_ch_vox / max(sum(l.work_ch_vox for l in levels), 1) > 0.9:
+        finest = levels[-1]
+        if finest.work_ch_vox / max(sum(l.work_ch_vox for l in levels), 1) > 0.9:
             warnings.append(
                 "the finest level run is over 90% of the work; check that "
                 "the caps for coarser levels are not set too low to converge"

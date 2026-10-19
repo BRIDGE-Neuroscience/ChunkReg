@@ -80,7 +80,7 @@ def run_update_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[s
     block = _xp.put(read_padded(isum, src_origin, src_shape, mode="constant")) / n
     updated = _fields.warp_offset(block, (margin, margin, margin), mean_warp, spacing)
 
-    if manifest.level in cfg.levels.sharpen_laplacian_levels:
+    if cfg.levels.sharpens(manifest.level, coarsest=manifest.coarsest):
         updated = _sharpen(updated)
 
     template = Volume.open(cfg.template_path(manifest.level), cfg.backend)

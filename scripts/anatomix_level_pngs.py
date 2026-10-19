@@ -17,6 +17,10 @@ run's own with ``--features run``), and write PNGs through that point:
 Extraction and the RGB projection run on the configured device (the GPU for a
 ``"device": "cuda"`` config). Only 2D planes and a few numbers leave it.
 
+Levels are numbered as the store's OME-Zarr datasets: ``L0`` is full
+resolution and the highest number the coarsest. By default every level is
+drawn, coarsest first.
+
 The point defaults to the tissue centroid of the coarsest level, so every
 level shows the same anatomy even when the scan is off centre. The subject has
 to be ingested already (``chunkreg setup``).
@@ -50,9 +54,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--at", default=None,
-        help="point in world mm as Z,Y,X (default: tissue centroid at level 0)",
+        help="point in world mm as Z,Y,X (default: tissue centroid at the coarsest level)",
     )
-    ap.add_argument("--levels", default=None, help="comma-separated levels (default: all)")
+    ap.add_argument(
+        "--levels", default=None,
+        help="comma-separated levels, 0 being full resolution (default: all, coarsest first)",
+    )
     ap.add_argument(
         "--features", default="anatomix",
         help="extractor spec (default: anatomix). 'run' uses the config's own "
@@ -257,11 +264,14 @@ def main(argv=None) -> int:
     levels = (
         [int(v) for v in args.levels.replace(",", " ").split()]
         if args.levels
-        else list(range(len(grids)))
+        else list(reversed(range(len(grids))))
     )
     bad = [k for k in levels if not 0 <= k < len(grids)]
     if bad:
-        sys.exit(f"levels {bad} do not exist; this store has levels 0..{len(grids) - 1}")
+        sys.exit(
+            f"levels {bad} do not exist; this store has levels 0 (full "
+            f"resolution) to {len(grids) - 1} (the coarsest)"
+        )
 
     # A combined, sampled spec without select() shows the subset of pass 0.
     features = cfg.profile.features if args.features in (None, "", "run") else args.features
@@ -281,8 +291,11 @@ def main(argv=None) -> int:
         if centre.size != 3:
             sys.exit(f"--at needs three world coordinates, got {args.at!r}")
     else:
-        g0 = grids[0]
-        top = as_tensor(vol.read_padded(0, (0, 0, 0), g0.shape, normalise=True), torch, dev)
+        coarsest = len(grids) - 1
+        g0 = grids[coarsest]
+        top = as_tensor(
+            vol.read_padded(coarsest, (0, 0, 0), g0.shape, normalise=True), torch, dev
+        )
         w = (top > TISSUE).to(torch.float32)
         if float(w.sum()) < 1:
             w = torch.ones_like(top)

@@ -24,7 +24,7 @@ from chunkreg.config import (
 from chunkreg.engines import get_engine
 from chunkreg.grid import GridSpec, Profile, pyramid, tile
 from chunkreg.passes import build_manifest, run_blend_task, run_register_task
-from chunkreg.passes.promote import seed_level_zero
+from chunkreg.passes.promote import seed_coarsest
 from chunkreg.pipelines import build_template
 from chunkreg.runners import LocalRunner
 from chunkreg.store import Field, Volume, ingest_array
@@ -75,8 +75,8 @@ def make_cfg(profile, **kw) -> RunConfig:
         backend="memory",
         gpu_mem_gb=1000.0,
         levels=LevelPolicy(
-            caps=(3, 2, 2),
-            level0_stages=(
+            caps=(2, 3),  # level 0 (native) gets 2, level 1 (the coarsest) 3
+            coarsest_stages=(
                 StageSpec(kind="greedy", scales=(4, 2, 1), iterations=(40, 25, 15)),
             ),
             seeded_stages=(
@@ -93,17 +93,18 @@ def make_cfg(profile, **kw) -> RunConfig:
 # --------------------------------------------------------------------------- #
 # The pieces, before the whole
 # --------------------------------------------------------------------------- #
-def test_level_zero_is_a_single_chunk(cohort, small_profile):
+def test_the_coarsest_level_is_a_single_chunk(cohort, small_profile):
     """The top of the pyramid is where the global component is estimated."""
     levels = pyramid(GridSpec(SHAPE, SPACING), small_profile)
-    assert len(tile(levels[0], small_profile)) == 1
+    assert len(tile(levels[-1], small_profile)) == 1
+    assert levels[0].shape == SHAPE, "level 0 is full resolution"
     assert len(levels) > 1, "test needs a real pyramid"
 
 
 def test_manifest_covers_every_subject_and_chunk(cohort, small_profile):
     cfg = make_cfg(small_profile)
-    grid = pyramid(GridSpec(SHAPE, SPACING), small_profile)[-1]
-    m = build_manifest(cfg, 2, 0, grid)
+    grid = pyramid(GridSpec(SHAPE, SPACING), small_profile)[0]
+    m = build_manifest(cfg, 0, 0, grid)
     assert m.n_entries == len(m.chunks) * 3
     seen = {(e.subject, e.chunk_id) for t in m.tasks for e in t.entries}
     assert len(seen) == m.n_entries
@@ -111,8 +112,8 @@ def test_manifest_covers_every_subject_and_chunk(cohort, small_profile):
 
 def test_blend_read_set_is_local(cohort, small_profile):
     cfg = make_cfg(small_profile)
-    grid = pyramid(GridSpec(SHAPE, SPACING), small_profile)[-1]
-    m = build_manifest(cfg, 2, 0, grid)
+    grid = pyramid(GridSpec(SHAPE, SPACING), small_profile)[0]
+    m = build_manifest(cfg, 0, 0, grid)
     interior = max(m.chunks, key=lambda c: min(c.index))
     touching = m.chunks_touching_core(interior.id)
     assert interior in touching
@@ -122,8 +123,9 @@ def test_blend_read_set_is_local(cohort, small_profile):
 def test_register_task_is_idempotent(cohort, small_profile):
     cfg = make_cfg(small_profile)
     levels = pyramid(GridSpec(SHAPE, SPACING), small_profile)
-    seed_level_zero(cfg, levels[0], {s: Volume.open(f"subjects/{s}.zarr") for s in cfg.subject_ids})
-    m = build_manifest(cfg, 0, 0, levels[0])
+    top = len(levels) - 1
+    seed_coarsest(cfg, top, levels[top], {s: Volume.open(f"subjects/{s}.zarr") for s in cfg.subject_ids})
+    m = build_manifest(cfg, top, 0, levels[top])
     first = run_register_task(cfg, m, 0, engine=get_engine("demons"))
     second = run_register_task(cfg, m, 0, engine=get_engine("demons"))
     assert not first["skipped"]
@@ -135,13 +137,14 @@ def test_blend_agrees_with_its_neighbours_across_a_core_boundary(cohort, small_p
     cfg = make_cfg(small_profile)
     levels = pyramid(GridSpec(SHAPE, SPACING), small_profile)
     vols = {s: Volume.open(f"subjects/{s}.zarr") for s in cfg.subject_ids}
-    seed_level_zero(cfg, levels[0], vols)
+    top = len(levels) - 1
+    seed_coarsest(cfg, top, levels[top], vols)
     from chunkreg.passes.promote import promote_level
 
-    for k in range(len(levels) - 1):
-        promote_level(cfg, k, levels[k], levels[k + 1])
+    for k in range(top, 0, -1):
+        promote_level(cfg, k, levels[k], levels[k - 1])
 
-    level = len(levels) - 1
+    level = 0
     grid = levels[level]
     m = build_manifest(cfg, level, 0, grid)
     for tid in range(m.n_tasks):
@@ -173,7 +176,8 @@ def test_build_template_recovers_the_cohort(cohort, small_profile):
     result = build_template(cfg, runner=LocalRunner())
 
     assert set(result.fields) == set(warps)
-    assert result.levels[0].level == 0
+    top = len(pyramid(GridSpec(SHAPE, SPACING), small_profile)) - 1
+    assert [lv.level for lv in result.levels] == list(range(top, -1, -1))
     assert result.n_passes >= len(result.levels)
 
     grid = result.template.grid(0)
@@ -210,7 +214,7 @@ def test_template_is_sharper_than_the_subject_average(cohort, small_profile):
     subs = []
     for s in cfg.subject_ids:
         v = Volume.open(f"subjects/{s}.zarr")
-        subs.append(v.read_padded(v.n_levels - 1, (0, 0, 0), grid.shape, normalise=True))
+        subs.append(v.read_padded(0, (0, 0, 0), grid.shape, normalise=True))
     naive = np.mean(subs, axis=0)
 
     box = tuple(slice(16, -16) for _ in range(3))

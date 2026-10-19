@@ -8,7 +8,7 @@ needed it.
 
 Two things are decided here and nowhere else. The run grid follows from the
 whole cohort at once (see :mod:`chunkreg.cohort`), because every pass reads
-subject level *k* and template level *k* at the same voxel indices, so one
+subject level *l* and template level *l* at the same voxel indices, so one
 scan cannot be placed without knowing the rest. And whether a scan is copied
 or read where it lies follows from whether the ingest would change a voxel: a
 zarr already exactly on the run grid is opened read-only and only its coarser
@@ -312,7 +312,7 @@ def ingest_subjects(
             f"      scan {'x'.join(str(n) for n in source.shape)} @ "
             f"{fmt_voxel(placement.voxel_mm)}, {how}\n"
             f"      {vol.native_grid.shape} @ {grid.spacing_mm:g} mm, "
-            f"{vol.n_levels} levels, {vol.array(vol.n_levels - 1).dtype}, "
+            f"{vol.n_levels} levels, {vol.array(0).dtype}, "
             f"window [{lo:.4g}, {hi:.4g}]"
         ]
         lines += [f"      warning: {note}" for note in notes]

@@ -145,7 +145,9 @@ def export_store(
     backend: str | None = None,
     target=None,
 ) -> None:
-    """Write a store's full-resolution level to NIfTI or TIFF.
+    """Write a store's full-resolution level (or ``level``) to NIfTI or TIFF.
+
+    ``level`` is the OME-Zarr level: ``0``, the default, is full resolution.
 
     ``target`` names a sampling to write on instead of the run grid: a
     :class:`~chunkreg.cohort.Placement`, or a store whose recorded placement
@@ -159,7 +161,7 @@ def export_store(
     from .io_formats import write_volume_blocks
 
     vol = store if isinstance(store, Volume) else Volume.open(store, backend)
-    k = vol.n_levels - 1 if level is None else vol._check_level(level)
+    k = 0 if level is None else vol._check_level(level)  # 0: full resolution
     if target is None:
         write_volume_blocks(out, vol.array(k), grid=vol.grid(k))
         return
@@ -222,7 +224,7 @@ def scan_view(
     from .cohort import Placement, ResampledSource
 
     vol = volume if isinstance(volume, Volume) else Volume.open(volume, backend)
-    k = vol.n_levels - 1 if level is None else vol._check_level(level)
+    k = 0 if level is None else vol._check_level(level)  # 0: full resolution
     return ResampledSource(
         vol.array(k),
         Placement.from_grid(vol.grid(k)),

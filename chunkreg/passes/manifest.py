@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ..config import RunConfig
-from ..grid import Chunk, GridSpec, Profile, tile
+from ..grid import Chunk, GridSpec, Profile, coarsest_level as _coarsest_level, tile
 from ..store import TaskEntry
 
 __all__ = ["TaskPlan", "Manifest", "build_manifest"]
@@ -41,6 +41,7 @@ class TaskPlan:
 @dataclass
 class Manifest:
     level: int
+    """The level this pass runs at: ``0`` is full resolution."""
     iteration: int
     grid: GridSpec
     subjects: tuple[str, ...]
@@ -48,6 +49,10 @@ class Manifest:
     tasks: tuple[TaskPlan, ...]
     d_max_mm: float | None
     seeded: bool
+    coarsest: int = 0
+    """``K``, the coarsest level of the run's pyramid. A task needs it to
+    know whether its level is the coarsest one, which runs its own stages,
+    and the depth of its level below the coarsest."""
     _index: dict[tuple[str, int], tuple[int, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -90,9 +95,14 @@ class Manifest:
         return [c for c in self.chunks if c.intersects(own.core_origin, own.core_shape)]
 
     # -- serialisation ------------------------------------------------------ #
+    @property
+    def is_coarsest(self) -> bool:
+        return self.level == self.coarsest
+
     def to_json(self) -> dict:
         return {
             "level": self.level,
+            "coarsest": self.coarsest,
             "iteration": self.iteration,
             "grid": {
                 "shape": list(self.grid.shape),
@@ -122,8 +132,9 @@ class Manifest:
     @classmethod
     def from_json(cls, d: dict) -> "Manifest":
         g = d["grid"]
+        level = int(d["level"])
         return cls(
-            level=int(d["level"]),
+            level=level,
             iteration=int(d["iteration"]),
             grid=GridSpec(tuple(g["shape"]), g["spacing_mm"], tuple(g["origin_mm"])),
             subjects=tuple(d["subjects"]),
@@ -147,6 +158,7 @@ class Manifest:
             ),
             d_max_mm=d.get("d_max_mm"),
             seeded=bool(d.get("seeded", True)),
+            coarsest=int(d.get("coarsest", level)),
         )
 
     def save(self, path) -> None:
@@ -165,9 +177,17 @@ def build_manifest(
     iteration: int,
     grid: GridSpec,
     subjects: Sequence[str] | None = None,
+    coarsest: int | None = None,
 ) -> Manifest:
-    """Enumerate the work for one template pass at one level."""
+    """Enumerate the work for one template pass at one level.
+
+    ``coarsest`` is ``K``, the coarsest level of the run's pyramid. Left
+    out, it is recovered from the level's own grid, whose pyramid is the rest
+    of the run's (see :func:`chunkreg.grid.coarsest_level`).
+    """
     p = cfg.profile
+    if coarsest is None:
+        coarsest = _coarsest_level(level, grid, p)
     chunks = tile(grid, p)
     subs = tuple(subjects) if subjects is not None else cfg.registered_ids
     per_task = max(1, cfg.slurm.register.chunks_per_task)
@@ -188,10 +208,10 @@ def build_manifest(
         for i, o in enumerate(range(0, len(entries), per_task))
     )
 
-    # A single-chunk level has no halo to bound it, so it is bounded by the
-    # aperture: a fraction of the volume's own extent.
+    # A single-chunk level -- the coarsest -- has no halo to bound it, so it
+    # is bounded by the aperture: a fraction of the volume's own extent.
     if len(chunks) == 1:
-        d_max = cfg.levels.level0_max_disp_frac * min(grid.extent_mm)
+        d_max = cfg.levels.coarsest_max_disp_frac * min(grid.extent_mm)
     else:
         d_max = p.d_max_mm(grid.spacing_mm)
     return Manifest(
@@ -202,5 +222,7 @@ def build_manifest(
         chunks=tuple(chunks),
         tasks=tasks,
         d_max_mm=d_max,
-        seeded=level > 0 or iteration > 0,
+        # Only the first pass of the coarsest level starts from nothing.
+        seeded=level != coarsest or iteration > 0,
+        coarsest=int(coarsest),
     )

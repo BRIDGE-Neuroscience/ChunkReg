@@ -84,7 +84,9 @@ def register_chunk(
     level = manifest.level
     spacing = manifest.grid.spacing_mm
     shape = tuple(entry.pad_shape)
-    stages = list(cfg.levels.stages(level))
+    stages = list(
+        cfg.levels.stages_for_pass(level, manifest.iteration, coarsest=manifest.coarsest)
+    )
 
     if seed is None:
         seed = _seed_block(cfg, manifest, entry, shape)
@@ -221,9 +223,14 @@ def run_register_task(
     extractor.setup()
     # A sampling extractor registers a different channel subset each pass. The
     # subset is a function of the pass alone, so every chunk of it, in every
-    # task and on every worker, registers the same channels.
+    # task and on every worker, registers the same channels. The draw is keyed
+    # by the level's depth below the coarsest, which is the coarse-first index
+    # it has always been keyed by, so the level renumbering did not change
+    # which channels any pass registers.
     if hasattr(extractor, "select"):
-        extractor.select(manifest.level, manifest.iteration, cfg.seed)
+        extractor.select(
+            manifest.coarsest - manifest.level, manifest.iteration, cfg.seed
+        )
 
     template = Volume.open(cfg.template_path(manifest.level), cfg.backend)
     subjects: dict[str, Volume] = {}

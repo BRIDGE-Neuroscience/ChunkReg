@@ -49,13 +49,15 @@ CONFIG="${CONFIG:-/home/akeenlys/storage_main/bridge_project_data/chunkreg/confi
 BINDS="${BINDS:-/home/akeenlys/storage_main/bridge_project_data}"
 # Which commands to run, in order: any of setup, run, status.
 STAGES="${STAGES:-setup run status}"
-# The finest level to run: a spacing such as 200um or a level index. Empty runs
-# every level, or whatever levels.stop_at in the config says.
+# The finest level to run: a spacing such as 200um, or a level number (0 is
+# full resolution, each step up halves it, the highest is the coarsest). Empty
+# runs every level, or whatever levels.stop_at in the config says.
 STOP_AT="${STOP_AT:-}"
 # Registration engine. Empty uses the config's (fireants on a GPU).
 ENGINE="${ENGINE:-}"
 # Extra flags, e.g. SETUP_ARGS="--no-probe". RUN_ARGS="--from-level 2" throws
-# away the progress at level 2 and finer and redoes it; a plain resubmit resumes.
+# away the progress at level 2 and every finer level (1, then 0 = full
+# resolution) and redoes it; a plain resubmit resumes.
 SETUP_ARGS="${SETUP_ARGS:-}"
 RUN_ARGS="${RUN_ARGS:-}"
 # Optional: a chunkreg checkout to use instead of the copy baked into the
@@ -93,15 +95,17 @@ pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
 # The GPUs Grid Engine gave this job, as the GPU prolog set them. Unset inside
 # a job means the prolog allocated none ("Not enough GPUs available ...,
 # rescheduling job") and the job started anyway. Every card on the node is then
-# visible, other people's included, so stop instead of using them. Outside Grid
-# Engine, unset means every GPU the container sees is used.
+# visible, other people's included, so stop instead of using them. Exit status
+# 99 tells Grid Engine to put the job back in the queue, which is what the
+# prolog meant to do. Outside Grid Engine, unset means every GPU the container
+# sees is used.
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
 elif [ -n "${JOB_ID:-}" ]; then
-    echo "FATAL: Grid Engine started this job without allocating it any GPUs" >&2
+    echo "Grid Engine started this job without allocating it any GPUs" >&2
     echo "  (CUDA_VISIBLE_DEVICES is unset; see the GPU prolog lines above)." >&2
-    echo "  Nothing has run. Submit the job again." >&2
-    exit 1
+    echo "  Nothing has run. Exiting 99 so Grid Engine requeues the job." >&2
+    exit 99
 fi
 pass TMPDIR                "$TMPDIR"
 pass XDG_CACHE_HOME        "$CACHE"

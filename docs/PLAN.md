@@ -52,10 +52,13 @@ rather than on a grid chosen for a cohort.
 
 The pipeline in one paragraph. Ingest resamples each volume onto a common
 grid as a sharded, multiscale zarr store. The pyramid has `K + 1` levels where
-`K = ceil(log2(max(shape) / core))`; at level 0 the whole volume is one chunk.
-Level 0 aligns every volume to an initial template by moments, rigid and
-affine, then deformably, and iterates the template to convergence. Each finer
-level is seeded by the upsampled template and fields, tiles the grid into
+`K = ceil(log2(max(shape) / core))`, numbered as OME-Zarr numbers its datasets:
+level `ℓ = 0` is full resolution, level `ℓ` has `2^ℓ` times its spacing, and at
+the coarsest level, `ℓ = K`, the whole volume is one chunk. The loop runs
+`ℓ = K, K−1, …, 0`. Level `K` aligns every volume to an initial template by
+moments, rigid and affine, then deformably, and iterates the template to
+convergence. Each finer level `ℓ − 1` is seeded by the upsampled template and
+fields of level `ℓ`, tiles the grid into
 fixed 256³ cores with 48-voxel halos, registers every (volume, chunk) pair as
 an independent GPU task on anatomix features, blends chunk residuals with a
 partition of unity into per-volume field stores, averages the warped volumes
@@ -65,9 +68,9 @@ function over zarr shards, so it runs identically under a local GPU pool or a
 SLURM array.
 
 ```
-                       ┌──────────────── level k (k = 0 … K) ────────────────┐
-  subjects/*.zarr ──►  │  register ──► task.zarr ──► blend+average ──► update │ ──► promote ──► level k+1
-  (multiscale s0..sK)  │  (N × chunks GPU tasks)     (per shard)     (per shard)│      (upsample)
+                       ┌──────────────── level ℓ (ℓ = K … 0) ────────────────┐
+  subjects/*.zarr ──►  │  register ──► task.zarr ──► blend+average ──► update │ ──► promote ──► level ℓ−1
+  (OME datasets 0..K)  │  (N × chunks GPU tasks)     (per shard)     (per shard)│      (upsample)
                        │        ▲                                         │     │
                        │        └──────── not converged: next iteration ◄─┘     │
                        └──────────────────────────────────────────────────────┘
@@ -137,8 +140,8 @@ correlation length exceeds the chunk width `L = core · spacing` looks like a
 translation inside a chunk and is invisible to a local similarity until it
 exceeds the anatomy's correlation length. Only a level whose `L` covers the
 deformation resolves it. With a fixed core, `L` doubles per level up the
-pyramid, and level 0 has `L ≥` the whole volume. That is why the pyramid
-always starts at level 0: it costs one registration per subject of a ≤ 256³
+pyramid, and the coarsest level, `K`, has `L ≥` the whole volume. That is why
+the run always starts at level `K`: it costs one registration per subject of a ≤ 256³
 volume, and it is the only place the global component can be estimated.
 In-chunk multiscale (`scales: [2,1]` or `[4,2,1]`) resolves ambiguity only up
 to `L`. Template iteration propagates information between chunks through the
@@ -174,14 +177,16 @@ shard by the shard's owner. Bias decays as `(1 − ε)^k` per pass.
 **Stopping rule per level** (replaces hand-set iteration counts):
 
 ```
-stop at level k when   d99_residual(k) < 0.5 · D_max(k+1)   and   ε·‖ū‖₉₉ < spacing(k)
+stop at level ℓ when   d99_residual(ℓ) < 0.5 · D_max(ℓ−1)   and   ε·‖ū‖₉₉ < spacing(ℓ)
 ```
 
-i.e. the leftover residual fits comfortably under the next level's clamp and
-the template has stopped moving by more than a voxel. Each level also has a
-cap (default `[8, 6, 4, 3, 2]` from coarse to fine) and a floor of 1. A level
-that inherits a converged shape exits after one pass; the first level runs
-until the global shape is right. The last level stops on `‖ū‖` alone.
+i.e. the leftover residual fits comfortably under the next (finer) level's
+clamp and the template has stopped moving by more than a voxel. Each level
+also has a cap and a floor of 1. The caps are indexed by level, from full
+resolution towards the coarsest, default `[2, 3, 4, 6, 8]` (level 0 gets 2,
+level 4 gets 8), the last value repeating for a deeper pyramid. A level that
+inherits a converged shape exits after one pass; the first (coarsest) level
+runs until the global shape is right. The last level stops on `‖ū‖` alone.
 
 **With a fixed template the rule is different, because `ū` does not exist.**
 No update pass runs, so the recentring step is identically zero and the
@@ -191,8 +196,8 @@ it is. What converges instead is the residual itself, the part of the
 correspondence each pass could not already explain:
 
 ```
-stop at level k when   d99_residual(k) < residual_vox · spacing(k)
-                or     d99_residual(k) < 0.5 · D_max(k+1)
+stop at level ℓ when   d99_residual(ℓ) < residual_vox · spacing(ℓ)
+                or     d99_residual(ℓ) < 0.5 · D_max(ℓ−1)
 ```
 
 `residual_vox` defaults to 0.5. Below half a voxel at the 99th percentile the
@@ -208,8 +213,9 @@ term is 24 voxels and nothing is left for `D_max`. The default profile resolves
 this by running seeded levels at `scales: [2,1]` and relying on two facts: the
 seed already places the residual within `D_max`, and anatomix features have a
 capture range several times wider than an intensity window (measured by
-`calibrate`, which is what lets the planner accept `[2,1]`). Level 0 (single
-chunk, unclamped after affine) uses `[8,4,2,1]`, where halo is irrelevant. Iterations per scale `≈ d(s)/δ + N_conv`: each finer octave has 2
+`calibrate`, which is what lets the planner accept `[2,1]`). The coarsest
+level (single chunk, unclamped after affine) uses `[8,4,2,1]`, where halo is
+irrelevant. Iterations per scale `≈ d(s)/δ + N_conv`: each finer octave has 2
 to 4× less displacement to cover, so counts decrease geometrically toward a
 convergence tail of 20 to 30. Configure them as caps with FireANTs
 `tolerance` early stopping, and after the first pass at any chunked level set
@@ -225,7 +231,7 @@ padded chunks and discards them. Normalisation is per volume and global
 receptive-field radius `r_f` enters the halo bound; it is **measured** by
 `calibrate`, not assumed (default 24 until measured). Channel count is the
 primary cost lever: registration work scales linearly with channels, so a PCA
-projection to `C_pca` channels fitted once at level 0 on a sample of feature
+projection to `C_pca` channels fitted once at the coarsest level on a sample of feature
 voxels is offered as a control, with intensity (`C = 1`) as the floor.
 
 ### 2.9 Memory and work model
@@ -307,21 +313,25 @@ run `[4,2,1]` with `D_max = 16`.
 ## 4. Level schedule for an arbitrary grid
 
 ```
-K        = ceil(log2(max(shape_native) / core))
-spacing_k = spacing_native · 2^(K−k)          k = 0 (coarsest) … K (native)
-shape_k   = ceil(shape_native / 2^(K−k))
-chunks_k  = Π_axis ceil(shape_k / core)       chunks_0 = 1 by construction
+K         = ceil(log2(max(shape_native) / core))
+spacing_ℓ = spacing_native · 2^ℓ               ℓ = 0 (native) … K (coarsest)
+shape_ℓ   = ceil(shape_native / 2^ℓ)
+chunks_ℓ  = Π_axis ceil(shape_ℓ / core)        chunks_K = 1 by construction
 ```
 
-For the HiP-CT example (1920 × 2560 × 2560 at 50 µm): `K = 4`, levels 800,
-400, 200, 100, 50 µm with 1, 4, 18, 100, 800 chunks per subject. For a
+Level `ℓ` is OME-Zarr dataset `ℓ` of every subject store, and `levels/Lℓ` of
+the run root. The loop runs `ℓ = K, K−1, …, 0`, and promote takes level `ℓ`
+to level `ℓ − 1`.
+
+For the HiP-CT example (1920 × 2560 × 2560 at 50 µm): `K = 4`, levels 4 … 0 at
+800, 400, 200, 100, 50 µm with 1, 4, 18, 100, 800 chunks per subject. For a
 1 mm brain MRI of 256³, `K = 0` and the pipeline is a single whole-volume
 anatomix registration. For a 8000³ volume, `K = 5`. Nothing else changes.
 
-Level 0 stages: moments → rigid → affine → greedy `[8,4,2,1]`, unclamped, on
-anatomix. The affine is composed into the field as dense displacement so every
-downstream consumer sees only vector zarr. Levels 1..K: greedy `[2,1]`,
-clamped to `D_max(k)`, seeded.
+Level `K` stages (`levels.coarsest_stages`): moments → rigid → affine → greedy
+`[8,4,2,1]`, unclamped, on anatomix. The affine is composed into the field as
+dense displacement so every downstream consumer sees only vector zarr. Levels
+`K−1 … 0`: greedy `[2,1]`, clamped to `D_max(ℓ)`, seeded.
 
 ---
 
@@ -330,13 +340,13 @@ clamped to `D_max(k)`, seeded.
 | Control | Default | Guards against | Where |
 |---|---|---|---|
 | Fixed chunk profile | `a16` (256/48, 16 ch) | memory surprises; per-level retuning | `config.profile` |
-| Derived clamp `D_max(k)` | 12 native voxels | halo bound violation; runaway chunk solutions | planner, register |
+| Derived clamp `D_max(ℓ)` | 12 native voxels | halo bound violation; runaway chunk solutions | planner, register |
 | Halo bound validation | from profile + measured `r_f` | silently under-sized halos | `config.validate` |
-| Per-level stopping rule | `d99 < 0.5·D_max(k+1)` and `ε‖ū‖ < spacing`; with a fixed template, `d99 < residual_vox·spacing` instead | too few passes (aperture leftovers) or too many (cost) | `pipelines.groupwise` |
-| Iteration caps + early stop | `[8,6,4,3,2]` passes; per-scale caps; `tolerance 1e-6` | unbounded runtime | config, engine |
+| Per-level stopping rule | `d99 < 0.5·D_max(ℓ−1)` and `ε‖ū‖ < spacing`; with a fixed template, `d99 < residual_vox·spacing` instead | too few passes (aperture leftovers) or too many (cost) | `pipelines.groupwise` |
+| Iteration caps + early stop | `[2,3,4,6,8]` passes, level 0 first; per-scale caps; `tolerance 1e-6` | unbounded runtime | config, engine |
 | Chunk retry ladder | folds > 0.1 % or loss diverged → (1) `σ_w × 2`, (2) clamp × 0.5, (3) emit seed and flag | one bad chunk poisoning a level | register |
 | Tissue-fraction skip | < 2 % → emit seed | registering air | register |
-| Global per-volume normalisation | percentiles 0.5 / 99.5 at level 0 | feature drift across chunks | ingest, features |
+| Global per-volume normalisation | percentiles 0.5 / 99.5 at the coarsest level | feature drift across chunks | ingest, features |
 | Measured `r_f` and capture | `calibrate` | wrong halo budget for a given backbone | calibrate |
 | Channel count `C` | 16; PCA to 8 / 4; intensity 1 | cost; memory class | config, G2 |
 | Level QC gate | similarity not worse than previous level; folds < 0.1 % | promoting a regression | `passes.qc` |
@@ -372,7 +382,7 @@ scalable-reg/
     runners/                      base.py · local.py · slurm.py · multigpu.py · runner_for
     config.py                     dataclasses, YAML, validation (halo bound, profile, shard alignment)
     calibrate.py                  measure r_f, capture range, B, throughput
-    probe.py                      measure d99 at level 0; report
+    probe.py                      measure d99 at the coarsest level; report
     selftest.py                   known-shift convention test, full and chunked
     cli.py
   configs/                        profiles.yaml · example_hipct.yaml · example_pairwise.yaml
@@ -398,13 +408,13 @@ class Profile:  core: int = 256; halo: int = 48; inner_chunk: int = 64; lattice_
                 def d_max_vox(self) -> int   # h − s_max·((k−1)/2 + 3σ) − r_f
                 def padded(self) -> int; def overhead(self) -> float; def mem_gb(self, B) -> float
 
-def pyramid(native: GridSpec, profile: Profile) -> list[GridSpec]        # K+1 levels, coarse → fine
+def pyramid(native: GridSpec, profile: Profile) -> list[GridSpec]        # K+1 levels; [ℓ] is level ℓ, [0] native
 def tile(grid: GridSpec, profile: Profile) -> list[Chunk]
 
-class Volume:   # multiscale scalar zarr group
+class Volume:   # multiscale scalar zarr group; level ℓ is OME-Zarr dataset ℓ
     open(path) / create(path, native_grid, levels, dtype="u2")
-    level(k) -> zarr.Array;  grid(k) -> GridSpec
-    read_padded(k, origin, shape, fill=0.0) -> ndarray
+    array(ℓ) -> zarr.Array;  grid(ℓ) -> GridSpec      # array(0) is full resolution
+    read_padded(ℓ, origin, shape, fill=0.0) -> ndarray
     attrs: norm_lo, norm_hi, mask, provenance
 
 class Field:    # vector zarr (3,Z,Y,X) float16 mm, lattice factor in attrs
@@ -426,7 +436,7 @@ class Engine(Protocol):
 # public
 plan(config) -> Plan
 calibrate(config, device) -> Calibration         # r_f, capture, B, throughput
-probe(config, pairs=3) -> ProbeReport            # d99 at level 0, expected passes per level
+probe(config, pairs=3) -> ProbeReport            # d99 at the coarsest level, expected passes per level
 build_template(volumes, config, runner) -> (Volume, dict[str, Field])
 register_pair(config, fixed, moving, runner) -> RunResult   # a pair out of a cohort
 pair_config(config, fixed, moving) -> RunConfig             # the derived config it runs under
@@ -449,7 +459,7 @@ selftest(config) -> bool
 | `blend` | field shards (= cores) | task arrays touching the shard; subject intensity with margin | `fields/<sid>.zarr` shard; `isum`, `wsum` shard |
 | `update` | template shards | `isum`, `wsum` with margin | `template.zarr` shard (recentred, optionally sharpened) |
 | `qc` | subjects | template, fields, subjects at a coarse level | metrics in level attrs + PNGs |
-| `promote` | shards of level k+1 | template and fields of level k | level k+1 template and seed fields |
+| `promote` | shards of level ℓ−1 | template and fields of level ℓ | level ℓ−1 template and seed fields |
 
 Register task: load backbone once; per (subject, chunk): read padded chunks,
 apply stored normalisation, skip if tissue < 2 %, read and upsample seed,
@@ -460,13 +470,13 @@ task array; write to `$TMPDIR`, copy, mark complete.
 Level loop (`pipelines/groupwise.py`):
 
 ```
-for k in 0..K:
-    seed ← promote(k−1) or (identity, initial template = mean of moments-aligned volumes) if k == 0
-    for it in 1..cap[k]:
+for ℓ in K..0:
+    seed ← promote(ℓ+1) or (identity, initial template = mean of moments-aligned volumes) if ℓ == K
+    for it in 1..cap[ℓ]:
         register; blend; update; qc
-        if stop_rule(k): break
-    gate(k)            # similarity ≥ previous level, folds < 0.1 %; else halt with report
-    clean(k, it)
+        if stop_rule(ℓ): break
+    gate(ℓ)            # similarity ≥ previous level, folds < 0.1 %; else halt with report
+    clean(ℓ, it)
 ```
 
 Runners: `LocalRunner` (one process per GPU, work queue) and `SlurmRunner`
@@ -488,15 +498,16 @@ subjects: [{id: s01, path: subjects/s01.zarr}, ...]
 grid: {spacing_mm: 0.05}          # shape/origin derived at ingest (union bbox after moments) or given
 
 levels:                           # optional overrides; everything below is derived by default
-  caps: [8, 6, 4, 3, 2]           # template passes per level, coarse → fine
-  level0_stages: [moments, rigid, affine, {greedy: {scales: [8,4,2,1], iterations: [120,80,50,30]}}]
+                                  # level numbers: 0 = full resolution, K = coarsest
+  caps: [2, 3, 4, 6, 8]           # template passes per level, level 0 first; last value repeats
+  coarsest_stages: [moments, rigid, affine, {greedy: {scales: [8,4,2,1], iterations: [120,80,50,30]}}]
   seeded_stages: [{greedy: {scales: [2,1], iterations: [50,30]}}]
   stop: {residual_frac: 0.5, ubar_vox: 1.0}
   shape_update_step: 0.25
-  sharpen_laplacian_levels: [0, 1]
+  sharpen_laplacian_levels: null  # null = the two coarsest levels; or a list of level numbers
 
 retry: {fold_frac: 0.001, ladder: [sigma_w_x2, clamp_x0.5, emit_seed]}
-retention: {keep_history_levels: [0, 1], delete_task_arrays: true}
+retention: {keep_history_levels: null, delete_task_arrays: true}   # null = the two coarsest
 slurm:
   partition: gpu
   register: {gpus: 1, cpus: 8, mem_gb: 64, time: "04:00:00", chunks_per_task: 16}
@@ -514,16 +525,17 @@ shard = core; channel count fits the GPU class; stage lists well-formed.
 ```
 chunkreg setup     CONFIG [--stop-at L]   # ingest onto the run grid, conventions, calibration, cohort spread, plan
 chunkreg selftest  CONFIG
-chunkreg run       CONFIG [--stop-at L] [--from-level k]   # the run itself; resumes on its own,
-                                                 # --from-level k redoes k and finer
-chunkreg pair      CONFIG --fixed ID --moving ID [--root DIR] [--stop-at L] [--from-level k]
+chunkreg run       CONFIG [--stop-at L] [--from-level ℓ]   # the run itself; resumes on its own,
+                                                 # --from-level ℓ redoes ℓ and finer (ℓ−1 … 0);
+                                                 # L is a level number (0 = native) or a spacing
+chunkreg pair      CONFIG --fixed ID --moving ID [--root DIR] [--stop-at L] [--from-level ℓ]
                                                  # derives a two-subject config under
                                                  # <root>/pairs/<fixed>__<moving>/ and runs there
-chunkreg run-task  CONFIG --level k --iter i --pass P --id T      # what sbatch invokes
+chunkreg run-task  CONFIG --level ℓ --iter i --pass P --id T      # what sbatch invokes
 chunkreg status    CONFIG [--retry]
 chunkreg apply     VOLUME FIELD OUT [--on STORE]  # --on delivers on that scan's own lattice
 chunkreg export    STORE OUT.nii.gz|OUT.tif [--on STORE]
-chunkreg clean     CONFIG --level k --iter i
+chunkreg clean     CONFIG --level ℓ --iter i
 ```
 
 ---
@@ -532,11 +544,13 @@ chunkreg clean     CONFIG --level k --iter i
 
 | Level | Spacing | Shape (Z,Y,X) | Voxels | Chunks/subject | D_max | Passes (cap) |
 |---|---|---|---|---|---|---|
-| 0 | 800 µm | 120 × 160 × 160 | 3.1 M | 1 | unclamped | ≤ 8 |
-| 1 | 400 µm | 240 × 320 × 320 | 24.6 M | 4 | 4.8 mm | ≤ 6 |
+| 4 | 800 µm | 120 × 160 × 160 | 3.1 M | 1 | unclamped | ≤ 8 |
+| 3 | 400 µm | 240 × 320 × 320 | 24.6 M | 4 | 4.8 mm | ≤ 6 |
 | 2 | 200 µm | 480 × 640 × 640 | 197 M | 18 | 2.4 mm | ≤ 4 |
-| 3 | 100 µm | 960 × 1280 × 1280 | 1.57 G | 100 | 1.2 mm | ≤ 3 |
-| 4 | 50 µm | 1920 × 2560 × 2560 | 12.6 G | 800 | 0.6 mm | ≤ 2 |
+| 1 | 100 µm | 960 × 1280 × 1280 | 1.57 G | 100 | 1.2 mm | ≤ 3 |
+| 0 | 50 µm | 1920 × 2560 × 2560 | 12.6 G | 800 | 0.6 mm | ≤ 2 |
+
+Rows in run order; level 0 is full resolution.
 
 Work at the caps' typical realised passes (6, 4, 3, 2, 1), overhead 2.60,
 N = 10, and GPU-hours at 1.5 × 10⁶ channel-voxels/s (to be replaced by the
@@ -549,12 +563,12 @@ calibrated throughput):
 | 4 (PCA) | 1.7 | 315 | 39 h | 5 h |
 | 1 (intensity) | 0.43 | 79 | 10 h | 1.2 h |
 
-Level 4 is 76 % of the work; level 3 is 19 %. Feature extraction (two 352³
+Level 0 is 76 % of the work; level 1 is 19 %. Feature extraction (two 352³
 UNet passes per chunk) is independent of `C` and adds roughly 15 GPU-hours per
-level-4 pass. G2 picks the channel count on 20 seeded level-4 chunks.
+level-0 pass. G2 picks the channel count on 20 seeded level-0 chunks.
 
 Storage, steady state: subject stores ~1,350 files / ~200 GB; fields ~1,250
-files / ~110 GB; templates ~130 files / ~30 GB; transient per level-4 pass
+files / ~110 GB; templates ~130 files / ~30 GB; transient per level-0 pass
 ≤ 600 task arrays / ~260 GB. Total ~3,000 files, ~350 GB, versus ~216,000 files
 and 3.8 TB per pass for the legacy script.
 
@@ -570,12 +584,12 @@ slices of template and checkerboard per level and pass.
 
 - **G0** `calibrate` and `probe` run; `plan` prints the pyramid, clamps and work.
 - **G1** `selftest` passes, full and chunked, features on and off.
-- **G2** Channel count: 2 subjects at level 1 and 20 seeded level-4 chunks;
+- **G2** Channel count: 2 subjects at level 3 (400 µm) and 20 seeded level-0 chunks;
   16 / pca:8 / pca:4 / intensity by similarity gain, folds, 20 landmarks.
-- **G3** One pass at level 2 on the cluster: throughput, memory, achieved
+- **G3** One pass at level 2 (200 µm) on the cluster: throughput, memory, achieved
   iteration histogram → caps; resubmission of a killed element works.
-- **G4** Pilot: 3 subjects to level 3; file count and bytes against budget.
-- **G5** Full run; deliver only if the level-4 gate passes.
+- **G4** Pilot: 3 subjects to level 1 (100 µm); file count and bytes against budget.
+- **G5** Full run; deliver only if the level-0 gate passes.
 
 ---
 
@@ -651,10 +665,10 @@ full correspondence and never shrinks. What has to fall below the next level's
 clamp is the part a pass could not already explain, which is the clamped
 residual the engine returned before it was composed onto the seed.
 
-**Level 0 is bounded by the aperture, not left unclamped.** Section 4 says the
-coarsest level runs unclamped because it has no halo. That leaves nothing at all
-bounding it, and a noisy solution can run away. It is now clamped to
-`levels.level0_max_disp_frac` (default 0.25) of the volume's shortest extent: a
+**The coarsest level is bounded by the aperture, not left unclamped.** Section
+4 says the coarsest level runs unclamped because it has no halo. That leaves
+nothing at all bounding it, and a noisy solution can run away. It is now clamped
+to `levels.coarsest_max_disp_frac` (default 0.25) of the volume's shortest extent: a
 displacement approaching the size of the volume cannot be a correspondence,
 whatever the similarity says.
 
@@ -758,7 +772,8 @@ exactly dilation plus patch radius it doubles as a known-answer test for
 Building it found two defects worth recording. The report originally derived the
 pyramid from the config profile rather than from the store, so a volume ingested
 under a different profile was indexed by the wrong depth: level 0 of a
-three-level store was read as if it were native, the box landed outside the
+three-level store (the coarsest, under the coarse-first numbering of the time)
+was read as if it were native, the box landed outside the
 array, and every tile came back all-zero with zero contrast and a confident
 colour map fitted to nothing. It now reads the levels the store actually has and
 refuses subjects whose stores disagree. Separately, the contact sheet's legend

@@ -195,10 +195,9 @@ def build_feature_report(
     native = first.native_grid
 
     # The levels come from the store, not from the profile. A volume ingested
-    # under a different profile has its own pyramid depth, and indexing it by a
-    # depth derived from the current config reads the wrong array: level 0 of a
-    # three-level store is the coarsest, and asking for a native-resolution box
-    # there lands outside it and returns zeros.
+    # under a different profile has its own pyramid depth, so the levels the
+    # current config would have are not necessarily the ones it holds. Level
+    # l is native spacing times 2**l in any store; only the depth differs.
     grids = first.grids()
     for sid, v in vols.items():
         if v.n_levels != first.n_levels:
@@ -208,13 +207,16 @@ def build_feature_report(
                 f"profiles and cannot be compared level by level"
             )
 
-    level_ids = list(levels) if levels else list(range(len(grids)))
+    # Columns run coarse to fine, as the levels run, unless asked otherwise.
+    level_ids = list(levels) if levels else list(reversed(range(len(grids))))
     for k in level_ids:
         if not 0 <= k < len(grids):
             raise ValueError(
                 f"level {k} out of range; this store has {len(grids)} levels "
-                f"(0 is the coarsest, {len(grids) - 1} is native)"
+                f"(0 is native, {len(grids) - 1} is the coarsest)"
             )
+    if warped:
+        cfg.check_level_order()  # the fields are read by level number
 
     if centre_world is None:
         centre_world = tuple(native.world(np.asarray(native.shape, float) / 2.0 - 0.5))

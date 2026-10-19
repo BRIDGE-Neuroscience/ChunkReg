@@ -15,7 +15,8 @@ Sampling
     template pass and draws a fresh subset for the next, so over a level every
     channel contributes while no single pass pays for all of them. The draw is
     stratified by part (a combined extractor keeps both anatomix and MIND in
-    every pass) and seeded by ``(seed, level, iteration)``, so every chunk and
+    every pass) and seeded by ``(seed, depth, iteration)``, where ``depth`` is
+    the level's distance below the coarsest level, so every chunk and
     every worker of a pass, on any machine, registers the same channels. It
     has to: the blend merges residuals across chunk boundaries, and residuals
     solved on different channels would not be answers to the same problem.
@@ -75,17 +76,21 @@ class CombinedFeatures:
 
 
 def stratified_pick(
-    groups: Sequence[int], k: int, seed: int, level: int, iteration: int
+    groups: Sequence[int], k: int, seed: int, depth: int, iteration: int
 ) -> np.ndarray:
     """``k`` channel indices, spread over the groups in proportion to size.
 
     Every group with channels gets at least one pick when ``k`` allows it.
-    Deterministic in ``(seed, level, iteration)``.
+    Deterministic in ``(seed, depth, iteration)``. ``depth`` is how far the
+    pass's level is below the coarsest level (``K - l``): ``0`` at the
+    coarsest. That is the coarse-first level index the draw was keyed by
+    before levels were numbered from full resolution, kept so that the
+    renumbering left every pass's channels as they were.
     """
     total = int(sum(groups))
     if not 1 <= k <= total:
         raise ValueError(f"cannot sample {k} of {total} channels")
-    rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, int(level), int(iteration)])
+    rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, int(depth), int(iteration)])
     live = [i for i, n in enumerate(groups) if n > 0]
     quota = {i: groups[i] * k / total for i in live}
     take = {i: int(math.floor(quota[i])) for i in live}
@@ -128,11 +133,15 @@ class ChannelSample:
         self.seed = int(seed)
         self.pick = stratified_pick(self.groups, self.k, self.seed, 0, 0)
 
-    def select(self, level: int, iteration: int, seed: int | None = None) -> np.ndarray:
-        """Choose the channels for one template pass, and return them."""
+    def select(self, depth: int, iteration: int, seed: int | None = None) -> np.ndarray:
+        """Choose the channels for one template pass, and return them.
+
+        ``depth`` is the pass's level counted down from the coarsest
+        (``K - l``); see :func:`stratified_pick`.
+        """
         if seed is not None:
             self.seed = int(seed)
-        self.pick = stratified_pick(self.groups, self.k, self.seed, level, iteration)
+        self.pick = stratified_pick(self.groups, self.k, self.seed, depth, iteration)
         return self.pick
 
     def setup(self, device: str | None = None) -> None:

@@ -27,7 +27,8 @@ SPACING = 0.05
 SHAPE = (48, 48, 48)
 
 # A core of 32 against a 48-voxel volume gives a two-level pyramid, which is
-# the smallest thing that can show per-level tuning doing anything. Halo 16
+# the smallest thing that can show per-level tuning doing anything: level 1,
+# the coarsest at 100 um, and level 0, full resolution at 50 um. Halo 16
 # against kernel 3 leaves a clamp of 11 voxels, above the configured floor.
 SMALL_PROFILE = {
     "core": 32,
@@ -65,8 +66,8 @@ def config_dict(**over) -> dict:
             for i in range(1, 4)
         ],
         "levels": {
-            "caps": [2, 1],
-            "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [20, 12]}}],
+            "caps": [1, 2],
+            "coarsest_stages": [{"greedy": {"scales": [2, 1], "iterations": [20, 12]}}],
             "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [15, 10]}}],
             "sharpen_laplacian_levels": [],
         },
@@ -157,7 +158,9 @@ def test_setup_runs_the_probe(ready, capsys):
 def test_run_builds_a_template_and_status_reports_it(ready, capsys):
     assert main(["run", ready]) == 0
     out = capsys.readouterr().out
-    assert "level 0 pass 0" in out
+    assert "level 1 pass 0" in out and "level 0 pass 0" in out
+    assert out.index("level 1 pass 0") < out.index("level 0 pass 0"), "coarsest first"
+    assert "promote level 1 -> 0" in out
     assert "d99" in out
 
     assert main(["status", ready]) == 0
@@ -180,21 +183,22 @@ def test_a_subject_without_a_store_or_a_source_says_so(tmp_path, capsys):
 # Per-level stage parameters
 # --------------------------------------------------------------------------- #
 def test_per_level_params_reach_the_stage_table(sources, tmp_path, capsys):
-    """What the config says about level 1 is what level 1 will run."""
+    """What the config says about level 0 is what level 0 will run."""
     levels = config_dict()["levels"]
-    levels["level_params"] = {"1": {"iterations": [9, 6], "smooth_warp_sigma": 0.25}}
+    levels["level_params"] = {"0": {"iterations": [9, 6], "smooth_warp_sigma": 0.25}}
     path = write_config(tmp_path, levels=levels)
     assert main(["setup", path, "--no-calibrate", "--no-probe", "--no-selftest"]) == 0
     out = capsys.readouterr().out
 
     table = out[out.index("stages per level") :]
-    level1 = table[table.index("level 1") :]
-    assert "iters=[9, 6]" in level1
-    assert "warp_sigma=0.25" in level1
-    assert "level_params" in level1, "the tuned level should be marked as tuned"
+    level0 = table[table.index("level 0") :]
+    assert "iters=[9, 6]" in level0
+    assert "warp_sigma=0.25" in level0
+    assert "level_params" in level0, "the tuned level should be marked as tuned"
 
-    level0 = table[table.index("level 0") : table.index("level 1")]
-    assert "iters=[20, 12]" in level0, "level 0 keeps its own stages"
+    coarsest = table[table.index("level 1") : table.index("level 0")]
+    assert "iters=[20, 12]" in coarsest, "the coarsest level keeps its own stages"
+    assert "coarsest_stages" in coarsest
 
 
 def test_per_level_params_are_used_by_the_run(sources, tmp_path):
@@ -202,11 +206,26 @@ def test_per_level_params_are_used_by_the_run(sources, tmp_path):
     from chunkreg.config import load_config
 
     levels = config_dict()["levels"]
-    levels["level_params"] = {"1": {"iterations": [9, 6], "lr": 0.125}}
+    levels["level_params"] = {"0": {"iterations": [9, 6], "lr": 0.125}}
     cfg = load_config(config_dict(levels=levels))
-    assert cfg.levels.stages(1)[0].iterations == (9, 6)
-    assert cfg.levels.stages(1)[0].lr == 0.125
-    assert cfg.levels.stages(0)[0].iterations == (20, 12)
+    assert cfg.levels.stages(0, coarsest=1)[0].iterations == (9, 6)
+    assert cfg.levels.stages(0, coarsest=1)[0].lr == 0.125
+    assert cfg.levels.stages(1, coarsest=1)[0].iterations == (20, 12)
+
+
+def test_an_integer_stop_at_on_the_command_line_is_a_level_number(ready, capsys):
+    """--stop-at 1 is level 1, twice the native spacing: here the coarsest."""
+    assert main(["run", ready, "--stop-at", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "level 1 pass 0" in out
+    assert "level 0 pass" not in out, "level 0 is full resolution and was not asked for"
+    assert "stopping at level 1 (100 um)" in out
+
+    assert main(["run", ready, "--stop-at", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "level 1 pass 0: done earlier" in out
+    assert "promote level 1 -> 0" in out
+    assert "stopping at level" not in out
 
 
 def test_an_override_for_a_level_that_does_not_exist_warns(sources, tmp_path, capsys):

@@ -30,9 +30,9 @@
 
   "levels": {
     "stop_at": "100um",
-    "caps": [6, 4, 3, 2, 1],
+    "caps": [1, 1, 2, 3, 4, 6],
 
-    "level0_stages": [
+    "coarsest_stages": [
       "moments",
       {"rigid":  {"scales": [4, 2, 1], "iterations": [200, 100, 50], "lr": 0.01}},
       {"affine": {"scales": [4, 2, 1], "iterations": [200, 100, 50], "lr": 0.01}},
@@ -44,11 +44,11 @@
     ],
 
     "level_params": {
-      "1": {"iterations": [60, 40], "lr": 0.50, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.70, "cc_kernel": 7, "tolerance": 1e-4},
-      "2": {"iterations": [60, 40], "lr": 0.50, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.70, "cc_kernel": 7, "tolerance": 1e-4},
-      "3": {"iterations": [60, 40], "lr": 0.40, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.50, "cc_kernel": 7, "tolerance": 1e-4},
-      "4": {"iterations": [80, 50], "lr": 0.30, "smooth_grad_sigma": 0.8, "smooth_warp_sigma": 0.40, "cc_kernel": 5, "tolerance": 1e-4},
-      "5": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
+      "4": {"iterations": [60, 40], "lr": 0.50, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.70, "cc_kernel": 7, "tolerance": 1e-4},
+      "3": {"iterations": [60, 40], "lr": 0.50, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.70, "cc_kernel": 7, "tolerance": 1e-4},
+      "2": {"iterations": [60, 40], "lr": 0.40, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.50, "cc_kernel": 7, "tolerance": 1e-4},
+      "1": {"iterations": [80, 50], "lr": 0.30, "smooth_grad_sigma": 0.8, "smooth_warp_sigma": 0.40, "cc_kernel": 5, "tolerance": 1e-4},
+      "0": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
     },
 
     "stop": {
@@ -58,9 +58,9 @@
     },
 
     "shape_update_step": 0.25,
-    "sharpen_laplacian_levels": [0, 1],
+    "sharpen_laplacian_levels": [5, 4],
     "min_tissue_fraction": 0.02,
-    "level0_max_disp_frac": 0.25
+    "coarsest_max_disp_frac": 0.25
   },
 
   "retry": {
@@ -69,7 +69,7 @@
   },
 
   "retention": {
-    "keep_history_levels": [0, 1],
+    "keep_history_levels": [5, 4],
     "delete_task_arrays": true,
     "delete_accumulators": true
   },

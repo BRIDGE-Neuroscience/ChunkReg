@@ -44,12 +44,17 @@ __all__ = [
     "unused_level_overrides",
     "skipped_level_overrides",
     "ConfigError",
+    "LEVEL_ORDER",
 ]
 
 
 class ConfigError(ValueError):
     """A configuration that cannot be run as written."""
 
+
+LEVEL_ORDER = "ome"
+"""How chunkreg numbers pyramid levels: as OME-Zarr numbers its datasets, with
+level 0 at full resolution. Recorded in every run root it writes."""
 
 MIN_D_MAX_VOX = 8.0
 """Smallest clamp worth running. Below this a chunk can barely move a feature
@@ -62,7 +67,7 @@ past the interpolation footprint, and the level cannot make progress."""
 PROFILES: dict[str, dict[str, Any]] = {
     # 16 anatomix channels. The reference profile; needs an 80 GB device.
     "a16": dict(channels=16, features="anatomix", r_f=24),
-    # anatomix projected to 8 channels by a PCA fitted once at level 0.
+    # anatomix projected to 8 channels by a PCA fitted once at the coarsest level.
     "a8": dict(channels=8, features="pca:8", r_f=24),
     "a4": dict(channels=4, features="pca:4", r_f=24),
     # Raw intensity. No receptive field, so the whole halo past the kernel
@@ -205,14 +210,14 @@ def _patch_stage(stage: StageSpec, patch: dict[str, Any]) -> StageSpec:
     return replace(stage, **kw)
 
 
-DEFAULT_LEVEL0_STAGES: tuple[StageSpec, ...] = (
+DEFAULT_COARSEST_STAGES: tuple[StageSpec, ...] = (
     StageSpec(kind="moments", scales=(), iterations=()),
     StageSpec(kind="rigid", scales=(4, 2, 1), iterations=(200, 100, 50), lr=0.01),
     StageSpec(kind="affine", scales=(4, 2, 1), iterations=(200, 100, 50), lr=0.01),
     StageSpec(kind="greedy", scales=(8, 4, 2, 1), iterations=(120, 80, 50, 30)),
 )
-"""Level 0 is one chunk, so its halo is irrelevant and it can afford the deep
-pyramid that estimates the global component nothing else can see."""
+"""The coarsest level is one chunk, so its halo is irrelevant and it can afford
+the deep pyramid that estimates the global component nothing else can see."""
 
 DEFAULT_SEEDED_STAGES: tuple[StageSpec, ...] = (
     StageSpec(kind="greedy", scales=(2, 1), iterations=(50, 30)),
@@ -225,15 +230,42 @@ kernel support (see :meth:`Profile.d_max_vox`)."""
 # --------------------------------------------------------------------------- #
 # Policy
 # --------------------------------------------------------------------------- #
+_RENAMED_LEVEL_KEYS = {
+    "level0_stages": "coarsest_stages",
+    "level0_max_disp_frac": "coarsest_max_disp_frac",
+}
+"""``levels`` keys from the coarse-first numbering, refused rather than aliased."""
+
+
 @dataclass(frozen=True)
 class LevelPolicy:
-    """Ceilings and thresholds for the level loop."""
+    """Ceilings and thresholds for the level loop.
 
-    caps: tuple[int, ...] = (8, 6, 4, 3, 2)
-    """Maximum template passes per level, coarse to fine. Padded with its last
-    value for deeper pyramids."""
-    level0_stages: tuple[StageSpec, ...] = DEFAULT_LEVEL0_STAGES
+    Levels are numbered as OME-Zarr numbers its datasets, and as a subject
+    store holds them: level ``0`` is full resolution (the run grid), level
+    ``l`` has ``2**l`` times its spacing, and the highest level, ``K``, is the
+    coarsest, the first at which the whole volume fits one chunk. The loop
+    runs ``K, K-1, ..., 0``. Every level-keyed or level-indexed setting below
+    uses that number.
+
+    ``K`` follows from the grid and the chunk core, not from the
+    configuration, so a level number names the coarsest level only once the
+    pyramid is known. Settings for the coarsest level whatever the depth are
+    the ``coarsest_*`` ones.
+    """
+
+    caps: tuple[int, ...] = (2, 3, 4, 6, 8)
+    """Maximum template passes per level, indexed by level: ``caps[0]`` is full
+    resolution, ``caps[1]`` the level above it, and so on towards the
+    coarsest. A pyramid deeper than the list repeats its last value for the
+    extra coarse levels, so the last entry is the budget of the coarsest
+    level and of anything coarser."""
+    coarsest_stages: tuple[StageSpec, ...] = DEFAULT_COARSEST_STAGES
+    """Stages of the coarsest level, the single chunk where the whole-volume
+    alignment is estimated. Unseeded and unclamped by any halo, so it may use
+    a deep in-chunk pyramid."""
     seeded_stages: tuple[StageSpec, ...] = DEFAULT_SEEDED_STAGES
+    """Stages of every other level, each seeded from the level above it."""
     residual_frac: float = 0.5
     """Stop a level once its residual falls below this fraction of the next
     level's clamp, so the finer level's halo can absorb what is left."""
@@ -258,94 +290,127 @@ class LevelPolicy:
     clear. The 99th percentile still ignores nothing that matters and does
     converge."""
     shape_update_step: float = 0.25
-    sharpen_laplacian_levels: tuple[int, ...] = (0, 1)
+    sharpen_laplacian_levels: tuple[int, ...] | None = None
+    """Levels whose updated template is unsharp-masked against the blur of
+    averaging. ``None`` is the two coarsest levels, ``K`` and ``K - 1``,
+    whatever the depth; a list names levels by number (``0`` = full
+    resolution)."""
     min_tissue_fraction: float = 0.02
     """Chunks with less foreground than this emit their seed unchanged."""
-    level0_max_disp_frac: float = 0.25
-    """Level 0 is a single chunk, so no halo bounds it. This bounds it by the
-    aperture instead: a displacement approaching the size of the volume cannot
-    be a real correspondence, whatever the similarity says."""
+    coarsest_max_disp_frac: float = 0.25
+    """The coarsest level is a single chunk, so no halo bounds it. This bounds
+    it by the aperture instead: a displacement approaching the size of the
+    volume cannot be a real correspondence, whatever the similarity says.
+    Applies to any level that fits one chunk, which only the coarsest does."""
+    require_subvoxel: bool = False
+    """With a template held fixed, stop a level only when its residual is
+    sub-voxel (or at the cap), not as soon as it would fit the next level's
+    halo. For a weak similarity signal at the coarse levels, where the point is
+    to converge there before handing a stable field down."""
+    anneal: dict[int, dict[str, Any]] = field(default_factory=dict)
+    """Per-level smoothing schedule over the passes of that level, keyed by
+    level number (``0`` = full resolution): ``{"smooth_grad_sigma": [start, end], "smooth_warp_sigma":
+    [start, end], "passes": N}``. Pass ``k`` uses ``start * (end / start) **
+    min(k / (N - 1), 1)`` -- geometric from heavy to light over the first N
+    passes, then held -- on every deformable stage of the level, after
+    ``level_params``. Heavy smoothing first keeps the early passes, where a weak
+    similarity is least reliable, from warping to extremes; the later passes
+    refine with less."""
 
     level_stages: dict[int, tuple[StageSpec, ...]] = field(default_factory=dict)
-    """Per-level replacement of the whole stage list, keyed by level index.
+    """Per-level replacement of the whole stage list, keyed by level number
+    (``0`` = full resolution).
 
     The escape hatch for a level that needs a different pipeline rather than a
-    different tuning: an extra affine stage at level 1, say. Overrides
-    ``level0_stages`` and ``seeded_stages`` for the levels it names."""
+    different tuning: an extra affine stage at the level below the coarsest,
+    say. Overrides ``coarsest_stages`` and ``seeded_stages`` for the levels
+    it names."""
 
     level_params: dict[int, dict[str, Any]] = field(default_factory=dict)
     """Per-level tuning applied on top of whichever stage list a level
-    resolves to, keyed by level index.
+    resolves to, keyed by level number (``0`` = full resolution).
 
     This is the knob for structures that need different regularisation at
     different resolutions: weaker smoothing and more iterations at the fine
-    levels where cerebellar foliation lives, stiffer at the coarse levels that
-    carry the global shape. Only :data:`TUNABLE_STAGE_FIELDS` may be set, and
-    the patch reaches every non-moments stage of that level."""
+    levels (the low numbers) where cerebellar foliation lives, stiffer at the
+    coarse levels that carry the global shape. Only
+    :data:`TUNABLE_STAGE_FIELDS` may be set, and the patch reaches every
+    non-moments stage of that level."""
 
     run: tuple[int | float, ...] | str | None = None
     """Which levels to run. ``None`` or ``"all"`` runs every level.
 
-    A tuple names levels: an ``int`` is a level index and a ``float`` is a
-    spacing in millimetres, matched against the pyramid when it is known.
-    ``"listed"`` runs level 0 plus every level named in ``level_params`` or
-    ``level_stages``. Leaving out the finest levels stops the run early;
-    leaving out a middle level hands the solution straight to the next level
-    that does run. Level 0 always has to run, because the global alignment is
-    estimated there and nothing finer can recover it."""
+    A tuple names levels: an ``int`` is a level number (``0`` = full
+    resolution) and a ``float`` is a spacing in millimetres, matched against
+    the pyramid when it is known. ``"listed"`` runs the coarsest level plus
+    every level named in ``level_params`` or ``level_stages``. Leaving out the
+    finest levels (the lowest numbers) stops the run early; leaving out a
+    middle level hands the solution straight to the next finer level that
+    does run. The coarsest level always has to run, because the global
+    alignment is estimated there and nothing finer can recover it."""
 
     stop_at: int | float | None = None
-    """The finest level to run, as a level index or a spacing in millimetres.
+    """The finest level to run, as a level number (``0`` = full resolution)
+    or a spacing in millimetres.
 
     Early stopping without listing every level: ``"200um"`` runs every level
     ``run`` selects down to 200 um and stops there, writing the final fields
-    at that resolution. A later run with a finer ``stop_at`` carries on from
-    where this one stopped."""
+    at that resolution; ``2`` stops at level 2, four times the native
+    spacing. A later run with a finer ``stop_at`` (a smaller number or
+    spacing) carries on from where this one stopped."""
 
     def run_levels(self, grids: Sequence[GridSpec]) -> tuple[int, ...]:
-        """Resolve ``run`` and ``stop_at`` against a pyramid into level indices."""
+        """Resolve ``run`` and ``stop_at`` against a pyramid into levels.
+
+        ``grids`` is indexed by level, as :func:`chunkreg.grid.pyramid`
+        returns it. The levels come back in the order they run: coarsest
+        first, finest last.
+        """
+        coarsest = len(grids) - 1
         source = "levels.run"
         if self.run is None or self.run == "all":
             chosen = set(range(len(grids)))
         else:
             entries: tuple = tuple(self.run)
             if self.run == "listed":
-                entries = (0, *self.tuned_levels())
-                source = "levels.run 'listed' (level 0 plus the tuned levels)"
+                entries = (coarsest, *self.tuned_levels())
+                source = "levels.run 'listed' (the coarsest level plus the tuned levels)"
             chosen = {_find_level(grids, e, source) for e in entries}
         if self.stop_at is not None:
             last = _find_level(grids, self.stop_at, "levels.stop_at")
-            chosen = {k for k in chosen if k <= last}
-        if 0 not in chosen:
+            chosen = {k for k in chosen if k >= last}
+        if coarsest not in chosen:
             raise ConfigError(
-                f"{source} leaves out level 0 ({grids[0].spacing_mm * 1000:g} um). "
-                f"Level 0 is where the whole-volume alignment is estimated, so "
-                f"every run starts there. A run that stopped part way resumes "
-                f"on its own when started again."
+                f"{source} leaves out level {coarsest} "
+                f"({grids[coarsest].spacing_mm * 1000:g} um), the coarsest. The "
+                f"coarsest level is where the whole-volume alignment is "
+                f"estimated, so every run starts there. A run that stopped part "
+                f"way resumes on its own when started again."
             )
-        return tuple(sorted(chosen))
+        return tuple(sorted(chosen, reverse=True))
 
     def cap(self, level: int) -> int:
+        """The pass budget of a level: ``caps[level]``, or the last cap past the end."""
         if not self.caps:
             return 1
-        return int(self.caps[min(level, len(self.caps) - 1)])
+        return int(self.caps[min(int(level), len(self.caps) - 1)])
 
-    def base_stages(self, level: int) -> tuple[StageSpec, ...]:
-        """The stage list for a level, before per-level tuning is applied."""
+    def base_stages(self, level: int, *, coarsest: int) -> tuple[StageSpec, ...]:
+        """The stage list for a level, before per-level tuning is applied.
+
+        ``coarsest`` is the coarsest level of the run's pyramid, ``K``.
+        """
+        return self._base(level, int(level) == int(coarsest))
+
+    def _base(self, level: int, is_coarsest: bool) -> tuple[StageSpec, ...]:
         override = self.level_stages.get(int(level))
         if override:
             return tuple(override)
-        return self.level0_stages if int(level) == 0 else self.seeded_stages
+        return self.coarsest_stages if is_coarsest else self.seeded_stages
 
-    def stages(self, level: int) -> tuple[StageSpec, ...]:
-        """The stage list a level actually runs.
-
-        Resolution order is ``level_stages[level]``, else ``level0_stages`` at
-        level 0 or ``seeded_stages`` below it, with ``level_params[level]``
-        patched over the result.
-        """
+    def _tuned(self, level: int, is_coarsest: bool) -> tuple[StageSpec, ...]:
         k = int(level)
-        base = self.base_stages(k)
+        base = self._base(k, is_coarsest)
         patch = self.level_params.get(k)
         if not patch:
             return base
@@ -354,9 +419,47 @@ class LevelPolicy:
         except ConfigError as exc:
             raise ConfigError(f"level {k}: {exc}") from None
 
+    def stages(self, level: int, *, coarsest: int) -> tuple[StageSpec, ...]:
+        """The stage list a level actually runs.
+
+        Resolution order is ``level_stages[level]``, else ``coarsest_stages``
+        at the coarsest level (``level == coarsest``) or ``seeded_stages``
+        below it, with ``level_params[level]`` patched over the result.
+        ``coarsest`` is ``K``, the coarsest level of the run's pyramid: it is
+        what the level number is compared against, since it depends on the
+        grid rather than on the configuration.
+        """
+        return self._tuned(level, int(level) == int(coarsest))
+
+    def stages_for_pass(
+        self, level: int, iteration: int, *, coarsest: int
+    ) -> tuple[StageSpec, ...]:
+        """:meth:`stages` with this level's ``anneal`` schedule applied for pass ``iteration``."""
+        stages = self.stages(level, coarsest=coarsest)
+        sched = self.anneal.get(int(level))
+        if not sched:
+            return stages
+        n = int(sched.get("passes", 1))
+        t = 1.0 if n <= 1 else min(max(int(iteration), 0) / (n - 1), 1.0)
+        patch = {}
+        for key in ("smooth_grad_sigma", "smooth_warp_sigma"):
+            if key in sched:
+                start, end = (float(x) for x in sched[key])
+                patch[key] = start * (end / start) ** t
+        return tuple(replace(s, **patch) if s.is_deformable else s for s in stages)
+
     def tuned_levels(self) -> tuple[int, ...]:
-        """Levels named by a per-level override, in order."""
+        """Levels named by a per-level override, in ascending order."""
         return tuple(sorted(set(self.level_stages) | set(self.level_params)))
+
+    def sharpens(self, level: int, *, coarsest: int) -> bool:
+        """Is this level's updated template unsharp-masked?
+
+        ``sharpen_laplacian_levels``, or by default the two coarsest levels.
+        """
+        if self.sharpen_laplacian_levels is None:
+            return int(level) >= int(coarsest) - 1
+        return int(level) in self.sharpen_laplacian_levels
 
 
 @dataclass(frozen=True)
@@ -377,7 +480,9 @@ class RetryPolicy:
 
 @dataclass(frozen=True)
 class Retention:
-    keep_history_levels: tuple[int, ...] = (0, 1)
+    keep_history_levels: tuple[int, ...] | None = None
+    """Levels whose history to keep, by number (``0`` = full resolution).
+    ``None`` is the two coarsest levels."""
     delete_task_arrays: bool = True
     delete_accumulators: bool = True
 
@@ -558,6 +663,7 @@ class RunConfig:
         return Path(self.root)
 
     def level_dir(self, level: int) -> Path:
+        """``levels/L<l>``: ``L0`` is full resolution, the highest the coarsest."""
         return self.root_path / "levels" / f"L{level}"
 
     def template_path(self, level: int) -> Path:
@@ -590,11 +696,76 @@ class RunConfig:
     def seed_marker_path(self, level: int) -> Path:
         """Written once a level has its starting template and fields.
 
-        Seeding level 0 and promoting into a finer level both overwrite the
-        level's fields, so a resumed run must never do either twice. This is
-        how it knows.
+        Seeding the coarsest level and promoting into a finer level both
+        overwrite the level's fields, so a resumed run must never do either
+        twice. This is how it knows.
         """
         return self.level_dir(level) / "seeded.json"
+
+    @property
+    def level_order_path(self) -> Path:
+        """The record of how this run root numbers its levels.
+
+        Written when a run first creates ``levels/``. A root whose ``levels/``
+        has progress but no such record was made under the earlier
+        coarse-first numbering, where ``L0`` was the coarsest level.
+        """
+        return self.root_path / "levels" / "level_order.json"
+
+    def check_level_order(self) -> None:
+        """Refuse a run root made under the earlier coarse-first numbering.
+
+        There, ``levels/L0`` was the coarsest level and ``L<K>`` full
+        resolution, the reverse of now, and nothing else on disk says which
+        way round a root is. Resuming one would replay its records against
+        the wrong resolutions. A root with no progress, or one this version
+        made, passes.
+        """
+        if self.level_order_path.exists():
+            try:
+                order = json.loads(
+                    self.level_order_path.read_text(encoding="utf-8")
+                ).get("level_order")
+            except (OSError, ValueError, AttributeError):
+                order = None
+            if order != LEVEL_ORDER:
+                raise ConfigError(
+                    f"{self.level_order_path} records level_order {order!r}; "
+                    f"this version of chunkreg only reads {LEVEL_ORDER!r} "
+                    f"(level 0 is full resolution)"
+                )
+            return
+        levels = self.root_path / "levels"
+        if not levels.is_dir() or not any(levels.glob("L*")):
+            return  # nothing has run here yet
+        raise ConfigError(
+            f"{self.root_path} holds a run made with the earlier coarse-first "
+            f"level numbering: there levels/L0 is the coarsest level and the "
+            f"highest L is full resolution, the reverse of this version, where "
+            f"level 0 is full resolution as in OME-Zarr. Its progress cannot "
+            f"be resumed here. Finish it with the previous chunkreg version, "
+            f"or start a new run root (a different 'root' in the config)."
+        )
+
+    def record_level_order(self) -> None:
+        """Mark this run root as numbering its levels the OME way."""
+        if self.level_order_path.exists():
+            return
+        self.level_order_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.level_order_path.with_name(self.level_order_path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "level_order": LEVEL_ORDER,
+                    "meaning": "levels/L<l> is pyramid level l, which is OME-Zarr "
+                    "dataset l of a subject store: L0 is full resolution, the "
+                    "highest l the coarsest",
+                },
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(self.level_order_path)
 
     @property
     def grid_record_path(self) -> Path:
@@ -651,8 +822,15 @@ class RunConfig:
         raise KeyError(f"no subject {subject!r} in this run")
 
     # -- validation --------------------------------------------------------- #
-    def validate(self) -> list[str]:
-        """Raise on anything unrunnable; return non-fatal warnings."""
+    def validate(self, n_levels: int | None = None) -> list[str]:
+        """Raise on anything unrunnable; return non-fatal warnings.
+
+        ``n_levels`` is the depth of the pyramid the run will use, when it is
+        known. A level number only names the coarsest level, whose stages the
+        halo does not bound, once the depth is known; without it a per-level
+        override that would only be valid at the coarsest level is reported
+        as a warning here and checked exactly once the run has its pyramid.
+        """
         warnings: list[str] = []
         p = self.profile
 
@@ -669,62 +847,14 @@ class RunConfig:
                 f"field."
             )
 
-        # Level 0 and a generic seeded level always exist; every level named by
-        # a per-level override is resolved here too, so a bad patch fails at
-        # load time rather than part way through a run.
-        to_check = [0, 1, *self.levels.tuned_levels()]
-        for level in sorted(set(to_check)):
-            stages = self.levels.stages(level)  # raises on a bad override
-            if not stages:
-                raise ConfigError(f"level {level} has no stages")
-            if not any(s.is_deformable for s in stages):
-                warnings.append(
-                    f"level {level} has no deformable stage; it can only "
-                    f"produce a linear alignment"
-                )
-            if level == 0:
-                continue
-            for s in stages:
-                if s.is_deformable and s.s_max > p.s_max:
-                    raise ConfigError(
-                        f"level {level}: stage {s.kind!r} uses scales up to "
-                        f"{s.s_max} but the profile budgets its halo for "
-                        f"s_max={p.s_max}. Either set profile scales to "
-                        f"{s.scales} (which would leave a clamp of "
-                        f"{p.halo - p.support_vox(s.s_max) - p.r_f:.1f} "
-                        f"voxels) or lower the stage scales."
-                    )
-                if not s.is_deformable:
-                    continue
-                # The halo is budgeted from the profile's kernel and sigmas. A
-                # stage that asks for a wider kernel or more smoothing reaches
-                # further than that budget, and the clamp, which is computed
-                # from the profile, then promises more displacement than the
-                # halo can really support.
-                need = s.s_max * (
-                    (s.cc_kernel - 1) / 2.0
-                    + 3.0 * max(s.smooth_grad_sigma, s.smooth_warp_sigma)
-                )
-                budget = p.support_vox()
-                if need > budget + 1e-9:
-                    left = p.halo - need - p.r_f
-                    msg = (
-                        f"level {level}: stage {s.kind!r} (cc_kernel "
-                        f"{s.cc_kernel}, sigmas {s.smooth_grad_sigma:g}/"
-                        f"{s.smooth_warp_sigma:g}, scales up to {s.s_max}) needs "
-                        f"{need:.1f} voxels of halo for its kernel and smoothing, "
-                        f"but the profile budgets {budget:.1f}. The clamp of "
-                        f"{p.d_max_vox():.1f} voxels is overstated; only about "
-                        f"{left:.1f} are really covered. Lower the kernel or "
-                        f"sigmas, or raise the profile's k, sigma_g, sigma_w and "
-                        f"halo to match."
-                    )
-                    # Refuse only when the halo covers no displacement at all;
-                    # a smaller real clamp than advertised is a warning, as
-                    # small test profiles run with default stages hit it.
-                    if left <= 0:
-                        raise ConfigError(msg)
-                    warnings.append(msg)
+        # The coarsest level's stages and the generic seeded stages always
+        # exist; every level named by a per-level override is resolved here
+        # too, so a bad patch fails at load time rather than part way through
+        # a run.
+        self._check_stages("coarsest_stages", self.levels.coarsest_stages, True, warnings)
+        self._check_stages("seeded_stages", self.levels.seeded_stages, False, warnings)
+        coarsest = None if n_levels is None else int(n_levels) - 1
+        self._check_tuned_levels(coarsest, warnings)
 
         run = self.levels.run
         if isinstance(run, str) and run not in ("all", "listed"):
@@ -736,12 +866,16 @@ class RunConfig:
                 raise ConfigError("levels.run is empty; leave it out to run every level")
             if any(isinstance(e, int) and e < 0 for e in run):
                 raise ConfigError(f"levels.run has a negative level: {list(run)}")
-            if all(isinstance(e, int) for e in run) and 0 not in run:
+            if (
+                coarsest is not None
+                and all(isinstance(e, int) for e in run)
+                and coarsest not in run
+            ):
                 raise ConfigError(
-                    f"levels.run {list(run)} leaves out level 0. Level 0 is where "
-                    f"the whole-volume alignment is estimated, so every run "
-                    f"starts there. A run that stopped part way resumes on its "
-                    f"own when started again."
+                    f"levels.run {list(run)} leaves out level {coarsest}, the "
+                    f"coarsest. The coarsest level is where the whole-volume "
+                    f"alignment is estimated, so every run starts there. A run "
+                    f"that stopped part way resumes on its own when started again."
                 )
 
         for level, spec in sorted(self.levels.level_stages.items()):
@@ -870,6 +1004,113 @@ class RunConfig:
             raise ConfigError(f"gpus must be 'all' or a positive integer, got {self.gpus!r}")
 
         return warnings
+
+    def check_level_overrides(self, n_levels: int) -> list[str]:
+        """Check every per-level override against a pyramid of known depth.
+
+        The part of :meth:`validate` that needs the depth: with it, a level
+        number is the coarsest level or it is not, and each override is held
+        to exactly the rules of the level it names. The run calls this once
+        it has its pyramid, before any work. Returns the warnings.
+        """
+        warnings: list[str] = []
+        self._check_tuned_levels(int(n_levels) - 1, warnings)
+        return warnings
+
+    def _check_tuned_levels(self, coarsest: int | None, warnings: list[str]) -> None:
+        for level in self.levels.tuned_levels():
+            where = f"level {level}"
+            if coarsest is not None:
+                is_top = level == coarsest
+                self._check_stages(
+                    where, self.levels._tuned(level, is_top), is_top, warnings
+                )
+                continue
+            # The depth is not known yet, so the level is taken as a seeded
+            # one, which it is for every pyramid deeper than it. Only if it is
+            # unrunnable there but would be fine as the coarsest level is the
+            # verdict deferred to the run, which knows the depth.
+            try:
+                self._check_stages(
+                    where, self.levels._tuned(level, False), False, warnings
+                )
+            except ConfigError as as_seeded:
+                as_top: list[str] = []
+                try:
+                    self._check_stages(
+                        where, self.levels._tuned(level, True), True, as_top
+                    )
+                except ConfigError:
+                    raise as_seeded from None
+                warnings.append(
+                    f"{where}'s override is only valid if level {level} is the "
+                    f"coarsest level of the pyramid ({as_seeded}); it is checked "
+                    f"again once the run knows the pyramid depth"
+                )
+
+    def _check_stages(
+        self,
+        where: str,
+        stages: Sequence[StageSpec],
+        coarsest: bool,
+        warnings: list[str],
+    ) -> None:
+        """Check one level's stage list against the profile's halo budget.
+
+        The coarsest level is a single chunk with no halo, so only seeded
+        levels are held to the budget.
+        """
+        p = self.profile
+        if not stages:
+            raise ConfigError(f"{where} has no stages")
+        if not any(s.is_deformable for s in stages):
+            warnings.append(
+                f"{where} has no deformable stage; it can only produce a "
+                f"linear alignment"
+            )
+        if coarsest:
+            return
+        for s in stages:
+            if s.is_deformable and s.s_max > p.s_max:
+                raise ConfigError(
+                    f"{where}: stage {s.kind!r} uses scales up to "
+                    f"{s.s_max} but the profile budgets its halo for "
+                    f"s_max={p.s_max}. Either set profile scales to "
+                    f"{s.scales} (which would leave a clamp of "
+                    f"{p.halo - p.support_vox(s.s_max) - p.r_f:.1f} "
+                    f"voxels) or lower the stage scales."
+                )
+            if not s.is_deformable:
+                continue
+            # The halo is budgeted from the profile's kernel and sigmas. A
+            # stage that asks for a wider kernel or more smoothing reaches
+            # further than that budget, and the clamp, which is computed
+            # from the profile, then promises more displacement than the
+            # halo can really support.
+            need = s.s_max * (
+                (s.cc_kernel - 1) / 2.0
+                + 3.0 * max(s.smooth_grad_sigma, s.smooth_warp_sigma)
+            )
+            budget = p.support_vox()
+            if need > budget + 1e-9:
+                left = p.halo - need - p.r_f
+                msg = (
+                    f"{where}: stage {s.kind!r} (cc_kernel "
+                    f"{s.cc_kernel}, sigmas {s.smooth_grad_sigma:g}/"
+                    f"{s.smooth_warp_sigma:g}, scales up to {s.s_max}) needs "
+                    f"{need:.1f} voxels of halo for its kernel and smoothing, "
+                    f"but the profile budgets {budget:.1f}. The clamp of "
+                    f"{p.d_max_vox():.1f} voxels is overstated; only about "
+                    f"{left:.1f} are really covered. Lower the kernel or "
+                    f"sigmas, or raise the profile's k, sigma_g, sigma_w and "
+                    f"halo to match."
+                )
+                # Refuse only when the halo covers no displacement at all;
+                # a smaller real clamp than advertised is a warning, as
+                # small test profiles run with default stages hit it.
+                if left <= 0:
+                    raise ConfigError(msg)
+                warnings.append(msg)
 
     # -- serialisation ------------------------------------------------------ #
     def to_json(self) -> dict:
@@ -1026,18 +1267,20 @@ class RunConfig:
             )
             if getattr(self.levels, attr) != getattr(default, attr)
         }
+        if self.levels.require_subvoxel:
+            stop["require_subvoxel"] = True
         if stop:
             out["stop"] = stop
 
         for key in (
             "caps", "shape_update_step", "sharpen_laplacian_levels",
-            "min_tissue_fraction", "level0_max_disp_frac",
+            "min_tissue_fraction", "coarsest_max_disp_frac",
         ):
             value = getattr(self.levels, key)
             if value != getattr(default, key):
                 out[key] = list(value) if isinstance(value, tuple) else value
 
-        for key in ("level0_stages", "seeded_stages"):
+        for key in ("coarsest_stages", "seeded_stages"):
             value = getattr(self.levels, key)
             if value != getattr(default, key):
                 out[key] = [st.to_json() for st in value]
@@ -1051,6 +1294,8 @@ class RunConfig:
             out["level_params"] = {
                 str(k): dict(v) for k, v in sorted(self.levels.level_params.items())
             }
+        if self.levels.anneal:
+            out["anneal"] = {str(k): dict(v) for k, v in sorted(self.levels.anneal.items())}
 
         if self.levels.run is not None:
             out["run"] = (
@@ -1071,11 +1316,17 @@ def _features_config_block(profile: Profile) -> dict:
     ``sample_channels`` is stated even when it is null, because leaving the key
     out asks for the default rather than for "no sampling".
     """
+    from .features import anatomix_window
+
     spec, _, sample = str(profile.features).partition("@")
-    return {
+    out = {
         "mind": "mindssc" in spec.split("+"),
         "sample_channels": int(sample) if sample else None,
     }
+    windows = [w for w in (anatomix_window(p) for p in spec.split("+")) if w is not None]
+    if windows:
+        out["anatomix_window"] = windows[0]
+    return out
 
 
 def _level_ref_json(ref: int | float):
@@ -1107,8 +1358,9 @@ def unused_level_overrides(cfg: "RunConfig", n_levels: int) -> list[int]:
 
     The pyramid depth follows from the grid and the chunk core, so it is not
     known until a subject has been ingested. A key for level 7 of a five-level
-    run is silently inert, which is exactly the kind of tuning mistake that
-    looks like the tuning simply not working, so the CLI reports it.
+    run (levels 0 to 4, 0 being full resolution) is silently inert, which is
+    exactly the kind of tuning mistake that looks like the tuning simply not
+    working, so the CLI reports it.
     """
     return [k for k in cfg.levels.tuned_levels() if k >= int(n_levels)]
 
@@ -1123,7 +1375,7 @@ def _stages(obj, default: tuple[StageSpec, ...]) -> tuple[StageSpec, ...]:
 
 
 def _level_key(key, what: str) -> int:
-    """Read a level index from a mapping key.
+    """Read a level number from a mapping key (``0`` = full resolution).
 
     JSON has no integer keys, so ``{"3": {...}}`` is the only spelling
     available there and has to mean the same as YAML's ``{3: {...}}``.
@@ -1132,7 +1384,8 @@ def _level_key(key, what: str) -> int:
         level = int(key)
     except (TypeError, ValueError):
         raise ConfigError(
-            f"{what} is keyed by level index; {key!r} is not one"
+            f"{what} is keyed by level number (0 = full resolution); "
+            f"{key!r} is not one"
         ) from None
     if level < 0:
         raise ConfigError(f"{what} has a negative level {level}")
@@ -1144,7 +1397,10 @@ _SPACING_RE = re.compile(r"^([0-9]*\.?[0-9]+(?:e-?[0-9]+)?)\s*(um|µm|microns?|m
 
 
 def parse_level_ref(e, where: str = "levels.run") -> int | float:
-    """Read one level reference: an index (``2``) or a spacing (``"200um"``).
+    """Read one level reference: a number (``2``) or a spacing (``"200um"``).
+
+    A number is a level as OME-Zarr numbers it: ``0`` is full resolution and
+    level ``l`` has ``2**l`` times its spacing.
 
     A spacing comes back as millimetres in a ``float``, an index as an
     ``int``. A bare decimal is refused: ``0.2`` could be a spacing or a typo for
@@ -1158,8 +1414,9 @@ def parse_level_ref(e, where: str = "levels.run") -> int | float:
         if e.is_integer():
             return int(e)
         raise ConfigError(
-            f"{where} entry {e!r} is ambiguous; write a level index such "
-            f"as 2, or a spacing with its unit such as \"200um\""
+            f"{where} entry {e!r} is ambiguous; write a level number such "
+            f"as 2 (0 is full resolution), or a spacing with its unit such as "
+            f"\"200um\""
         )
     if isinstance(e, str):
         text = e.strip().lower()
@@ -1169,14 +1426,15 @@ def parse_level_ref(e, where: str = "levels.run") -> int | float:
         if m and float(m.group(1)) > 0:
             return float(m.group(1)) * _SPACING_UNITS[m.group(2)]
         raise ConfigError(
-            f"{where} entry {e!r} is not a level; use an index such "
-            f"as 2 or a spacing such as \"200um\" or \"0.2mm\""
+            f"{where} entry {e!r} is not a level; use a level number such "
+            f"as 2 (0 is full resolution) or a spacing such as \"200um\" or "
+            f"\"0.2mm\""
         )
     raise ConfigError(f"{where} entry {e!r} is not a level")
 
 
 def _find_level(grids: Sequence[GridSpec], ref: int | float, where: str) -> int:
-    """The pyramid index a level reference names."""
+    """The level a level reference names. ``grids`` is indexed by level."""
     ladder = ", ".join(f"{k} = {g.spacing_mm * 1000:g} um" for k, g in enumerate(grids))
     if isinstance(ref, float):
         for k, g in enumerate(grids):
@@ -1263,14 +1521,33 @@ def _with_features(profile: Profile, block) -> Profile:
     count for anatomix profiles whenever MIND makes the total larger, so
     adding MIND leaves device memory and per-pass cost where the profile put
     them.
+
+    ``anatomix_window`` runs anatomix in sliding windows of that many voxels
+    (a multiple of 32, at least 64) instead of over a whole chunk at once, so
+    each channel sees a few centimetres of context rather than the whole brain.
+    Between different subjects at coarse levels that is what makes the channels
+    agree locally (BigBrain vs HiP-CT at 640 um: local agreement 0.30 with
+    64-voxel windows vs 0.12 whole-volume). ``null`` or absent keeps one pass.
     """
-    from .features import describe
+    from .features import anatomix_window, describe
 
     feat = dict(block or {})
-    _check_keys(feat, {"mind", "sample_channels"}, "the 'features' block")
+    _check_keys(feat, {"mind", "sample_channels", "anatomix_window"}, "the 'features' block")
     spec, _, _ = str(profile.features).partition("@")
     parts = [p for p in spec.split("+") if p]
-    has_anatomix = any(p == "anatomix" for p in parts)
+    is_anatomix = lambda p: p == "anatomix" or anatomix_window(p) is not None
+    has_anatomix = any(is_anatomix(p) for p in parts)
+    if "anatomix_window" in feat:
+        win = feat["anatomix_window"]
+        if win is not None:
+            win = int(win)
+            if win < 64 or win % 32:
+                raise ConfigError(
+                    f"features.anatomix_window must be a multiple of 32 and at least 64, got {win}"
+                )
+        if not has_anatomix and win is not None:
+            raise ConfigError("features.anatomix_window is set, but this profile has no anatomix channels")
+        parts = [("anatomix" if win is None else f"anatomix:w{win}") if is_anatomix(p) else p for p in parts]
     mind = bool(feat.get("mind", has_anatomix))
     if mind and "mindssc" not in parts:
         parts.append("mindssc")
@@ -1388,20 +1665,37 @@ def load_config(source: str | Path | dict) -> RunConfig:
 
     lv = dict(raw.get("levels") or {})
     stop = dict(lv.pop("stop", None) or {})
+    _refuse_renamed_level_keys(lv)
     _check_keys(
         lv,
         {
-            "caps", "level0_stages", "seeded_stages", "level_stages",
+            "caps", "coarsest_stages", "seeded_stages", "level_stages",
             "level_params", "shape_update_step", "sharpen_laplacian_levels",
-            "min_tissue_fraction", "level0_max_disp_frac", "run", "stop_at",
+            "min_tissue_fraction", "coarsest_max_disp_frac", "run", "stop_at", "anneal",
         },
         "the 'levels' block",
     )
     _check_keys(
         stop,
-        {"residual_frac", "ubar_vox", "residual_vox", "percentile"},
+        {"residual_frac", "ubar_vox", "residual_vox", "percentile", "require_subvoxel"},
         "'levels.stop'",
     )
+    anneal = {}
+    for k, v in (lv.get("anneal") or {}).items():
+        level = _level_key(k, "levels.anneal")
+        if not isinstance(v, dict):
+            raise ConfigError(f"levels.anneal[{level}] must be a mapping, got {v!r}")
+        _check_keys(v, {"smooth_grad_sigma", "smooth_warp_sigma", "passes"}, f"levels.anneal[{level}]")
+        entry = {"passes": int(v.get("passes", 1))}
+        if entry["passes"] < 1:
+            raise ConfigError(f"levels.anneal[{level}].passes must be at least 1")
+        for key in ("smooth_grad_sigma", "smooth_warp_sigma"):
+            if key in v:
+                pair = [float(x) for x in v[key]]
+                if len(pair) != 2 or min(pair) <= 0:
+                    raise ConfigError(f"levels.anneal[{level}].{key} must be [start, end], both positive")
+                entry[key] = pair
+        anneal[level] = entry
 
     level_stages = {
         _level_key(k, "levels.level_stages"): _stages(v, ())
@@ -1417,9 +1711,10 @@ def load_config(source: str | Path | dict) -> RunConfig:
             )
         level_params[level] = dict(v)
 
+    sharpen = lv.get("sharpen_laplacian_levels")
     policy = LevelPolicy(
         caps=tuple(lv.get("caps", LevelPolicy.caps)),
-        level0_stages=_stages(lv.get("level0_stages"), DEFAULT_LEVEL0_STAGES),
+        coarsest_stages=_stages(lv.get("coarsest_stages"), DEFAULT_COARSEST_STAGES),
         seeded_stages=_stages(lv.get("seeded_stages"), DEFAULT_SEEDED_STAGES),
         residual_frac=float(stop.get("residual_frac", LevelPolicy.residual_frac)),
         ubar_vox=float(stop.get("ubar_vox", LevelPolicy.ubar_vox)),
@@ -1428,15 +1723,17 @@ def load_config(source: str | Path | dict) -> RunConfig:
         shape_update_step=float(
             lv.get("shape_update_step", LevelPolicy.shape_update_step)
         ),
-        sharpen_laplacian_levels=tuple(
-            lv.get("sharpen_laplacian_levels", LevelPolicy.sharpen_laplacian_levels)
+        sharpen_laplacian_levels=(
+            None if sharpen is None else tuple(int(v) for v in sharpen)
         ),
         min_tissue_fraction=float(
             lv.get("min_tissue_fraction", LevelPolicy.min_tissue_fraction)
         ),
-        level0_max_disp_frac=float(
-            lv.get("level0_max_disp_frac", LevelPolicy.level0_max_disp_frac)
+        coarsest_max_disp_frac=float(
+            lv.get("coarsest_max_disp_frac", LevelPolicy.coarsest_max_disp_frac)
         ),
+        require_subvoxel=bool(stop.get("require_subvoxel", LevelPolicy.require_subvoxel)),
+        anneal=anneal,
         level_stages=level_stages,
         level_params=level_params,
         run=_run_spec(lv.get("run")),
@@ -1467,10 +1764,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
     )
 
     rn = dict(raw.get("retention") or {})
+    keep = rn.get("keep_history_levels")
     retention = Retention(
-        keep_history_levels=tuple(
-            rn.get("keep_history_levels", Retention.keep_history_levels)
-        ),
+        keep_history_levels=None if keep is None else tuple(int(v) for v in keep),
         delete_task_arrays=bool(
             rn.get("delete_task_arrays", Retention.delete_task_arrays)
         ),
@@ -1548,6 +1844,30 @@ def load_config(source: str | Path | dict) -> RunConfig:
     )
     cfg.validate()
     return cfg
+
+
+def _refuse_renamed_level_keys(lv: dict) -> None:
+    """Reject the ``levels`` keys of the coarse-first level numbering.
+
+    Not aliased: a config that still says ``level0_*`` was written when level
+    0 was the coarsest, so its other level numbers count the old way too, and
+    silently accepting the key would run every one of them at the wrong
+    resolution.
+    """
+    old = [k for k in _RENAMED_LEVEL_KEYS if k in lv]
+    if not old:
+        return
+    renames = ", ".join(f"levels.{k} -> levels.{_RENAMED_LEVEL_KEYS[k]}" for k in old)
+    raise ConfigError(
+        f"{renames}: renamed with the level numbering. Levels are now numbered "
+        f"as OME-Zarr numbers its datasets: level 0 is full resolution and the "
+        f"highest level is the coarsest (it was the other way round). Rename "
+        f"the key, and renumber every level in the config to match: the keys "
+        f"of level_params, level_stages and anneal, the entries of run, "
+        f"sharpen_laplacian_levels and retention.keep_history_levels, an "
+        f"integer stop_at (a spacing such as \"200um\" needs no change), and "
+        f"caps, which is now listed from full resolution towards the coarsest."
+    )
 
 
 def _workers_per_gpu(value) -> int | str:

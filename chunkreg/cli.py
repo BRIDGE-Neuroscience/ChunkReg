@@ -76,22 +76,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None, help="where to write calibration.json")
     p.add_argument(
         "--stop-at", default=None, metavar="LEVEL",
-        help="plan as if the run stops at this level: an index such as 3 or a "
-             "spacing such as 200um (overrides levels.stop_at)",
+        help="plan as if the run stops at this level: a level number such as "
+             "2 (0 is full resolution, each step up halves it) or a spacing "
+             "such as 200um (overrides levels.stop_at)",
     )
 
     p = sub.add_parser("run", help="stage two: build the unbiased group template")
     p.add_argument("config")
     p.add_argument(
         "--stop-at", default=None, metavar="LEVEL",
-        help="finest level to run: an index such as 3 or a spacing such as "
-             "200um (overrides levels.stop_at). Running again with a finer "
-             "level carries on from here",
+        help="finest level to run: a level number such as 2 (0 is full "
+             "resolution, each step up halves it, the highest is the "
+             "coarsest) or a spacing such as 200um (overrides "
+             "levels.stop_at). Running again with a finer level carries on "
+             "from here",
     )
     p.add_argument(
         "--from-level", type=int, default=None, metavar="N",
-        help="redo the run from level N, discarding progress at N and finer. "
-             "Without it a run resumes from wherever it stopped",
+        help="redo level N and every finer level (N-1 down to 0, full "
+             "resolution), discarding their progress. Without it a run "
+             "resumes from wherever it stopped",
     )
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--engine", default=None)
@@ -113,7 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="box width in mm, identical at every level "
              "(default: one chunk core at native resolution)",
     )
-    p.add_argument("--levels", default=None, help="comma-separated, default all")
+    p.add_argument(
+        "--levels", default=None,
+        help="comma-separated level numbers (0 is full resolution), default all",
+    )
     p.add_argument("--subjects", default=None, help="comma-separated, default all")
     p.add_argument("--plane", default="axial", choices=["axial", "coronal", "sagittal", "all"])
     p.add_argument(
@@ -142,19 +149,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--stop-at", default=None, metavar="LEVEL",
-        help="finest level to run: an index such as 3 or a spacing such as "
-             "200um. Running again with a finer level carries on from here",
+        help="finest level to run: a level number such as 2 (0 is full "
+             "resolution) or a spacing such as 200um. Running again with a "
+             "finer level carries on from here",
     )
     p.add_argument(
         "--from-level", type=int, default=None, metavar="N",
-        help="redo from level N, discarding progress at N and finer",
+        help="redo level N and every finer level (N-1 down to 0), "
+             "discarding their progress",
     )
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--engine", default=None)
 
     p = sub.add_parser("run-task", help="what a scheduler array element invokes")
     p.add_argument("config")
-    p.add_argument("--level", type=int, required=True)
+    p.add_argument("--level", type=int, required=True, help="0 is full resolution")
     p.add_argument("--iter", type=int, required=True, dest="iteration")
     p.add_argument(
         "--pass", required=True, dest="pass_name", choices=["register", "blend", "update"]
@@ -171,7 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("out")
     p.add_argument(
         "--level", type=int, default=None,
-        help="volume level to read (default: the one matching the field's grid)",
+        help="volume level to read, 0 being full resolution (default: the one "
+             "matching the field's grid)",
     )
     p.add_argument("--profile", default="a16", help="profile for the output store")
     p.add_argument(
@@ -189,11 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("out")
     p.add_argument(
         "--level", type=int, default=None,
-        help="pyramid level to write, numbered as the run numbers them "
-             "(0 coarsest). Default: the store's finest. A template store "
-             "holds a single level, so this is for subject stores, where it "
-             "is how a coarse level is pulled out to look at beside a "
-             "template of the same level",
+        help="pyramid level to write, numbered as the run and OME-Zarr "
+             "number them: 0 is full resolution (the default), the highest "
+             "the coarsest. A template store holds a single level, so this "
+             "is for subject stores, where it is how a coarse level is "
+             "pulled out to look at beside a template of the same level",
     )
     p.add_argument(
         "--on", default=None, metavar="STORE",
@@ -205,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("clean", help="apply the retention policy")
     p.add_argument("config")
-    p.add_argument("--level", type=int, required=True)
+    p.add_argument("--level", type=int, required=True, help="0 is full resolution")
     p.add_argument("--iter", type=int, required=True, dest="iteration")
 
     return ap
@@ -286,7 +296,11 @@ def _fmt_stage(st) -> str:
 
 
 def _ladder(cfg, levels) -> str:
-    """The resolved pyramid: what each level index means, and whether it runs."""
+    """The resolved pyramid: what each level number means, and whether it runs.
+
+    Listed in the order the levels run, coarsest first; level 0 is full
+    resolution, and the number is the OME-Zarr dataset of a subject store.
+    """
     from .grid import tile
 
     run = set(cfg.levels.run_levels(levels))
@@ -294,10 +308,11 @@ def _ladder(cfg, levels) -> str:
         f"  {'level':>5} {'spacing':>12} {'shape':>22} {'chunks':>8} "
         f"{'clamp':>12}  run"
     ]
-    for k, g in enumerate(levels):
+    for k in reversed(range(len(levels))):
+        g = levels[k]
         n = len(tile(g, cfg.profile))
         clamp = (
-            cfg.levels.level0_max_disp_frac * min(g.extent_mm)
+            cfg.levels.coarsest_max_disp_frac * min(g.extent_mm)
             if n == 1
             else cfg.profile.d_max_mm(g.spacing_mm)
         )
@@ -312,18 +327,21 @@ def _ladder(cfg, levels) -> str:
 def _stage_table(cfg, levels) -> str:
     """Stages as each level that runs will use them, per-level tuning applied."""
     run = cfg.levels.run_levels(levels)
+    coarsest = len(levels) - 1
     rows = []
     for k in run:
         marks = []
+        if k == coarsest and k not in cfg.levels.level_stages:
+            marks.append("coarsest_stages")
         if k in cfg.levels.level_stages:
             marks.append("level_stages")
         if k in cfg.levels.level_params:
             marks.append("level_params")
         tag = f"   <- {' + '.join(marks)}" if marks else ""
         rows.append(f"  level {k} (cap {cfg.levels.cap(k)}){tag}")
-        for st in cfg.levels.stages(k):
+        for st in cfg.levels.stages(k, coarsest=coarsest):
             rows.append(f"      {_fmt_stage(st)}")
-    skipped = [k for k in range(len(levels)) if k not in set(run)]
+    skipped = [k for k in reversed(range(len(levels))) if k not in set(run)]
     if skipped:
         rows.append(f"  levels skipped by levels.run: {skipped}")
     return "\n".join(rows)
@@ -337,8 +355,9 @@ def _report_stray_overrides(cfg, levels) -> None:
     if stray:
         print(
             f"  warning: per-level override(s) for level(s) {stray} will not "
-            f"run; this pyramid has levels 0..{n_levels - 1}. The depth "
-            f"follows from the grid and the chunk core, not the config."
+            f"run; this pyramid has levels 0 (full resolution) to "
+            f"{n_levels - 1} (the coarsest). The depth follows from the grid "
+            f"and the chunk core, not the config."
         )
     skipped = [
         k for k in skipped_level_overrides(cfg, cfg.levels.run_levels(levels))
@@ -406,7 +425,9 @@ def cmd_setup(args) -> int:
 
         run_levels = cfg.levels.run_levels(levels)
         cal = calibrate(
-            cfg, engine=engine_name, stages=cfg.levels.stages(run_levels[-1])
+            cfg,
+            engine=engine_name,
+            stages=cfg.levels.stages(run_levels[-1], coarsest=len(levels) - 1),
         )
         out = Path(args.out or (cfg.root_path / "calibration.json"))
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -456,7 +477,10 @@ def cmd_run(args) -> int:
     _report_stray_overrides(cfg, levels)
     run_levels = cfg.levels.run_levels(levels)
     if len(run_levels) < len(levels):
-        print(f"  running levels {list(run_levels)} of 0..{len(levels) - 1}")
+        print(
+            f"  running levels {list(run_levels)} of {len(levels) - 1}..0 "
+            f"(0 is full resolution)"
+        )
     tuned = [k for k in cfg.levels.tuned_levels() if k in set(run_levels)]
     if tuned:
         print(f"  per-level tuning active on level(s) {tuned}")
@@ -645,10 +669,10 @@ def cmd_export(args) -> int:
 
     try:
         vol = Volume.open(args.store)
-        level = vol.n_levels - 1 if args.level is None else vol._check_level(args.level)
+        level = 0 if args.level is None else vol._check_level(args.level)
         grid = vol.grid(level)
         print(
-            f"  level {level} of 0..{vol.n_levels - 1}: "
+            f"  level {level} of 0 (full resolution) to {vol.n_levels - 1}: "
             f"{'x'.join(str(n) for n in grid.shape)} @ {grid.spacing_mm:g} mm"
         )
         export_store(vol, args.out, level=level, target=args.on)

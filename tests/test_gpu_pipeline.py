@@ -38,12 +38,12 @@ SP = 0.05
 SHAPE = (40, 40, 40)
 PROFILE = Profile(core=16, halo=12, inner_chunk=8, lattice_factor=2, channels=1,
                   features="intensity", r_f=0, k=3, sigma_g=0.5, sigma_w=0.5)
-GRIDS = pyramid(GridSpec(SHAPE, SP), PROFILE)
+GRIDS = pyramid(GridSpec(SHAPE, SP), PROFILE)  # levels 0 (native), 1, 2 (coarsest)
 LEVELS = LevelPolicy(
-    caps=(2, 1, 1),
-    level0_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(6, 4)),),
+    caps=(1, 1, 2),
+    coarsest_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(6, 4)),),
     seeded_stages=(StageSpec(kind="greedy", scales=(2, 1), iterations=(4, 3)),),
-    sharpen_laplacian_levels=(0,),
+    sharpen_laplacian_levels=(2,),
 )
 
 
@@ -70,7 +70,7 @@ def config(device, **kw) -> RunConfig:
 
 
 def snapshot(cfg, result):
-    last = len(GRIDS) - 1
+    last = 0  # full resolution, the last level run
     template = xp.get(result.template.read_padded(0, (0, 0, 0), GRIDS[last].shape))
     flds = {s: xp.get(f.read_dense((0, 0, 0), GRIDS[last].shape))
             for s, f in result.fields.items()}
@@ -163,8 +163,8 @@ def test_median_ingest_matches_on_the_device(monkeypatch):
     ref = ingest_source(data, "ref.zarr", SP, PROFILE, median_radius=1.5)
     with xp.using("torch-cpu"):
         got = ingest_source(data, "dev.zarr", SP, PROFILE, median_radius=1.5)
-        g = xp.get(got.read_padded(len(GRIDS) - 1, (0, 0, 0), SHAPE))
-    r = ref.read_padded(len(GRIDS) - 1, (0, 0, 0), SHAPE)
+        g = xp.get(got.read_padded(0, (0, 0, 0), SHAPE))
+    r = ref.read_padded(0, (0, 0, 0), SHAPE)
     assert np.array_equal(g, r)
     assert got.normalisation == pytest.approx(ref.normalisation)
 
@@ -183,7 +183,7 @@ def test_the_multi_gpu_runner_matches_the_local_runner(tmp_path, monkeypatch):
                               "sigma_g": 0.5, "sigma_w": 0.5, "scales": [2, 1]},
         "subjects": [{"id": s, "path": f"subjects/{s}.zarr"} for s in "abc"],
         "levels": {"caps": [1, 1, 1],
-                   "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3]}}],
+                   "coarsest_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3]}}],
                    "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [3, 2]}}],
                    "sharpen_laplacian_levels": []},
     }

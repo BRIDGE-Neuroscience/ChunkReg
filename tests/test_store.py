@@ -72,7 +72,7 @@ def test_lattice_box_is_exact_for_aligned_chunks():
 # --------------------------------------------------------------------------- #
 def test_volume_round_trips_native_data(volume_data, small_profile):
     vol = ingest_array(volume_data, "v.zarr", 0.05, small_profile)
-    back = vol.read_padded(vol.n_levels - 1, (0, 0, 0), volume_data.shape)
+    back = vol.read_padded(0, (0, 0, 0), volume_data.shape)
     assert np.array_equal(back.astype(np.uint16), volume_data)
 
 
@@ -83,13 +83,14 @@ def test_volume_levels_match_the_profile_pyramid(volume_data, small_profile):
     expected = pyramid(GridSpec(volume_data.shape, 0.05), small_profile)
     assert vol.n_levels == len(expected)
     assert vol.grids() == expected
-    assert len(tile(vol.grid(0), small_profile)) == 1
+    assert vol.grid(0) == GridSpec(volume_data.shape, 0.05), "level 0 is full resolution"
+    assert len(tile(vol.grid(vol.n_levels - 1), small_profile)) == 1
 
 
 def test_pyramid_preserves_the_mean(volume_data, small_profile):
-    """Mean pooling is mean-preserving, so a level-0 read is the volume mean."""
+    """Mean pooling is mean-preserving, so a coarsest-level read is the volume mean."""
     vol = ingest_array(volume_data, "v.zarr", 0.05, small_profile)
-    coarse = np.asarray(vol.array(0)[:], np.float32)
+    coarse = np.asarray(vol.array(vol.n_levels - 1)[:], np.float32)
     assert coarse.mean() == pytest.approx(volume_data.mean(), rel=0.02)
 
 
@@ -104,7 +105,7 @@ def test_normalisation_is_stored_and_reapplied(volume_data, small_profile):
     vol = ingest_array(volume_data, "v.zarr", 0.05, small_profile)
     lo, hi = vol.normalisation
     assert hi > lo
-    block = vol.read_padded(vol.n_levels - 1, (0, 0, 0), (8, 8, 8), normalise=True)
+    block = vol.read_padded(0, (0, 0, 0), (8, 8, 8), normalise=True)
     assert block.min() >= 0.0 and block.max() <= 1.0
     reopened = Volume.open("v.zarr")
     assert reopened.normalisation == (lo, hi)
@@ -124,7 +125,7 @@ def test_volume_rejects_an_out_of_range_level(volume_data, small_profile):
 
 def test_chunk_read_covers_the_padded_box(volume_data, small_profile):
     vol = ingest_array(volume_data, "v.zarr", 0.05, small_profile)
-    k = vol.n_levels - 1
+    k = 0  # full resolution, several chunks
     for c in tile(vol.grid(k), small_profile):
         assert vol.read_chunk(k, c).shape == c.pad_shape
 

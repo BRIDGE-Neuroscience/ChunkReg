@@ -41,14 +41,8 @@
   ],
   "levels": {
     "stop_at": "400um",
-    "caps": [
-      12,
-      10,
-      11,
-      3,
-      2
-    ],
-    "level0_stages": [
+    "caps": [2, 2, 3, 11, 10, 12],
+    "coarsest_stages": [
       "moments",
       {
         "rigid": {
@@ -117,7 +111,7 @@
       }
     ],
     "level_params": {
-      "1": {
+      "4": {
         "iterations": [
           250,
           200
@@ -128,7 +122,7 @@
         "cc_kernel": 7,
         "tolerance": 0.0001
       },
-      "2": {
+      "3": {
         "iterations": [
           200,
           150
@@ -139,7 +133,7 @@
         "cc_kernel": 7,
         "tolerance": 0.0001
       },
-      "3": {
+      "2": {
         "iterations": [
           100,
           70
@@ -150,7 +144,7 @@
         "cc_kernel": 5,
         "tolerance": 0.0001
       },
-      "4": {
+      "1": {
         "iterations": [
           80,
           50
@@ -168,12 +162,9 @@
       "percentile": 99.0
     },
     "shape_update_step": 0.25,
-    "sharpen_laplacian_levels": [
-      0,
-      1
-    ],
+    "sharpen_laplacian_levels": [5, 4],
     "min_tissue_fraction": 0.02,
-    "level0_max_disp_frac": 0.25
+    "coarsest_max_disp_frac": 0.25
   },
   "retry": {
     "fold_frac": 0.001,
@@ -184,11 +175,7 @@
     ]
   },
   "retention": {
-    "keep_history_levels": [
-      0,
-      1,
-      2
-    ],
+    "keep_history_levels": [5, 4, 3],
     "delete_task_arrays": true,
     "delete_accumulators": true
   },

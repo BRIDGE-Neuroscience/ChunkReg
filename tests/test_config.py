@@ -189,8 +189,19 @@ def test_channels_shorthand_selects_a_profile():
 
 
 def test_caps_are_padded_for_deeper_pyramids():
-    p = LevelPolicy(caps=(8, 6))
-    assert [p.cap(k) for k in range(5)] == [8, 6, 6, 6, 6]
+    """Indexed by level from full resolution; extra coarse levels repeat the last."""
+    p = LevelPolicy(caps=(2, 6))
+    assert [p.cap(k) for k in range(5)] == [2, 6, 6, 6, 6]
+
+
+def test_caps_are_indexed_from_full_resolution():
+    p = LevelPolicy(caps=(1, 2, 3, 4, 5))
+    assert p.cap(0) == 1, "caps[0] is level 0, full resolution"
+    assert p.cap(4) == 5, "the last cap is the coarsest level's"
+    assert p.cap(9) == 5
+    # The default is the old coarse-first (8, 6, 4, 3, 2) for a five-level
+    # pyramid, now listed from full resolution.
+    assert LevelPolicy().caps == (2, 3, 4, 6, 8)
 
 
 def test_unknown_config_keys_are_rejected():
@@ -204,14 +215,15 @@ def test_unknown_config_keys_are_rejected():
 def test_plan_reproduces_the_worked_example_geometry():
     p = plan(cfg(), HIPCT)
     assert p.depth == 4
+    assert [lv.level for lv in p.levels] == [4, 3, 2, 1, 0], "in run order"
     assert [lv.n_chunks for lv in p.levels] == [1, 4, 18, 100, 800]
     assert [round(lv.spacing_mm, 6) for lv in p.levels] == [0.8, 0.4, 0.2, 0.1, 0.05]
 
 
 def test_plan_clamps_scale_with_level_spacing():
     p = plan(cfg(), HIPCT)
-    # Level 0 is one chunk, so the halo bound does not apply; it is bounded by
-    # the aperture, a quarter of the volume's shortest extent.
+    # The coarsest level is one chunk, so the halo bound does not apply; it is
+    # bounded by the aperture, a quarter of the volume's shortest extent.
     assert p.levels[0].d_max_mm == pytest.approx(0.25 * 96.0)
     assert p.levels[1].d_max_mm == pytest.approx(4.8)
     assert p.levels[3].d_max_mm == pytest.approx(1.2)
@@ -236,7 +248,7 @@ def test_work_scales_linearly_with_channels_and_subjects():
 
 def test_the_native_level_dominates_the_work():
     p = plan(cfg(), HIPCT)
-    assert p.dominant_level().level == 4
+    assert p.dominant_level().level == 0, "level 0 is full resolution"
     assert p.levels[4].work_ch_vox / p.work_ch_vox > 0.5
 
 
@@ -280,11 +292,11 @@ def test_level_params_patch_only_the_levels_they_name():
         seeded_stages=(StageSpec(scales=(2, 1), iterations=(50, 30)),),
         level_params={3: {"iterations": (80, 50), "smooth_warp_sigma": 0.25}},
     )
-    assert policy.stages(2)[0].iterations == (50, 30)
-    assert policy.stages(2)[0].smooth_warp_sigma == 0.5
-    assert policy.stages(3)[0].iterations == (80, 50)
-    assert policy.stages(3)[0].smooth_warp_sigma == 0.25
-    assert policy.stages(3)[0].scales == (2, 1), "unnamed fields are untouched"
+    assert policy.stages(2, coarsest=4)[0].iterations == (50, 30)
+    assert policy.stages(2, coarsest=4)[0].smooth_warp_sigma == 0.5
+    assert policy.stages(3, coarsest=4)[0].iterations == (80, 50)
+    assert policy.stages(3, coarsest=4)[0].smooth_warp_sigma == 0.25
+    assert policy.stages(3, coarsest=4)[0].scales == (2, 1), "unnamed fields are untouched"
 
 
 def test_level_params_reach_every_deformable_stage_of_a_level():
@@ -297,7 +309,7 @@ def test_level_params_reach_every_deformable_stage_of_a_level():
         },
         level_params={1: {"lr": 0.05}},
     )
-    assert [s.lr for s in policy.stages(1)] == [0.05, 0.05]
+    assert [s.lr for s in policy.stages(1, coarsest=4)] == [0.05, 0.05]
 
 
 def test_a_moments_stage_ignores_a_schedule_patch():
@@ -309,7 +321,7 @@ def test_a_moments_stage_ignores_a_schedule_patch():
         },
         level_params={0: {"iterations": (7, 7)}},
     )
-    moments, greedy = policy.stages(0)
+    moments, greedy = policy.stages(0, coarsest=4)
     assert moments.iterations == ()
     assert greedy.iterations == (7, 7)
 
@@ -318,26 +330,48 @@ def test_level_stages_replace_the_whole_list():
     policy = LevelPolicy(
         level_stages={2: (StageSpec(kind="greedy", scales=(1,), iterations=(4,)),)}
     )
-    assert len(policy.stages(2)) == 1
-    assert policy.stages(2)[0].iterations == (4,)
-    assert policy.stages(1) == LevelPolicy.seeded_stages
+    assert len(policy.stages(2, coarsest=4)) == 1
+    assert policy.stages(2, coarsest=4)[0].iterations == (4,)
+    assert policy.stages(1, coarsest=4) == LevelPolicy.seeded_stages
+    assert policy.stages(4, coarsest=4) == LevelPolicy.coarsest_stages
 
 
 def test_a_mistyped_tuning_key_names_the_level_and_the_alternatives():
     policy = LevelPolicy(level_params={2: {"smooth_wrap_sigma": 0.3}})
     with pytest.raises(ConfigError) as e:
-        policy.stages(2)
+        policy.stages(2, coarsest=4)
     assert "level 2" in str(e.value)
     assert "smooth_warp_sigma" in str(e.value)
 
 
 def test_a_tuned_level_is_validated_against_the_halo_budget():
-    """The check that guards seeded_stages must guard per-level overrides too."""
+    """The check that guards seeded_stages must guard per-level overrides too.
+
+    Level 3 is a seeded level of a five-level pyramid, so the deep in-chunk
+    pyramid the patch asks for cannot fit its halo.
+    """
     policy = LevelPolicy(
         level_params={3: {"scales": (8, 4, 2, 1), "iterations": (4, 4, 4, 4)}}
     )
     with pytest.raises(ConfigError, match="level 3"):
-        cfg(levels=policy).validate()
+        cfg(levels=policy).validate(n_levels=5)
+    with pytest.raises(ConfigError, match="level 3"):
+        cfg(levels=policy).check_level_overrides(5)
+
+
+def test_a_tuned_level_that_only_fits_the_coarsest_is_checked_once_the_depth_is_known():
+    """Level 3 is the coarsest of a four-level pyramid, where no halo binds.
+
+    Without the depth a level number cannot be told apart from the coarsest,
+    so the verdict is deferred, with a warning, rather than refusing a config
+    that is valid for the pyramid it will run on.
+    """
+    policy = LevelPolicy(
+        level_params={3: {"scales": (8, 4, 2, 1), "iterations": (4, 4, 4, 4)}}
+    )
+    warnings = cfg(levels=policy).validate()
+    assert any("only valid if level 3 is the coarsest" in w for w in warnings)
+    cfg(levels=policy).validate(n_levels=4)  # level 3 is the coarsest: fine
 
 
 def test_a_bad_override_is_caught_at_load_not_mid_run():
@@ -362,7 +396,7 @@ def test_level_keys_may_be_strings_because_json_has_no_integer_keys():
         }
     )
     assert cfg_json.levels.level_params[2] == {"lr": 0.2}
-    assert cfg_json.levels.stages(2)[0].lr == 0.2
+    assert cfg_json.levels.stages(2, coarsest=4)[0].lr == 0.2
 
 
 def test_overrides_for_levels_the_pyramid_lacks_are_reported():
@@ -401,7 +435,7 @@ def test_a_json_config_file_loads(tmp_path):
     )
     loaded = load_config(path)
     assert loaded.subjects[0].source == "raw/s01.tif"
-    assert loaded.levels.stages(1)[0].lr == 0.3
+    assert loaded.levels.stages(1, coarsest=4)[0].lr == 0.3
 
 
 def test_the_shipped_json_example_is_valid():
@@ -410,8 +444,10 @@ def test_the_shipped_json_example_is_valid():
     example = Path(__file__).resolve().parents[1] / "configs" / "example.json"
     loaded = load_config(example)
     assert loaded.profile_name == "a16"
-    assert loaded.levels.tuned_levels() == (1, 2, 3, 4)
-    assert loaded.levels.stages(4)[0].smooth_warp_sigma == 0.30
+    # Five levels at the worked example's grid: 4 is the coarsest, 0 native.
+    assert loaded.levels.tuned_levels() == (0, 1, 2, 3)
+    assert loaded.levels.stages(0, coarsest=4)[0].smooth_warp_sigma == 0.30
+    assert loaded.levels.cap(4) == 8 and loaded.levels.cap(0) == 2
 
 
 def test_a_subject_path_defaults_to_the_conventional_location():
@@ -506,8 +542,10 @@ def test_the_atlas_config_resolves_as_intended():
     assert loaded.slurm.register.chunks_per_task == 4
     assert loaded.profile.features == "anatomix+mindssc@8"
     assert loaded.profile.channels == 8
-    for level in (1, 2, 3, 4, 5):
+    # Six levels at 50 um: 5 (1600 um) is the coarsest, 0 full resolution.
+    for level in (0, 1, 2, 3, 4):
         assert loaded.levels.level_params[level]["tolerance"] == 1e-4
+    assert loaded.levels.cap(5) == 6 and loaded.levels.cap(0) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -647,13 +685,13 @@ def test_save_config_writes_a_file_that_loads(tmp_path):
 
 
 def test_the_coarse_rerun_config_resolves_as_intended():
-    """v3: levels 0 and 1 only, flexible, and no chunk allowed to give up."""
+    """v3: levels 5 and 4 (1600 and 800 um) only, flexible, and no chunk allowed to give up."""
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[1] / "configs" / "atlas_v3.json"
     loaded = load_config(path)
     assert loaded.levels.stop_at == 0.8, "800um is normalised to mm at load"
-    assert [loaded.levels.cap(k) for k in (0, 1)] == [20, 15]
+    assert [loaded.levels.cap(k) for k in (5, 4)] == [20, 15]
 
     # The point of the run: every chunk returns a residual. Without emit_seed
     # the retry ladder runs out and the chunk keeps its last solution rather
@@ -662,7 +700,8 @@ def test_the_coarse_rerun_config_resolves_as_intended():
     assert loaded.retry.ladder == ("sigma_w_x2", "clamp_x0.5")
     assert loaded.retry.fold_frac == 0.01
 
-    coarse, seeded = loaded.levels.stages(0)[-1], loaded.levels.stages(1)[-1]
+    coarse = loaded.levels.stages(5, coarsest=5)[-1]
+    seeded = loaded.levels.stages(4, coarsest=5)[-1]
     assert coarse.lr == 2.0 and seeded.lr == 1.5, "amplitude falls coarse to fine"
     assert coarse.smooth_warp_sigma == 0.30 and seeded.smooth_warp_sigma == 0.30
     # Flexibility costs nothing from the halo: a narrower kernel and smaller

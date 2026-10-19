@@ -102,8 +102,8 @@ def make_cfg(profile, **kw) -> RunConfig:
         backend="memory",
         gpu_mem_gb=1000.0,
         levels=LevelPolicy(
-            caps=(3, 2, 2),
-            level0_stages=(
+            caps=(2, 3),  # level 0 (native) 2 passes, level 1 (the coarsest) 3
+            coarsest_stages=(
                 StageSpec(kind="greedy", scales=(4, 2, 1), iterations=(40, 25, 15)),
             ),
             seeded_stages=(
@@ -259,7 +259,7 @@ def test_the_template_of_a_pairwise_run_is_the_fixed_subject(pair, pair_profile)
     grid = result.template.grid(0)
     got = result.template.read_padded(0, (0, 0, 0), grid.shape, normalise=True)
     src = Volume.open("subjects/fix.zarr", "memory")
-    want = src.read_padded(src.n_levels - 1, (0, 0, 0), grid.shape, normalise=True)
+    want = src.read_padded(0, (0, 0, 0), grid.shape, normalise=True)
     assert np.allclose(got, want, atol=1e-5)
 
 
@@ -273,8 +273,8 @@ def test_a_pairwise_level_runs_more_than_one_pass_when_it_needs_to(pair, pair_pr
     cfg = make_cfg(
         pair_profile,
         levels=LevelPolicy(
-            caps=(1, 3),  # the pyramid is two levels deep here
-            level0_stages=(
+            caps=(3, 1),  # two levels here: 0 (native) gets 3, 1 (the coarsest) 1
+            coarsest_stages=(
                 StageSpec(kind="greedy", scales=(4, 2, 1), iterations=(40, 25, 15)),
             ),
             seeded_stages=(
@@ -331,7 +331,7 @@ def test_a_pair_runs_under_a_root_of_its_own(pair, pair_profile):
     Every run writes ``levels/L*/pass_it*.json`` and seeds from
     ``levels/L*/seeded.json``, and every run resumes from whatever it finds.
     A pair sharing the cohort's root would replay the cohort's passes as its
-    own and seed level 0 from the cohort's template -- silently, because
+    own and seed the coarsest level from the cohort's template -- silently, because
     resuming is exactly what those files are for.
     """
     from chunkreg.pipelines import pair_config

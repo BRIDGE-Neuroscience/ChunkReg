@@ -73,27 +73,28 @@ def test_pyramid_matches_the_worked_example():
     levels = pyramid(HIPCT, p)
     assert pyramid_depth(HIPCT.shape, p.core) == 4
     assert len(levels) == 5
+    # Indexed by level: 0 is full resolution, 4 the coarsest.
     assert [g.shape for g in levels] == [
-        (120, 160, 160),
-        (240, 320, 320),
-        (480, 640, 640),
-        (960, 1280, 1280),
         (1920, 2560, 2560),
+        (960, 1280, 1280),
+        (480, 640, 640),
+        (240, 320, 320),
+        (120, 160, 160),
     ]
-    assert [round(g.spacing_mm, 6) for g in levels] == [0.8, 0.4, 0.2, 0.1, 0.05]
+    assert [round(g.spacing_mm, 6) for g in levels] == [0.05, 0.1, 0.2, 0.4, 0.8]
 
 
 def test_chunk_counts_match_the_worked_example():
     p = Profile()
     counts = [len(tile(g, p)) for g in pyramid(HIPCT, p)]
-    assert counts == [1, 4, 18, 100, 800]
+    assert counts == [800, 100, 18, 4, 1]
 
 
 def test_coarsest_level_is_always_one_chunk():
     p = Profile()
     for shape in [(1920, 2560, 2560), (256, 256, 256), (8000, 8000, 8000), (3, 517, 41)]:
         g = GridSpec(shape, 0.05)
-        assert len(tile(pyramid(g, p)[0], p)) == 1
+        assert len(tile(pyramid(g, p)[-1], p)) == 1
 
 
 def test_small_volume_needs_no_pyramid():
@@ -105,8 +106,24 @@ def test_small_volume_needs_no_pyramid():
 
 
 def test_finest_level_is_the_native_grid():
+    """Level 0, as OME-Zarr numbers it."""
     g = GridSpec((1920, 2560, 2560), 0.05, origin_mm=(1.0, -2.0, 3.5))
-    assert pyramid(g, Profile())[-1] == g
+    assert pyramid(g, Profile())[0] == g
+
+
+def test_level_spacing_is_native_times_two_to_the_level():
+    for level, g in enumerate(pyramid(HIPCT, Profile())):
+        assert g.spacing_mm == pytest.approx(HIPCT.spacing_mm * 2**level)
+
+
+def test_the_coarsest_level_follows_from_any_one_level():
+    from chunkreg.grid import coarsest_level
+
+    p = Profile()
+    for shape in [(1920, 2560, 2560), (256, 256, 256), (8000, 300, 41), (257, 1, 1)]:
+        levels = pyramid(GridSpec(shape, 0.05), p)
+        for level, g in enumerate(levels):
+            assert coarsest_level(level, g, p) == len(levels) - 1
 
 
 def test_levels_share_a_world_frame():

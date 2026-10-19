@@ -1,8 +1,9 @@
 # HiP-CT cohort: 10 subjects at 50 um on a common grid.
 #
 # Run `chunkreg plan` against this before submitting anything. At profile a16
-# it resolves to five levels (800, 400, 200, 100, 50 um) with 1, 4, 18, 100 and
-# 800 chunks per subject, a clamp of 12 voxels at every level, and roughly
+# it resolves to five levels, 4 down to 0 (800, 400, 200, 100, 50 um; level 0 is
+# full resolution, as OME-Zarr numbers it), with 1, 4, 18, 100 and 800 chunks
+# per subject, a clamp of 12 voxels at every level, and roughly
 # 2400 GPU-hours at the caps. Dropping to a4 divides that by four and the
 # device class from 80 GB to 24 GB; gate G2 is what decides whether the
 # channels are earning their cost at native resolution.
@@ -35,13 +36,16 @@ subjects:
 
 levels:
   # Backstops, not a schedule: a level exits as soon as the stopping rule is
-  # met. The coarsest level gets the most because it starts from a voxelwise
-  # mean carrying the full population shape bias, which decays as 0.75^k.
-  caps: [8, 6, 4, 3, 2]
+  # met. Listed from full resolution (level 0) towards the coarsest; a deeper
+  # pyramid repeats the last value. The coarsest level gets the most because
+  # it starts from a voxelwise mean carrying the full population shape bias,
+  # which decays as 0.75^k.
+  caps: [2, 3, 4, 6, 8]
 
-  # Level 0 is one chunk, so its halo is irrelevant and it can afford the deep
-  # pyramid that estimates the global component no finer level can see.
-  level0_stages:
+  # The coarsest level is one chunk, so its halo is irrelevant and it can
+  # afford the deep pyramid that estimates the global component no finer
+  # level can see.
+  coarsest_stages:
     - moments
     - {rigid:  {scales: [4, 2, 1], iterations: [200, 100, 50], lr: 0.01}}
     - {affine: {scales: [4, 2, 1], iterations: [200, 100, 50], lr: 0.01}}
@@ -59,7 +63,7 @@ levels:
     percentile: 99.0
 
   shape_update_step: 0.25
-  sharpen_laplacian_levels: [0, 1]
+  sharpen_laplacian_levels: [4, 3]   # the two coarsest levels
   min_tissue_fraction: 0.02
 
 retry:
@@ -67,7 +71,7 @@ retry:
   ladder: [sigma_w_x2, clamp_x0.5, emit_seed]
 
 retention:
-  keep_history_levels: [0, 1]
+  keep_history_levels: [4, 3]
   delete_task_arrays: true
   delete_accumulators: true
 

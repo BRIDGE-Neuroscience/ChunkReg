@@ -316,8 +316,7 @@ def open_source(path) -> VolumeSource:
         from .store import Volume
 
         v = Volume.open(p)
-        k = v.n_levels - 1
-        arr = v.array(k)
+        arr = v.array(0)  # full resolution
         return VolumeSource(
             v.native_grid.shape,
             np.dtype(arr.dtype),

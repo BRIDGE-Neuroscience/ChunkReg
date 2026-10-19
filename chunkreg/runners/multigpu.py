@@ -2,7 +2,7 @@
 
 For a job that holds several GPUs under one scheduler allocation, such as a
 Grid Engine job with ``-pe gpu 6``. The driver process only coordinates, seeds
-level 0 and writes small metadata; each worker owns one GPU, loads the feature
+the coarsest level and writes small metadata; each worker owns one GPU, loads the feature
 network and the registration engine once, and then takes tasks from a shared
 queue until the run ends. Those tasks are the register, blend and update
 passes and also promotion and settling, one chunk core per task, so no step of
@@ -124,7 +124,7 @@ def _worker(
         except Exception:  # noqa: BLE001 - reported to the driver
             outbox.put(("fail", slot, (job, pass_name, task_id), traceback.format_exc()))
         finally:
-            # The driver shares the first GPU (it seeds level 0 there), so a
+            # The driver shares the first GPU (it seeds the coarsest level there), so a
             # worker must not sit on memory it is not using.
             xp.release()
 

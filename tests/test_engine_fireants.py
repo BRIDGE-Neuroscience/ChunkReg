@@ -179,7 +179,7 @@ def _plan(kind, stage, carry=None):
 
 @pytest.mark.parametrize("kind", ["moments", "rigid", "affine", "greedy"])
 def test_every_level_zero_stage_builds_against_the_pinned_build(kind):
-    """moments -> rigid -> affine -> greedy is what level 0 runs."""
+    """moments -> rigid -> affine -> greedy is what the coarsest level runs."""
     stage = StageSpec(kind=kind)
     cls, kwargs = _plan(kind, stage, carry=_Shaped((1, 3, 4)))
     assert isinstance(_construct(cls, kwargs, kind), cls)

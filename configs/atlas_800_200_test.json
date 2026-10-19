@@ -36,9 +36,9 @@
 
   "levels": {
     "stop_at": "200um",
-    "caps": [1, 1, 1, 1],
+    "caps": [1, 1, 1, 1, 1, 1],
 
-    "level0_stages": [
+    "coarsest_stages": [
       "moments",
       {"rigid":  {"scales": [4, 2, 1], "iterations": [300, 150, 75], "lr": 0.01}},
       {"affine": {"scales": [4, 2, 1], "iterations": [300, 150, 75], "lr": 0.01}},
@@ -52,11 +52,11 @@
     ],
 
     "level_params": {
-      "1": {"iterations": [120, 80], "lr": 0.5, "cc_kernel": 7,
+      "4": {"iterations": [120, 80], "lr": 0.5, "cc_kernel": 7,
             "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0},
-      "2": {"iterations": [100, 60], "lr": 0.5, "cc_kernel": 7,
+      "3": {"iterations": [100, 60], "lr": 0.5, "cc_kernel": 7,
             "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0},
-      "3": {"iterations": [80, 50], "lr": 0.4, "cc_kernel": 7,
+      "2": {"iterations": [80, 50], "lr": 0.4, "cc_kernel": 7,
             "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 1.0}
     },
 
@@ -67,9 +67,9 @@
     },
 
     "shape_update_step": 0.25,
-    "sharpen_laplacian_levels": [0, 1],
+    "sharpen_laplacian_levels": [5, 4],
     "min_tissue_fraction": 0.02,
-    "level0_max_disp_frac": 0.25
+    "coarsest_max_disp_frac": 0.25
   },
 
   "retry": {
@@ -78,7 +78,7 @@
   },
 
   "retention": {
-    "keep_history_levels": [0, 1, 2, 3],
+    "keep_history_levels": [5, 4, 3, 2],
     "delete_task_arrays": true,
     "delete_accumulators": true
   }

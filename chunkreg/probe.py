@@ -4,9 +4,10 @@ The pyramid exists because a chunk cannot see a deformation longer than its own
 width. Whether a given cohort needs every level, or could be handled at fewer,
 is a property of the data and takes minutes to measure at the coarsest level.
 
-The statistic is the residual displacement after registering at level 0, where
-the whole volume is a single chunk and nothing is clipped by a halo. Compared
-against each level's chunk width it says which levels are doing real work.
+The statistic is the residual displacement after registering at the coarsest
+level, where the whole volume is a single chunk and nothing is clipped by a
+halo. Compared against each level's chunk width it says which levels are doing
+real work.
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ class ProbeReport:
     d50_mm: float
     d99_mm: float
     levels: list[tuple[int, float, float]] = field(default_factory=list)
-    """(level, chunk width L in mm, clamp in mm)."""
+    """(level, chunk width L in mm, clamp in mm), coarsest first; level 0 is
+    full resolution."""
 
     def format(self) -> str:
         out = [
@@ -70,32 +72,34 @@ def probe(cfg: RunConfig, pairs: int = 3, engine: str | None = None) -> ProbeRep
 
     vols = {s: Volume.open(cfg.subject_path(s), cfg.backend) for s in ids}
     native = vols[ids[0]].native_grid
-    grid = pyramid(native, cfg.profile)[0]
+    grids = pyramid(native, cfg.profile)
+    top = len(grids) - 1  # the coarsest level, one chunk
+    grid = grids[top]
 
     from . import xp
 
     eng = get_engine(engine or cfg.engine_for(xp.device_name()))
     ex = get_extractor(cfg.profile.features)
     ex.setup()
-    stages = list(cfg.levels.stages(0))
+    stages = list(cfg.levels.stages(top, coarsest=top))
 
     fixed_id = ids[0]
-    fixed_img = vols[fixed_id].read_padded(0, (0, 0, 0), grid.shape, normalise=True)
+    fixed_img = vols[fixed_id].read_padded(top, (0, 0, 0), grid.shape, normalise=True)
     fixed = ex(fixed_img, grid.spacing_mm)
 
     hist = _stats.empty()
     used: list[tuple[str, str]] = []
     for moving_id in ids[1 : 1 + pairs]:
         moving_img = vols[moving_id].read_padded(
-            0, (0, 0, 0), grid.shape, normalise=True
+            top, (0, 0, 0), grid.shape, normalise=True
         )
         res = eng.register(fixed, ex(moving_img, grid.spacing_mm), grid.spacing_mm, stages)
         hist += _stats.histogram(_fields.magnitude(res.disp_mm))
         used.append((fixed_id, moving_id))
 
     levels = [
-        (k, cfg.profile.core * g.spacing_mm, cfg.profile.d_max_mm(g.spacing_mm))
-        for k, g in enumerate(pyramid(native, cfg.profile))
+        (k, cfg.profile.core * grids[k].spacing_mm, cfg.profile.d_max_mm(grids[k].spacing_mm))
+        for k in reversed(range(len(grids)))
     ]
     return ProbeReport(
         pairs=used,

@@ -226,7 +226,7 @@ def mixed_cohort(tmp_path, **over) -> str:
             {"id": "thick", "source": "thick.nii.gz"},
         ],
         "levels": {"caps": [1],
-                   "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3]}}],
+                   "coarsest_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3]}}],
                    "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [3, 2]}}],
                    "sharpen_laplacian_levels": []},
     }

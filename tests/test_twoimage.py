@@ -39,7 +39,7 @@ TUNING = dict(
         # Two scales, not three: the reference engine's third scale takes a
         # 24-voxel level to six, where locally normalising band-limited noise
         # is all noise and it wanders off to the clamp.
-        "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [8, 5]}}],
+        "coarsest_stages": [{"greedy": {"scales": [2, 1], "iterations": [8, 5]}}],
         "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [8, 5]}}],
         "sharpen_laplacian_levels": [],
     },
@@ -104,7 +104,7 @@ def test_registering_makes_the_moving_volume_match_the_fixed_one(volumes, tmp_pa
 
     grid = result.fixed.native_grid
     whole = lambda v: np.asarray(  # noqa: E731
-        v.read_padded(v.n_levels - 1, (0, 0, 0), grid.shape)
+        v.read_padded(0, (0, 0, 0), grid.shape)
     )
     inner = tuple(slice(12, -12) for _ in range(3))
     target = whole(result.fixed)[inner].ravel()
@@ -198,9 +198,10 @@ def test_overrides_reach_the_configuration(volumes, tmp_path):
 
 
 def test_stop_at_stops_the_run_early(volumes, tmp_path):
+    """``stop_at=1`` is level 1, twice the native spacing: here the coarsest."""
     fixed, moving = volumes
     result = chunkreg.register(
-        fixed, moving, tmp_path / "work", stop_at=0, **TUNING
+        fixed, moving, tmp_path / "work", stop_at=1, **TUNING
     )
-    assert [lv.level for lv in result.run.levels] == [0]
+    assert [lv.level for lv in result.run.levels] == [1]
     assert result.field.level_grid.spacing_mm == pytest.approx(2 * SPACING)

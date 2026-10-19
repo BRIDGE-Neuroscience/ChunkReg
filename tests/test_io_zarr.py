@@ -166,7 +166,7 @@ def test_blockwise_median_equals_the_whole_volume_median(tmp_path):
     data = volume()
     vol = ingest_source(data, tmp_path / "m.zarr", 0.05, PROFILE, median_radius=1.5)
     want = ndimage.median_filter(data, size=4)
-    got = vol.read_padded(vol.n_levels - 1, (0, 0, 0), SHAPE)
+    got = vol.read_padded(0, (0, 0, 0), SHAPE)
     assert np.array_equal(got, want)
 
 
@@ -174,7 +174,7 @@ def test_ingested_stores_are_sharded_one_shard_per_core(tmp_path):
     vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE)
     errors, warnings = check_volume(vol, PROFILE)
     assert errors == [] and warnings == []
-    native = zarr.open_array(str(vol.level_path(vol.n_levels - 1)), mode="r")
+    native = zarr.open_array(str(vol.level_path(0)), mode="r")
     assert native.shards == (32, 32, 32)
     assert native.chunks == (8, 8, 8)
 
@@ -182,7 +182,7 @@ def test_ingested_stores_are_sharded_one_shard_per_core(tmp_path):
 def test_float_sources_are_not_truncated(tmp_path):
     data = volume().astype(np.float32) / 4000.0
     vol = ingest_array(data, tmp_path / "f.zarr", 0.05, PROFILE)
-    assert vol.array(vol.n_levels - 1).dtype == np.float32
+    assert vol.array(0).dtype == np.float32
 
 
 def test_a_store_ingested_with_another_profile_is_caught(tmp_path):
@@ -195,7 +195,7 @@ def test_a_store_ingested_with_another_profile_is_caught(tmp_path):
 
 def test_an_unsharded_store_is_flagged(tmp_path):
     vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE)
-    k = vol.n_levels - 1
+    k = 0  # full resolution
     g = vol.grid(k)
     zarr.create_array(str(vol.level_path(k)), shape=g.shape,
                       dtype="uint16", chunks=(8, 8, 8), overwrite=True)
@@ -218,7 +218,7 @@ def cohort_config(tmp_path, **over) -> str:
                               "sigma_g": 0.5, "sigma_w": 0.5, "scales": [2, 1]},
         "subjects": [{"id": f"s{i}", "source": f"raw/s{i}.ome.zarr"} for i in range(1, 3)],
         "levels": {"caps": [1, 1],
-                   "level0_stages": [{"greedy": {"scales": [2, 1], "iterations": [6, 4],
+                   "coarsest_stages": [{"greedy": {"scales": [2, 1], "iterations": [6, 4],
                                                  "cc_kernel": 3, "smooth_grad_sigma": 0.5}}],
                    "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [4, 3],
                                                  "cc_kernel": 3, "smooth_grad_sigma": 0.5}}],
@@ -302,7 +302,7 @@ def test_translation_matches_every_level_grid(tmp_path):
     vol = ingest_array(volume(), tmp_path / "s.zarr", 0.05, PROFILE, origin_mm=(1.0, -2.0, 0.5))
     ms = zarr.open_group(str(tmp_path / "s.zarr"), mode="r").attrs["ome"]["multiscales"][0]
     for d in ms["datasets"]:
-        k = vol.n_levels - 1 - int(d["path"])
+        k = int(d["path"])  # dataset l is level l
         assert d["coordinateTransformations"][1]["translation"] == pytest.approx(
             list(vol.grid(k).origin_mm)
         )
@@ -386,12 +386,12 @@ def test_setup_links_a_scan_already_on_the_grid(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "read in place" in out
     vol = Volume.open(tmp_path / "subjects/s1.zarr")
-    top = vol.n_levels - 1
-    assert vol.is_linked(top)
-    assert not vol.level_path(top).exists(), "the full resolution was copied"
-    np.testing.assert_array_equal(vol.array(top)[:], np.roll(volume(), 1, axis=0))
+    native = 0
+    assert vol.is_linked(native)
+    assert not vol.level_path(native).exists(), "the full resolution was copied"
+    np.testing.assert_array_equal(vol.array(native)[:], np.roll(volume(), 1, axis=0))
     with pytest.raises(PermissionError):
-        vol.array(top, "r+")
+        vol.array(native, "r+")
     # Reingesting rebuilds the store and leaves the scan alone.
     assert main(["setup", path, "--reingest", *QUICK]) == 0
     assert _tree(tmp_path / "raw/s1.ome.zarr") == before
@@ -405,8 +405,8 @@ def test_link_false_copies(tmp_path, capsys):
     assert main(["setup", path, *QUICK]) == 0
     assert "read in place" not in capsys.readouterr().out
     vol = Volume.open(tmp_path / "subjects/s1.zarr")
-    assert not vol.is_linked(vol.n_levels - 1)
-    assert vol.level_path(vol.n_levels - 1).exists()
+    assert not vol.is_linked(0)
+    assert vol.level_path(0).exists()
 
 
 def test_a_run_on_linked_scans_writes_nothing_into_them(tmp_path, capsys):

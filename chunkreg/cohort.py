@@ -1,6 +1,6 @@
 """Putting a cohort of scans onto one run grid.
 
-Every pass reads subject level ``k`` and template level ``k`` with the same
+Every pass reads subject level ``l`` and template level ``l`` with the same
 voxel indices, so every subject store has to be on one grid. The scans a cohort
 is built from rarely are: they differ in shape, field of view and voxel size,
 and some have anisotropic voxels. This module decides the run grid and
@@ -8,8 +8,8 @@ resamples each scan onto it at ingest, so everything downstream still sees one
 grid.
 
 Resolution
-    ``grid.spacing_mm`` is the finest pyramid level: the resolution a run
-    registers at when every level runs. ``finest`` (the default) takes the
+    ``grid.spacing_mm`` is the finest pyramid level, level 0: the resolution a
+    run registers at when every level runs. ``finest`` (the default) takes the
     finest voxel in the cohort, ``coarsest`` the coarsest, and a number sets it
     outright. A scan finer than the run grid is anti-aliased on the way down;
     a scan coarser than it is interpolated up, which adds voxels but no detail.
@@ -19,8 +19,9 @@ Extent
     outright, and a scan larger than that box is cropped.
 
 Placement
-    ``centre`` (the default) centres every scan in the run grid, so level 0's
-    moments and rigid stages only have to correct what centring leaves.
+    ``centre`` (the default) centres every scan in the run grid, so the
+    coarsest level's moments and rigid stages only have to correct what
+    centring leaves.
     ``corner`` puts every scan's first voxel corner on the grid's corner.
     Either way, a scan whose voxel size divides the run spacing is shifted by
     at most half a run voxel so its voxels line up with the grid's. A scan

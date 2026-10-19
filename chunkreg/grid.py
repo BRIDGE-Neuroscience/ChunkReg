@@ -8,6 +8,10 @@ Conventions fixed here and relied on everywhere else:
 * The chunk geometry is a *profile* and does not vary between pyramid levels.
   The coarsest level is by construction the level at which the whole volume
   fits inside a single chunk.
+* Pyramid levels are numbered as OME-Zarr numbers its datasets: level ``0``
+  is full resolution (the run grid) and level ``K`` is the coarsest. Level
+  ``l`` is the native grid mean-pooled by ``2**l``. The level loop runs from
+  ``K`` down to ``0``.
 
 The profile is the load-bearing object. Because the halo is fixed, the halo
 bound of the design is read backwards: it defines the displacement clamp
@@ -30,6 +34,7 @@ __all__ = [
     "Chunk",
     "pyramid",
     "pyramid_depth",
+    "coarsest_level",
     "tile",
     "window",
     "chunks_touching",
@@ -282,12 +287,26 @@ def pyramid_depth(shape: Sequence[int], core: int) -> int:
 
 
 def pyramid(native: GridSpec, profile: Profile) -> list[GridSpec]:
-    """Level grids from coarsest (index 0, one chunk) to native (index K).
+    """Level grids indexed by level: native (index 0) to coarsest (index K).
 
-    Level ``k`` is the native grid mean-pooled by ``2**(K-k)``.
+    Level ``l`` is the native grid mean-pooled by ``2**l``, so its spacing is
+    ``native.spacing_mm * 2**l``, and level ``K`` is the first that fits in a
+    single chunk. The index is the OME-Zarr dataset path of the same level in
+    a subject store.
     """
     K = pyramid_depth(native.shape, profile.core)
-    return [native.coarsened(2 ** (K - k)) for k in range(K + 1)]
+    return [native.coarsened(2**level) for level in range(K + 1)]
+
+
+def coarsest_level(level: int, grid: GridSpec, profile: Profile) -> int:
+    """The coarsest level ``K`` of the pyramid that has ``grid`` as level ``level``.
+
+    The pyramid above any level is that level's own pyramid, so the levels
+    still to go from ``level`` to the coarsest are ``pyramid_depth`` of its
+    grid. That makes ``K`` recoverable from one level alone, which is what a
+    manifest, built for a single level, records it from.
+    """
+    return int(level) + pyramid_depth(grid.shape, profile.core)
 
 
 def shard_grid(grid: GridSpec, profile: Profile) -> tuple[int, int, int]:

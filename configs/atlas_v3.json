@@ -24,9 +24,9 @@
 
   "levels": {
     "stop_at": "100um",
-    "caps": [20, 15, 8, 5, 3],
+    "caps": [3, 3, 5, 8, 15, 20],
 
-    "level0_stages": [
+    "coarsest_stages": [
       "moments",
       {"rigid":  {"scales": [4, 2, 1], "iterations": [400, 300, 200], "lr": 0.02}},
       {"affine": {"scales": [4, 2, 1], "iterations": [400, 300, 200], "lr": 0.02}},
@@ -40,22 +40,22 @@
     ],
 
     "level_params": {
-      "1": {"iterations": [300, 200], "lr": 1.50, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
-      "2": {"iterations": [250, 150], "lr": 1.25, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
-      "3": {"iterations": [200, 120], "lr": 1.00, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
-      "4": {"iterations": [150, 100], "lr": 0.75, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
+      "4": {"iterations": [300, 200], "lr": 1.50, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "3": {"iterations": [250, 150], "lr": 1.25, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "2": {"iterations": [200, 120], "lr": 1.00, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4},
+      "1": {"iterations": [150, 100], "lr": 0.75, "smooth_grad_sigma": 0.60, "smooth_warp_sigma": 0.30, "cc_kernel": 5, "tolerance": 1e-4}
     },
 
     "stop": {"residual_frac": 0.5, "ubar_vox": 1.0, "percentile": 99.0},
 
     "shape_update_step": 0.40,
-    "sharpen_laplacian_levels": [0, 1],
+    "sharpen_laplacian_levels": [5, 4],
     "min_tissue_fraction": 0.02,
-    "level0_max_disp_frac": 0.25
+    "coarsest_max_disp_frac": 0.25
   },
 
   "retry": {"fold_frac": 0.01, "ladder": ["sigma_w_x2", "clamp_x0.5"]},
-  "retention": {"keep_history_levels": [0, 1], "delete_task_arrays": true, "delete_accumulators": true},
+  "retention": {"keep_history_levels": [5, 4], "delete_task_arrays": true, "delete_accumulators": true},
 
   "slurm": {"register": {"chunks_per_task": 1}}
 }

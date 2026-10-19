@@ -153,7 +153,10 @@ printing three things:
 
 - **The pyramid.** Levels halve in resolution from native until the volume fits
   one chunk. The depth is worked out for you. A 2500³ volume at 50 µm gives
-  levels at 800, 400, 200, 100 and 50 µm, numbered 0 to 4.
+  levels at 50, 100, 200, 400 and 800 µm, numbered 0 to 4: level 0 is full
+  resolution and level `k` has 2^k times its spacing, the same numbering as the
+  OME-Zarr datasets of each subject store. The run goes from the coarsest
+  level (4 here) down to 0.
 - **The stages per level.** These are the registration settings each level will
   actually use.
 - **The cost.** This is the work per level and the estimated GPU-hours.
@@ -199,8 +202,10 @@ volume as OME-Zarr instead of a file. The named arguments are `grid`,
 any other config key goes through as a keyword:
 
 ```python
-chunkreg.register(..., levels={"caps": [4, 3, 2]}, features={"mind": False})
+chunkreg.register(..., levels={"caps": [2, 3, 4]}, features={"mind": False})
 ```
+
+(`caps` is listed from full resolution towards the coarsest level.)
 
 ## The fixed volume's grid
 
@@ -288,12 +293,15 @@ shape bias decays rather than accumulates.
 | Per-pass QC sheet | `<root>/levels/L<k>/qc/it<n>.png` |
 | Residual map | `<root>/levels/L<k>/qc/residual_<id>.zarr` (OME-Zarr) |
 
+`L<k>` is level `k`: `L0` is full resolution and the highest number the
+coarsest, as in the subject stores' OME-Zarr datasets.
+
 Fields map template coordinates to subject coordinates, in millimetres. To use
 them:
 
 ```bash
 chunkreg apply subjects/s01.zarr fields/s01.zarr s01_in_template.zarr
-chunkreg export levels/L4/template.zarr template.nii.gz
+chunkreg export levels/L0/template.zarr template.nii.gz
 ```
 
 Everything the pipeline writes is on the run grid, which is chosen for the
@@ -382,7 +390,14 @@ rules have changed since, a level may add passes, but only until the next
 level has been seeded from it.
 
 To redo work on purpose, use `chunkreg run run.json --from-level N`. This
-discards the progress at level N and every finer level, then runs them again.
+discards the progress at level N and every finer level (N-1 down to 0, full
+resolution), then runs them again.
+
+A run root started by a chunkreg that numbered levels from the coarsest
+(`levels/L0` was the coarsest there) is refused rather than resumed, since its
+records would be read against the wrong resolutions. Finish it with the
+chunkreg it was started with, or start a new root. A root this version starts
+records its numbering in `levels/level_order.json`.
 
 ---
 
@@ -394,14 +409,15 @@ These apply to both kinds of run.
 
 Coarse levels need stiff regularisation, and fine levels need freedom for
 detail such as cerebellar folia. `level_params` sets parameters per level,
-using the level numbers from the pyramid table:
+using the level numbers from the pyramid table (0 is full resolution). For
+the five-level example above, 400 µm and 50 µm:
 
 ```json
 "levels": {
   "seeded_stages": [{"greedy": {"scales": [2, 1], "iterations": [50, 30]}}],
   "level_params": {
-    "1": {"iterations": [60, 40],  "lr": 0.5,  "smooth_grad_sigma": 1.2, "smooth_warp_sigma": 0.7},
-    "4": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.3, "cc_kernel": 5}
+    "3": {"iterations": [60, 40],  "lr": 0.5,  "smooth_grad_sigma": 1.2, "smooth_warp_sigma": 0.7},
+    "0": {"iterations": [100, 70], "lr": 0.25, "smooth_grad_sigma": 0.6, "smooth_warp_sigma": 0.3, "cc_kernel": 5}
   }
 }
 ```
@@ -411,8 +427,12 @@ You can set `scales`, `iterations`, `lr`, `translation_lr`,
 A misspelt key is an error, and a level number the pyramid lacks is reported.
 To replace a level's stages entirely, use `level_stages` with the same keys.
 
-Level 0 uses `level0_stages`, which by default are moments, rigid, affine and
-then greedy. Every other level starts from `seeded_stages`.
+The coarsest level uses `coarsest_stages`, which by default are moments,
+rigid, affine and then greedy. Every other level starts from `seeded_stages`.
+`levels.anneal` takes the same level keys. The keys `level0_stages` and
+`level0_max_disp_frac` of the earlier coarse-first numbering are now
+`coarsest_stages` and `coarsest_max_disp_frac`; a config that still uses them
+is refused, because its level numbers count the old way too.
 
 ## Choosing which levels run
 
@@ -430,7 +450,7 @@ anything.
 `levels.run` picks an arbitrary subset:
 
 ```json
-"levels": {"run": [0, "400um", "200um"]}
+"levels": {"run": [4, "400um", "200um"]}
 ```
 
 - **Stop early** by leaving out the finest levels. The example above stops at
@@ -439,10 +459,12 @@ anything.
   straight to the next level that runs.
 - **Name levels** by number, or by spacing such as `"200um"` or `"0.2mm"`.
   A spacing must match a level in the pyramid table exactly.
-- **Run only tuned levels** with `"run": "listed"`. This runs level 0 plus every
-  level named in `level_params` or `level_stages`.
+- **Run only tuned levels** with `"run": "listed"`. This runs the coarsest
+  level plus every level named in `level_params` or `level_stages`.
 
-Level 0 always runs, because it aligns the whole volume. `setup` marks skipped
+The coarsest level always runs, because it aligns the whole volume. An
+integer `stop_at` or `--stop-at` is a level number too: `--stop-at 2` stops
+at level 2, four times the native spacing. `setup` marks skipped
 levels in the pyramid table and leaves them out of the cost. `setup --stop-at`
 costs a run that stops early.
 
@@ -555,7 +577,7 @@ finally:
 
 print(result.summary())
 chunkreg.apply_field("subjects/s01.zarr", "fields/s01.zarr", "s01_in_template.zarr")
-chunkreg.export_store("levels/L4/template.zarr", "template.nii.gz")
+chunkreg.export_store("levels/L0/template.zarr", "template.nii.gz")
 ```
 
 For two volumes it is [`chunkreg.register`](#registration), which needs no
@@ -589,7 +611,7 @@ costs nothing more than the grid geometry.
 | `engine` | `fireants`, `demons`, or `auto` (FireANTs on a GPU). |
 | `gpus` | How many GPUs a local run uses. Default `all`. |
 | `workers_per_gpu` | Worker processes per GPU. Default 1; `auto` allows 2 when two tasks fit the device. |
-| `levels.caps` | Maximum passes per level. Levels usually stop earlier on their own. |
+| `levels.caps` | Maximum passes per level, listed from full resolution (level 0) towards the coarsest; a deeper pyramid repeats the last value for its extra coarse levels. Levels usually stop earlier on their own. |
 | `levels.stop.*` | What "earlier on their own" means: `residual_frac` and `ubar_vox` for a run that estimates a template, `residual_vox` for one holding a subject fixed, and `percentile`. |
 | `ingest.median_radius` | Optional median denoise at ingest. A scan with one is always copied. |
 | `ingest.link` | Read zarr scans that are already on the run grid in place. Default `true`. |
