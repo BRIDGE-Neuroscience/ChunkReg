@@ -29,6 +29,9 @@ refused on resume.
 - NGFF 0.6 stores (coordinateSystems, sequence transforms) are read by ingest.
 - `scripts/qc_levels.py`: one QC figure per finished level. Docs site under
   `docs/` (MkDocs).
+- The blend accumulates and smooths each core together with a margin into its
+  neighbours and crops afterwards, so the field has no derivative kink at
+  chunk seams (those kinks were folds along every seam at large displacements).
 - A chunk's fold check is judged over its core, not its padded box: a fold
   in the halo, where the blend's weight is zero, no longer makes a sound chunk
   emit its seed. A pass has at least as many register tasks as the runner has

@@ -94,6 +94,13 @@ judged over the padded box, halo included, where the registration is least const
 zero. Changed (in main and as a one-line patch of the cluster copy, backup `register.py.bak_padded_folds`) to judge
 the core only. The level had already closed at pass 4 under the old criterion (8 of 8 gave up), so the
 job was resubmitted as 7558158 with `--from-level 1`, redoing 640 um and finer under the new one.
+The 640 um QC figure then showed fold lines exactly along the chunk seams: the blend smoothed each core
+within itself with its own edge replicated, a derivative kink at every seam. The blend now accumulates and
+smooths over the core plus a margin and crops (seam ratios 1.01/1.23/1.02 -> 0.84/1.04/0.90 on the local smoke);
+installed in the cluster copy too (backup `blend.py.bak_core_smoothing`) and the job resubmitted again as
+7558168 from level 1. Before that restart, 320 um showed 12-13 of 27 chunks giving up on folds: lr 1.0 at the
+fine levels was never run locally (the finished 80 um levels used lr 0.25); `prepare --lr-fine 0.5` is the
+fallback if the smooth seed does not cure it.
 
 **Not done tonight, still wanted:** section 2 (finished on branch `ome-level-order`, worktree `scalable-reg-ome`,
 uncommitted, 520 tests passing -- review and merge after the run), section 3 (the 0.6 reader; `affine_view.

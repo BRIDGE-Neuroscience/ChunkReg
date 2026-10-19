@@ -14,6 +14,7 @@ everywhere by construction.
 
 from __future__ import annotations
 
+import math
 import time
 from itertools import product
 from typing import Any
@@ -25,12 +26,12 @@ from .. import backend as _backend
 from .. import fields as _fields
 from .. import xp as _xp
 from ..config import RunConfig
-from ..grid import window_on
+from ..grid import chunks_touching, window_on
 from ..store import Field, TaskArray, Volume, read_padded, write_block
 from ._common import warped_subject_block
 from .manifest import Manifest
 
-__all__ = ["run_blend_task", "ensure_accumulators", "blend_core", "blend_depends"]
+__all__ = ["run_blend_task", "ensure_accumulators", "blend_core", "blend_depends", "blend_margin", "blend_box"]
 
 
 def blend_depends(cfg: RunConfig, manifest: Manifest) -> dict[int, set[int]]:
@@ -52,17 +53,19 @@ def blend_depends(cfg: RunConfig, manifest: Manifest) -> dict[int, set[int]]:
     overlap predicate the blend itself uses, so the result is exactly
     :meth:`Manifest.chunks_touching_core`.
     """
-    radius = -(-int(cfg.profile.halo) // int(cfg.profile.core))
+    margin = blend_margin(cfg, manifest.level)
+    radius = -(-(int(cfg.profile.halo) + margin) // int(cfg.profile.core))
     offsets = list(product(range(-radius, radius + 1), repeat=3))
     by_index = {tuple(c.index): c for c in manifest.chunks}
     deps: dict[int, set[int]] = {}
     for own in manifest.chunks:
+        box_lo, box_shape = blend_box(manifest.grid, own, margin)
         tasks: set[int] = set()
         for dz, dy, dx in offsets:
             other = by_index.get(
                 (own.index[0] + dz, own.index[1] + dy, own.index[2] + dx)
             )
-            if other is None or not other.intersects(own.core_origin, own.core_shape):
+            if other is None or not other.intersects(box_lo, box_shape):
                 continue
             for subject in manifest.subjects:
                 tasks.add(manifest.locate(subject, other.id)[0])
@@ -113,21 +116,51 @@ def _create_if_absent(b, path, shape, chunks, shards) -> None:
         pass
 
 
+def blend_margin(cfg: RunConfig, level: int) -> int:
+    """Voxels read past a core so its smoothing sees the neighbours' field.
+
+    The blended field is smoothed by half a lattice voxel. Done within the
+    core alone, with the core's own edge replicated, every core ended with a
+    kink in the field's derivative at its boundary; with large displacements
+    those kinks were folds along every chunk seam. Reading the support of the
+    kernel past the core (the neighbours' residuals cover it, since the halo
+    is wider) and cropping after smoothing removes them.
+    """
+    sigma = 0.5 * cfg.profile_at(level).lattice_factor
+    return int(math.ceil(4.0 * sigma)) if sigma > 0 else 0
+
+
+def blend_box(grid, chunk, margin: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """A chunk's core widened by ``margin``, clipped to the level."""
+    lo = np.maximum(np.asarray(chunk.core_origin, dtype=np.int64) - margin, 0)
+    hi = np.minimum(
+        np.asarray(chunk.core_origin, dtype=np.int64) + np.asarray(chunk.core_shape, dtype=np.int64) + margin,
+        np.asarray(grid.shape, dtype=np.int64),
+    )
+    return tuple(int(v) for v in lo), tuple(int(v) for v in hi - lo)
+
+
 def blend_core(
     cfg: RunConfig, manifest: Manifest, subject: str, chunk_id: int
 ) -> np.ndarray:
-    """Partition-of-unity merge over one core, at level resolution."""
+    """Partition-of-unity merge over one core, at level resolution.
+
+    Accumulated over the core plus :func:`blend_margin`, smoothed there, and
+    cropped to the core, so the smoothing never replicates a core's own edge.
+    """
     own = manifest.chunk(chunk_id)
     grid = manifest.grid
     core_shape = tuple(own.core_shape)
-    num = _xp.zeros((3,) + core_shape, dtype=np.float64)
-    den = _xp.zeros(core_shape, dtype=np.float64)
+    margin = blend_margin(cfg, manifest.level)
+    box_lo, box_shape = blend_box(grid, own, margin)
+    num = _xp.zeros((3,) + tuple(box_shape), dtype=np.float64)
+    den = _xp.zeros(tuple(box_shape), dtype=np.float64)
 
-    lo = np.asarray(own.core_origin, dtype=np.int64)
-    hi = lo + np.asarray(core_shape, dtype=np.int64)
+    lo = np.asarray(box_lo, dtype=np.int64)
+    hi = lo + np.asarray(box_shape, dtype=np.int64)
 
     cache: dict[int, TaskArray] = {}
-    for other in manifest.chunks_touching_core(chunk_id):
+    for other in chunks_touching(manifest.chunks, box_lo, box_shape):
         task_id, index = manifest.locate(subject, other.id)
         if task_id not in cache:
             cache[task_id] = TaskArray.open(
@@ -172,10 +205,15 @@ def blend_core(
         )
     out = _xp.to_float32(num / den)
 
-    sigma = cfg.profile_at(manifest.level).lattice_factor  # one lattice voxel, in level voxels
+    sigma = 0.5 * cfg.profile_at(manifest.level).lattice_factor  # half a lattice voxel
     if sigma > 0:
-        out = _fields.smooth(out, sigma * 0.5, mode="nearest")
-    return out
+        out = _fields.smooth(out, sigma, mode="nearest")
+    off = np.asarray(own.core_origin, dtype=np.int64) - lo
+    crop = (slice(None),) + tuple(
+        slice(int(o), int(o + n)) for o, n in zip(off, core_shape)
+    )
+    out = out[crop]
+    return out.contiguous() if _xp.is_tensor(out) else np.ascontiguousarray(out)
 
 
 def _upsample_box(

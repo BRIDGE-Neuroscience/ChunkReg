@@ -63,10 +63,10 @@ COARSEST_ANNEAL = {"passes": 25, "smooth_grad_sigma": [3.0, 1.5], "smooth_warp_s
 SECOND_ANNEAL = {"passes": 12, "smooth_grad_sigma": [2.5, 1.5], "smooth_warp_sigma": [2.0, 1.0]}
 
 
-def _seeded(iters, sigma_g=1.5, sigma_w=1.0):
+def _seeded(iters, sigma_g=1.5, sigma_w=1.0, lr=1.0):
     return {
         "kind": "greedy", "scales": [2, 1], "iterations": list(iters), "loss": "cc",
-        "cc_kernel": 7, "lr": 1.0, "smooth_grad_sigma": sigma_g, "smooth_warp_sigma": sigma_w,
+        "cc_kernel": 7, "lr": lr, "smooth_grad_sigma": sigma_g, "smooth_warp_sigma": sigma_w,
     }
 
 
@@ -94,16 +94,16 @@ def level_plan(spacings_um, args):
             anneal[k] = SECOND_ANNEAL
         elif um > 100:
             caps.append(4)
-            stages[k] = [_seeded((100, 60))]
+            stages[k] = [_seeded((100, 60), args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
         elif um > 50:
             caps.append(args.cap_80um)
-            stages[k] = [_seeded(args.iters_80um)]
+            stages[k] = [_seeded(args.iters_80um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
         elif um > 25:
             caps.append(args.cap_40um)
-            stages[k] = [_seeded(args.iters_40um)]
+            stages[k] = [_seeded(args.iters_40um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
         else:
             caps.append(args.cap_20um)
-            stages[k] = [_seeded(args.iters_20um)]
+            stages[k] = [_seeded(args.iters_20um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
     return caps, stages, anneal
 
 
@@ -368,6 +368,11 @@ def main(argv=None) -> int:
         p.add_argument("--cap-80um", type=int, default=2)
         p.add_argument("--cap-40um", type=int, default=1)
         p.add_argument("--cap-20um", type=int, default=1)
+        p.add_argument("--lr-fine", type=float, default=1.0,
+                       help="FireANTs learning rate at every level below the annealed two (default 1.0; "
+                            "0.5 if many chunks give up on folds)")
+        p.add_argument("--sigma-fine", type=lambda s: [float(v) for v in s.split(",")], default=[1.5, 1.0],
+                       help="smooth_grad_sigma,smooth_warp_sigma at those levels (default 1.5,1.0)")
         p.add_argument("--gpu-mem-gb", type=float, default=80.0)
 
     p = sub.add_parser("prepare", help="subject stores, grid record and config per core")
