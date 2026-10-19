@@ -107,7 +107,15 @@ every level (`CHUNKREG_TEMPLATE_LINK_MIN_VOXELS=0`); that run then failed becaus
 left by the crash was trusted -- `template_from_subject` now remakes a template that has no window, and the
 stale store and seed marker were removed by hand. The 320 um field is over-warped (|u| p99.5 32 mm, Jacobian at
 0.5x/2x over much of the brain): lr 1.0 and smoothing 1.5/1.0 at the fine levels is under-regularised for this
-pair; the redo from 320 um uses lr 0.5 and smoothing 2.5/2.0.
+pair. Reviewing the 640 and 1280 um figures, the over-warping was already present at the coarse levels (lr 1.0,
+smoothing annealed to 1.5/1.0, 29 + 18 passes). Redesigned and restarted as a new run (**v2**, root
+`bigbrain_s2146/v2/c160`, job 7558778, 13:32 BST, cluster copy now main 0.2.0): the coarse levels held stiff
+(lr 0.5, smoothing 3.0/2.5, 8 passes each, coarsest clamp 0.12 of the field of view), easing through 320 and
+160 um, free from 80 um (lr 1, 1.5/1.0, two passes at 40 um); core 160 / halo 84 so a pass may move 28 voxels
+instead of 12 inside the same 328-cubed memory. v2 at 1280 um after 8 passes: d99 falling steadily 2.39 -> 1.06 mm,
+|u| p99.5 7.5 mm (was 22.5), Jacobian within about 0.7-1.4x, Dice 0.972 (was 0.981 with the over-fit).
+Note for the sysadmin: seymour2's GPU prolog reads `/var/gpu/*.free`, which is missing, so it refuses multi-GPU
+allocations ("not enough GPUs") while SGE shows free slots.
 
 **Not done tonight, still wanted:** section 2 (finished on branch `ome-level-order`, worktree `scalable-reg-ome`,
 uncommitted, 520 tests passing -- review and merge after the run), section 3 (the 0.6 reader; `affine_view.
