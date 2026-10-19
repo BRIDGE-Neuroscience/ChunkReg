@@ -356,7 +356,15 @@ def template_from_subject(cfg: RunConfig, level: int, grid: GridSpec) -> Volume:
         )
     path = cfg.template_path(level)
     if Volume.exists(path, cfg.backend):
-        return Volume.open(path, cfg.backend)
+        existing = Volume.open(path, cfg.backend)
+        if existing.normalisation is not None:
+            return existing
+        # A store without a window was left by a run that died while making
+        # it: a copy interrupted part way. Trusting it fails every register
+        # task of the level, so it is made again.
+        from .. import backend as _backend
+
+        _backend.get_backend(cfg.backend).remove(path)
     source = _template_source(src, level) if grid.n_voxels >= TEMPLATE_LINK_MIN_VOXELS else None
     if source is not None:
         dst = Volume.create(

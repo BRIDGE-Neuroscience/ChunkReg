@@ -101,6 +101,13 @@ installed in the cluster copy too (backup `blend.py.bak_core_smoothing`) and the
 7558168 from level 1. Before that restart, 320 um showed 12-13 of 27 chunks giving up on folds: lr 1.0 at the
 fine levels was never run locally (the finished 80 um levels used lr 0.25); `prepare --lr-fine 0.5` is the
 fallback if the smooth seed does not cure it.
+7558168 died at `promote level 2 -> 3`: the driver copies a template below 2^30 voxels through the GPU, and the
+H100s are in exclusive-process mode with both cards held by workers. Resumed (7558714) with templates linked at
+every level (`CHUNKREG_TEMPLATE_LINK_MIN_VOXELS=0`); that run then failed because the half-copied 160 um template
+left by the crash was trusted -- `template_from_subject` now remakes a template that has no window, and the
+stale store and seed marker were removed by hand. The 320 um field is over-warped (|u| p99.5 32 mm, Jacobian at
+0.5x/2x over much of the brain): lr 1.0 and smoothing 1.5/1.0 at the fine levels is under-regularised for this
+pair; the redo from 320 um uses lr 0.5 and smoothing 2.5/2.0.
 
 **Not done tonight, still wanted:** section 2 (finished on branch `ome-level-order`, worktree `scalable-reg-ome`,
 uncommitted, 520 tests passing -- review and merge after the run), section 3 (the 0.6 reader; `affine_view.
