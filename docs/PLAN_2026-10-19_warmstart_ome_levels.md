@@ -81,6 +81,15 @@ run with `STOP_AT=40um` and continue later; the run resumes.
 float32 per level, task arrays ~1.2 TB uncompressed per pass (deleted after the blend). Budget >= 1 TB on the run
 filesystem; everything compresses, the empties to nothing.
 
+**Launch record (2026-10-19, pryor.cs.ucl.ac.uk).** Job 7558152, `sge/bigbrain_s2146_20um.qsub`, 2 H100 on
+seymour2 (the node's GPU prolog refused 4 and 3 although SGE showed 4 free slots; the rest of the 80 GB estate was
+full). Core 256 ran out of memory in calibration (78.4 of 79 GB) and the job fell back to the c192 root: 7 levels,
+1280 um coarsest, 328^3 chunks, 47 GB per task. Calibration: 14.1 s per chunk at the 20 um schedule, 122 bytes
+per voxel-channel, receptive field 32. Fixed = the masked `S-21-46_brain_20um.ome.zarr` already on the cluster
+(all six levels linked); moving = BigBrain pulled from the public bucket with `scripts/fetch_public_gcs_zarr.sh`
+(265 objects verified). The code on the cluster is main at 093b4c9 (pre-renumbering); the run root is numbered the
+old way and must finish under that code.
+
 **Not done tonight, still wanted:** section 2 (finished on branch `ome-level-order`, worktree `scalable-reg-ome`,
 uncommitted, 520 tests passing -- review and merge after the run), section 3 (the 0.6 reader; `affine_view.
 ome_datasets` parses 0.6 datasets for the two new store constructors, `io_formats` still does not), fixes 1b/1d,
