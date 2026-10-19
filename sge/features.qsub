@@ -1,7 +1,8 @@
 #!/bin/bash
 # chunkreg features on one GPU: anatomix channels as RGB per subject per level.
 #
-#   qsub -v CONFIG=/path/run.json,ARGS="--size-vox 512 --plane all --basis shared" sge/features.qsub
+#   qsub -v CONFIG=/path/run.json,ARGS="--size-vox 512 --plane all --subjects 'a b'" sge/features.qsub
+#   (no commas inside ARGS: Grid Engine splits -v on them; lists take spaces)
 #
 # Writes to <root>/qc/features unless ARGS carries --out. Same container and
 # bind conventions as sge/bigbrain_s2146_20um.qsub.
@@ -23,7 +24,12 @@ ARGS="${ARGS:-}"
 RUNTIME=$(command -v apptainer || command -v singularity)
 export TMPDIR="${TMPDIR:-/tmp/chunkreg.$$}"; mkdir -p "$TMPDIR/cache"
 pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
-[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+elif [ -n "${JOB_ID:-}" ]; then
+    echo "Grid Engine started this job without a GPU; exiting 99 to requeue" >&2
+    exit 99
+fi
 pass TMPDIR "$TMPDIR"; pass XDG_CACHE_HOME "$TMPDIR/cache"; pass MPLCONFIGDIR "$TMPDIR/cache"
 pass PATH "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"; pass HF_HOME "/opt/hf"; pass HF_HUB_OFFLINE "1"
 pass PYTHONNOUSERSITE "1"; pass PYTHONUNBUFFERED "1"; pass PYTHONPATH "/opt/chunkreg-dev"
