@@ -26,8 +26,8 @@
 #$ -N bb_s2146_20um
 #$ -l h_rt=36:00:00
 #$ -l gpu=true,gpu_type=h100
-#$ -pe gpu 6                         # GPUs; one chunkreg worker on each (raise to 8 if the node has them)
-#$ -l tmem=40G                       # PER SLOT
+#$ -pe gpu 4                         # GPUs; one chunkreg worker on each (what seymour2 had free on 2026-10-19)
+#$ -l tmem=48G                       # PER SLOT
 #$ -R y
 #$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log
 #$ -S /bin/bash

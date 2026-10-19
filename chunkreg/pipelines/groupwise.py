@@ -367,12 +367,25 @@ def _run_pass(
         # the whole register pass, so the two run as one dependency-ordered
         # dispatch. The barrier they replace is where most of a node's GPUs
         # sit idle behind the last few register tasks of every pass.
+        #
+        # A task array is deleted as soon as the last blend that reads it is
+        # done, not at the end of the pass: the records the stopping rule
+        # needs came back with the task's result, and the residual map was
+        # written separately, so nothing else ever opens it again. Without
+        # this, one pass at 20 um holds about a terabyte of them at its peak.
+        free_upstream = None
+        if cfg.retention.delete_task_arrays:
+            from .. import backend as _backend
+
+            b = _backend.get_backend(cfg.backend)
+            free_upstream = lambda tid: b.remove(cfg.task_path(level, iteration, tid))
         reg, bl = runner.run_chain(
             "register",
             register_ids,
             "blend",
             blend_ids,
             _blend.blend_depends(cfg, manifest),
+            free_upstream=free_upstream,
         )
     else:
         reg = runner.run(
