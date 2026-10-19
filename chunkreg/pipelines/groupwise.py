@@ -278,7 +278,8 @@ def build_template(
                 pr, manifest = _run_pass(
                     cfg, runner, engine, extractor, level, iteration, grid, config_path
                 )
-            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap)
+            history = [p.d99_mm for p in report.passes] + [pr.d99_mm]
+            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap, history)
             pr.stopped, pr.reason = stopped, reason
             report.passes.append(pr)
             say(
@@ -355,7 +356,8 @@ def _run_pass(
     # Created before anything is dispatched, so the common path does not rely
     # on the race-tolerance inside the task, and so a blend that starts while
     # register is still running finds them there.
-    _blend.ensure_accumulators(cfg, manifest)
+    if cfg.template_subject is None:
+        _blend.ensure_accumulators(cfg, manifest)  # only the update pass reads them
     _qc.ensure_residual_stores(cfg, manifest)
     register_ids = range(manifest.n_tasks)
     blend_ids = range(len(manifest.chunks))
@@ -644,8 +646,30 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float,
     )
 
 
+def _plateaued(cfg: RunConfig, level: int, iteration: int, history: Sequence[float]) -> bool:
+    """Has the residual stopped falling, by ``levels.stop.plateau``?
+
+    ``history`` is the level's d99 per pass so far, this pass last. The test
+    waits until the anneal schedule (if any) has run, then compares this pass
+    with the one ``passes`` earlier: no fall of at least ``rel`` means a
+    plateau. A rise counts as a plateau too -- the residual is a histogram
+    percentile and wanders once the level has converged.
+    """
+    n = cfg.levels.plateau_passes
+    if not n or len(history) <= n:
+        return False
+    after = cfg.levels.plateau_after
+    if after is None:
+        after = int((cfg.levels.anneal.get(int(level)) or {}).get("passes", 0))
+    if iteration < after + n:
+        return False
+    old, new = float(history[-1 - n]), float(history[-1])
+    return (old - new) < cfg.levels.plateau_rel * old
+
+
 def _should_stop(
-    cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap
+    cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap,
+    history: Sequence[float] = (),
 ) -> tuple[bool, str]:
     """Has this level finished?
 
@@ -666,8 +690,17 @@ def _should_stop(
     fits_next_halo = threshold > 0 and pr.d99_mm < threshold
 
     if cfg.template_subject is not None:
+        solved = pr.entries - pr.seeded_tissue
+        if solved > 0 and pr.seeded_folds >= solved:
+            # Every chunk that had tissue gave up on folds and emitted its seed,
+            # so the residual is empty, not small: report it as what it is.
+            return True, "every chunk gave up on folds (field kept from the previous pass)"
         if pr.d99_mm < cfg.levels.residual_vox * grid.spacing_mm:
             return True, "residual is sub-voxel"
+        if _plateaued(cfg, pr.level, iteration, history):
+            return True, f"residual plateaued over {cfg.levels.plateau_passes} passes"
+        if cfg.levels.require_subvoxel:
+            fits_next_halo = False
         if fits_next_halo:
             return True, "residual fits the next halo"
     else:

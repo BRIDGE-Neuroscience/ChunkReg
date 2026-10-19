@@ -28,6 +28,13 @@ def _one(spec: str, **kwargs) -> FeatureExtractor:
         from .pca import PCAFeatures
 
         return PCAFeatures(n_components=n, **kwargs)
+    window = anatomix_window(spec)
+    if window is not None:
+        # ``anatomix:wN``: anatomix run in N-voxel sliding windows rather than
+        # over the whole chunk in one pass (see ``features.anatomix_window``).
+        from .anatomix import AnatomixFeatures
+
+        return AnatomixFeatures(window=window, **kwargs)
     if spec not in _REGISTRY:
         raise ValueError(
             f"unknown feature spec {spec!r}; use one of "
@@ -85,6 +92,24 @@ def get_extractor(spec: str, seed: int = 0, **kwargs) -> FeatureExtractor:
     return ChannelSample(inner, k, seed=seed)
 
 
+def anatomix_window(name: str) -> int | None:
+    """The window of an ``anatomix:wN`` spec part, or ``None`` for any other part.
+
+    Windowed anatomix sees at most N voxels of context. On a whole brain at a
+    coarse level the network otherwise sees the entire volume in one pass and
+    its channels are dominated by where a voxel sits in the brain, which
+    differs between subjects; limiting the context to a few centimetres makes
+    them describe local tissue, which is what a deformable stage can match.
+    """
+    name = str(name).strip()
+    if not name.startswith("anatomix:w"):
+        return None
+    try:
+        return int(name[len("anatomix:w"):])
+    except ValueError:
+        raise ValueError(f"feature spec {name!r}: the window must be an integer, e.g. anatomix:w64") from None
+
+
 def describe(spec: str) -> tuple[int, int]:
     """``(channels registered per pass, receptive-field radius)`` of a spec.
 
@@ -101,6 +126,9 @@ def describe(spec: str) -> tuple[int, int]:
     for n in names:
         if n.startswith("pca:"):
             channels += int(n.split(":", 1)[1])
+            r_f = max(r_f, known_rf["anatomix"])
+        elif anatomix_window(n) is not None:
+            channels += known_ch["anatomix"]
             r_f = max(r_f, known_rf["anatomix"])
         elif n in known_ch:
             channels += known_ch[n]

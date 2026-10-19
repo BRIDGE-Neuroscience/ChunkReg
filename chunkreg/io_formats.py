@@ -150,17 +150,70 @@ def is_zarr(path) -> bool:
     )
 
 
+def _flatten_transforms(transforms) -> list[dict]:
+    """NGFF 0.6 nests transforms in ``sequence`` entries; flatten them."""
+    out: list[dict] = []
+    for tr in transforms or []:
+        if not isinstance(tr, dict):
+            continue
+        if tr.get("type") == "sequence":
+            out += _flatten_transforms(tr.get("transformations"))
+        else:
+            out.append(tr)
+    return out
+
+
+def _ome_axes(multiscale: dict) -> tuple[list, str | None]:
+    """The axes of a multiscale, and the name of the coordinate system they belong to.
+
+    NGFF 0.4 and 0.5 put ``axes`` on the multiscale. 0.6 puts them inside
+    named ``coordinateSystems``; the datasets' own system is the one their
+    transforms output to (``physical``, usually), and that is the one whose
+    axes carry the voxel size. Other systems (an MNI frame) are metadata.
+    """
+    axes = list(multiscale.get("axes") or [])
+    if axes:
+        return axes, None
+    systems = [s for s in (multiscale.get("coordinateSystems") or []) if isinstance(s, dict)]
+    if not systems:
+        return [], None
+    wanted = None
+    for ds in multiscale.get("datasets") or []:
+        for tr in ds.get("coordinateTransformations") or []:
+            out = tr.get("output") if isinstance(tr, dict) else None
+            if isinstance(out, dict) and out.get("name"):
+                wanted = out["name"]
+                break
+        if wanted:
+            break
+    system = next((s for s in systems if s.get("name") == wanted), systems[0])
+    return list(system.get("axes") or []), system.get("name")
+
+
 def _ome_spacing(
-    multiscale: dict, dataset: dict, axes: list
+    multiscale: dict, dataset: dict, axes: list, system: str | None = None
 ) -> float | tuple[float, float, float] | None:
-    """Voxel size in mm from OME-NGFF scale transforms, ordered ``(z, y, x)``."""
+    """Voxel size in mm from OME-NGFF scale transforms, ordered ``(z, y, x)``.
+
+    Dataset transforms are read whole, ``sequence`` entries included. A
+    multiscale-level transform is applied after them in 0.4 and so counts, but
+    only when it stays in the datasets' own system: a 0.6 transform into
+    another system (``output`` naming an MNI frame, say) is not a voxel size.
+    """
     scale = [1.0] * len(axes)
-    transforms = list(dataset.get("coordinateTransformations") or [])
-    transforms += list(multiscale.get("coordinateTransformations") or [])
+    transforms = _flatten_transforms(dataset.get("coordinateTransformations"))
+    for tr in multiscale.get("coordinateTransformations") or []:
+        out = tr.get("output") if isinstance(tr, dict) else None
+        if isinstance(out, dict) and out.get("name") not in (None, system):
+            continue
+        transforms += _flatten_transforms([tr])
     found = False
     for tr in transforms:
         if tr.get("type") == "scale" and "scale" in tr:
-            scale = [a * float(b) for a, b in zip(scale, tr["scale"])]
+            s = list(tr["scale"])
+            # A transform may name fewer axes than the array has (spatial only)
+            s = [1.0] * (len(scale) - len(s)) + s if len(s) < len(scale) else s[-len(scale):]
+            scale = [a * float(b) for a, b in zip(scale, s)]
             found = True
     if not found:
         return None
@@ -216,10 +269,10 @@ def _resolve_zarr(p: Path):
         m = multiscales[0]
         dataset = m["datasets"][0]  # the first dataset is the full resolution
         arr = node[dataset["path"]]
-        axes = list(m.get("axes") or [])
+        axes, system = _ome_axes(m)
         if axes:
             names = [a["name"] if isinstance(a, dict) else str(a) for a in axes]
-            spacing = _ome_spacing(m, dataset, axes)
+            spacing = _ome_spacing(m, dataset, axes, system)
         else:  # NGFF 0.3 and earlier carry no axes: assume trailing z, y, x
             names = [f"dim{i}" for i in range(arr.ndim - 3)] + list(_SPATIAL)
             spacing = None

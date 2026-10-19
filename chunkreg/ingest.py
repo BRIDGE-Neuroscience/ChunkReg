@@ -113,6 +113,92 @@ def scan_voxel(
     )
 
 
+def _has_pyramid(path) -> bool:
+    """Is this zarr an OME multiscale group with more than one dataset?"""
+    import json
+
+    doc = Path(path) / "zarr.json"
+    if not doc.exists():
+        return False
+    try:
+        attrs = json.loads(doc.read_text(encoding="utf-8")).get("attributes") or {}
+    except (OSError, ValueError):
+        return False
+    ome = attrs.get("ome", attrs)
+    ms = ome.get("multiscales") if isinstance(ome, dict) else None
+    return bool(ms) and len(ms[0].get("datasets") or []) > 1
+
+
+def _affine_matrix(cfg, value):
+    """A warm-start affine as a 4x4 array, from the config's list or a JSON file.
+
+    A file may hold the matrix under any key; the first 4x4 or 3x4 numeric
+    list found is taken (``T_pair_bigbrain_to_s2146_zyx_um``, ``affine_um``...).
+    """
+    import json
+
+    import numpy as np
+
+    if isinstance(value, str):
+        path = _resolve(cfg, value)
+        try:
+            doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise IngestError(f"cannot read the warm-start affine {path}: {exc}") from None
+        found = None
+        candidates = [doc] if isinstance(doc, list) else list(doc.values())
+        for cand in candidates:
+            try:
+                a = np.asarray(cand, dtype=np.float64)
+            except (TypeError, ValueError):
+                continue
+            if a.shape in ((4, 4), (3, 4)):
+                found = a
+                break
+        if found is None:
+            raise IngestError(f"{path} holds no 4x4 or 3x4 matrix")
+        value = found
+    T = np.asarray(value, dtype=np.float64)
+    if T.shape == (3, 4):
+        T = np.vstack([T, [0.0, 0.0, 0.0, 1.0]])
+    return T
+
+
+def _physical_frame(cfg, fixed_id: str, grid, sources, say):
+    """The fixed scan's own physical frame: voxel ``i`` at ``scale * i + translation`` um.
+
+    From its OME-Zarr metadata when the source is one; a plain array or a
+    NIfTI has no stated origin, so its physical frame is taken as voxel index
+    times voxel size. The run grid is the fixed scan's own sampling (it is the
+    grid reference), so this is also the map from run voxels to physical um.
+    """
+    from .store import Volume
+
+    src = sources.get(fixed_id)
+    src_path = src[0] if src else None
+    if src_path is None:
+        spec = next(s for s in cfg.subjects if s.id == fixed_id)
+        if spec.source is not None:
+            src_path = _resolve(cfg, spec.source)
+    if src_path is not None and (Path(src_path) / "zarr.json").exists():
+        try:
+            from .affine_view import ome_datasets
+
+            datasets = ome_datasets(src_path)
+            finest = min(datasets, key=lambda d: max(d["scale_um"]))
+            if tuple(finest["shape"]) == tuple(grid.shape):
+                return finest["scale_um"], finest["translation_um"]
+            say(
+                f"  note: {fixed_id}: the run grid {grid.shape} is not the finest dataset "
+                f"of {src_path} ({finest['shape']}); its physical frame is taken as "
+                f"voxel x spacing"
+            )
+        except (OSError, ValueError, KeyError):
+            pass
+    um = grid.spacing_mm * 1000.0
+    return [um] * 3, [0.0, 0.0, 0.0]
+
+
 def same_grid(a, b) -> bool:
     import math
 
@@ -174,8 +260,11 @@ def ingest_subjects(
 
     # The run grid depends on every scan, so the ones already ingested count
     # too. Their stores record the scan they came from, which saves opening
-    # sources that may have been moved since.
+    # sources that may have been moved since. A scan read through a warm-start
+    # affine lives in its own frame and is sampled onto whatever grid the rest
+    # decide, so it takes no part in choosing it.
     scans, sources = {}, {}
+    through_affine = {s.id for s in cfg.subjects if (s.warm_start or {}).get("affine_um")}
     for spec in cfg.subjects:
         if spec in todo:
             src_path = _resolve(cfg, spec.source)
@@ -185,9 +274,14 @@ def ingest_subjects(
                     f"subject {spec.id!r}: 'source' and 'path' are both {dst}; "
                     f"the store has to be written somewhere else"
                 )
+            if spec.id in through_affine:
+                sources[spec.id] = (src_path, None)
+                continue
             source = open_source(src_path)
             sources[spec.id] = (src_path, source)
             scans[spec.id] = (source.shape, scan_voxel(cfg, spec, source, say))
+            continue
+        if spec.id in through_affine:
             continue
         vol = Volume.open(cfg.subject_path(spec.id), cfg.backend)
         recorded = (vol.meta.get("provenance") or {}).get("placement")
@@ -198,6 +292,11 @@ def ingest_subjects(
             g = vol.native_grid
             scans[spec.id] = (g.shape, (g.spacing_mm,) * 3)
 
+    if not scans:
+        raise IngestError(
+            "every subject is read through a warm-start affine; one scan has to "
+            "define the run grid (name it with grid.reference)"
+        )
     try:
         grid, placements = resolve_run_grid(
             scans,
@@ -208,6 +307,8 @@ def ingest_subjects(
         )
     except ValueError as exc:
         raise IngestError(f"cannot choose a run grid: {exc}") from None
+    for sid in through_affine:
+        placements[sid] = Placement.from_grid(grid)
     moved = {
         sid: Volume.open(cfg.subject_path(sid), cfg.backend).native_grid
         for sid in kept
@@ -248,7 +349,50 @@ def ingest_subjects(
     # overlap rather than queue. Threads, not processes: the time goes in zarr
     # decompression and compression, which release the GIL, and a thread keeps
     # whatever device this process configured instead of building its own.
+    def ingest_through_affine(spec) -> list[str]:
+        """A store that samples the scan through its warm-start affine."""
+        from . import affine_view as _av
+        from .store import link_affine_source
+
+        dst = cfg.subject_path(spec.id)
+        src_path, _ = sources[spec.id]
+        ws = spec.warm_start
+        fixed_id = cfg.grid.reference or cfg.template_subject
+        T = _affine_matrix(cfg, ws["affine_um"])
+        scale_um, trans_um = _physical_frame(cfg, fixed_id, grid, sources, say)
+        world_to_src = _av.world_to_source_um(grid, scale_um, trans_um, T)
+        bg = ws.get("background")
+        spec_dict = _av.build_spec(
+            src_path, world_to_src, background=None if bg is None else tuple(bg)
+        )
+        vol = link_affine_source(
+            spec_dict,
+            dst,
+            grid,
+            cfg.profile,
+            backend=cfg.backend,
+            overwrite=True,
+            percentiles=cfg.ingest.percentiles,
+            provenance={
+                "source": str(src_path),
+                "config": cfg.fingerprint(),
+                "warm_start": {k: v for k, v in ws.items() if k != "field"},
+                "placement": Placement.from_grid(grid).to_json(),
+            },
+        )
+        lo, hi = vol.normalisation
+        used = [vol.array(k).dataset["path"] for k in range(vol.n_levels)]
+        return [
+            f"  {spec.id}: {src_path} -> {dst}\n"
+            f"      read in its own frame through the warm-start affine onto the run "
+            f"grid ({'x'.join(str(n) for n in grid.shape)} @ {grid.spacing_mm:g} mm), "
+            f"nothing resampled on disk\n"
+            f"      {vol.n_levels} levels from source datasets {used}, window [{lo:.4g}, {hi:.4g}]"
+        ]
+
     def ingest_one(spec) -> list[str]:
+        if spec.id in through_affine:
+            return ingest_through_affine(spec)
         dst = cfg.subject_path(spec.id)
         src_path, source = sources[spec.id]
         placement = placements[spec.id]
@@ -272,26 +416,59 @@ def ingest_subjects(
         )
         if linkable:
             from .io_formats import open_zarr_in_place
+            from .store import link_pyramid
 
             arr = open_zarr_in_place(src_path)
             layout = f"chunks {tuple(getattr(arr, 'chunks', ()) or ())}"
             shards = getattr(arr, "shards", None)
             layout += f", shards {tuple(shards)}" if shards else ", not sharded"
-            how = (
-                f"read in place, full resolution not copied ({layout}; set "
-                f"ingest.link false to copy it into {cfg.profile.core}-voxel shards)"
-            )
-            vol = link_source(
-                src_path,
-                dst,
-                grid.spacing_mm,
-                cfg.profile,
-                origin_mm=grid.origin_mm,
-                backend=cfg.backend,
-                overwrite=True,
-                percentiles=cfg.ingest.percentiles,
-                provenance=provenance,
-            )
+            vol = None
+            if _has_pyramid(src_path):
+                # The scan carries its own pyramid: every level whose shape is
+                # the run's is read where it lies, and only the rest is built.
+                try:
+                    vol = link_pyramid(
+                        src_path,
+                        dst,
+                        grid.spacing_mm,
+                        cfg.profile,
+                        origin_mm=grid.origin_mm,
+                        backend=cfg.backend,
+                        overwrite=True,
+                        percentiles=cfg.ingest.percentiles,
+                        provenance=provenance,
+                    )
+                except ValueError as exc:
+                    say(f"  note: {spec.id}: pyramid of {src_path} not linked ({exc})")
+                    vol = None
+            if vol is not None:
+                linked = [k for k in range(vol.n_levels) if vol.is_linked(k)]
+                how = (
+                    f"read in place at levels {linked} of 0..{vol.n_levels - 1} from "
+                    f"the scan's own pyramid ({layout})"
+                )
+                skipped = (vol.meta.get("provenance") or {}).get("pyramid_levels_not_linked")
+                if skipped:
+                    notes = list(notes) + [
+                        f"level {k} of the scan's pyramid not used: {why}; built here instead"
+                        for k, why in sorted(skipped.items())
+                    ]
+            else:
+                how = (
+                    f"read in place, full resolution not copied ({layout}; set "
+                    f"ingest.link false to copy it into {cfg.profile.core}-voxel shards)"
+                )
+                vol = link_source(
+                    src_path,
+                    dst,
+                    grid.spacing_mm,
+                    cfg.profile,
+                    origin_mm=grid.origin_mm,
+                    backend=cfg.backend,
+                    overwrite=True,
+                    percentiles=cfg.ingest.percentiles,
+                    provenance=provenance,
+                )
         else:
             vol = ingest_source(
                 view,

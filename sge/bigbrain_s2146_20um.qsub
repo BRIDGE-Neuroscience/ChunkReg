@@ -1,0 +1,147 @@
+#!/bin/bash
+# BigBrain (histology) onto S-21-46 (HiP-CT) at 20 um, on one node's H100s.
+#
+# Before submitting, once, on a login node (seconds; writes metadata only):
+#
+#   python scripts/bigbrain_s2146.py prepare --root $RUNS \
+#       --fixed  $DATA/S-21-46_HiP-CT_20um.ome.zarr \
+#       --moving $DATA/BigBrain2015_coronal_20um.ome.zarr \
+#       --pair   $DATA/T_pair_zyx_um.json --core 256 192
+#
+# which makes $RUNS/c256 and $RUNS/c192 (one per chunk core). This job runs
+# setup on c256 -- its calibration registers one full padded chunk, which is
+# the memory check on the real card -- and falls back to c192 if that does not
+# fit. Then it runs the registration and prints the status. A job that hits
+# h_rt is continued by submitting it again: the run resumes from the first
+# pass without a record.
+#
+#   qsub sge/bigbrain_s2146_20um.qsub
+#   qsub -v STOP_AT=40um sge/bigbrain_s2146_20um.qsub     # look at 40 um first
+#   qsub -v CORE=192 sge/bigbrain_s2146_20um.qsub         # force the smaller core
+#   qsub -v APPLY=1 sge/bigbrain_s2146_20um.qsub          # also write the warped BigBrain at the end
+#
+# ---- Grid Engine resources ------------------------------------------------
+#$ -N bb_s2146_20um
+#$ -l h_rt=36:00:00
+#$ -l gpu=true,gpu_type=h100
+#$ -pe gpu 6                         # GPUs; one chunkreg worker on each (raise to 8 if the node has them)
+#$ -l tmem=40G                       # PER SLOT
+#$ -R y
+#$ -o /home/akeenlys/storage_main/bridge_project_data/logs/$JOB_NAME.$JOB_ID.log
+#$ -S /bin/bash
+#$ -cwd
+#$ -j y
+
+set -euo pipefail
+
+# ---- SETTINGS -------------------------------------------------------------
+SIF="${SIF:-/home/akeenlys/storage_main/bridge_project_data/containers/chunkreg.sif}"
+RUNS="${RUNS:-/home/akeenlys/storage_main/bridge_project_data/bigbrain_s2146}"
+BINDS="${BINDS:-/home/akeenlys/storage_main/bridge_project_data}"
+CHUNKREG_SRC="${CHUNKREG_SRC:-/home/akeenlys/storage_main/bridge_project_data/chunkreg}"
+CORE="${CORE:-}"                     # empty: try 256, fall back to 192
+STOP_AT="${STOP_AT:-}"
+SETUP_ARGS="${SETUP_ARGS:---no-probe}"
+RUN_ARGS="${RUN_ARGS:-}"
+# ---------------------------------------------------------------------------
+
+echo "job ${JOB_ID:-<interactive>} on $(hostname), $(date)"
+echo "slots=${NSLOTS:-1} gpus=${CUDA_VISIBLE_DEVICES:-<all visible>}"
+[ -f "$SIF" ] || { echo "FATAL: no image at $SIF" >&2; exit 1; }
+[ -d "$RUNS" ] || { echo "FATAL: no run root at $RUNS; run 'prepare' first" >&2; exit 1; }
+CHUNKREG_SRC="$(cd "$CHUNKREG_SRC" && pwd -P)"
+RUNTIME=$(command -v apptainer || command -v singularity) \
+    || { echo "FATAL: no apptainer/singularity (try: module load apptainer)" >&2; exit 1; }
+
+export TMPDIR="${TMPDIR:-/tmp/chunkreg.$$}"
+CACHE="$TMPDIR/chunkreg-cache"
+mkdir -p "$CACHE/torch" "$CACHE/mpl"
+pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
+elif [ -n "${JOB_ID:-}" ]; then
+    echo "Grid Engine started this job without allocating it any GPUs; exiting 99 to requeue" >&2
+    exit 99
+fi
+pass TMPDIR "$TMPDIR"
+pass XDG_CACHE_HOME "$CACHE"
+pass TORCHINDUCTOR_CACHE_DIR "$CACHE/torch"
+pass MPLCONFIGDIR "$CACHE/mpl"
+pass OMP_NUM_THREADS "${NSLOTS:-1}"
+pass PATH "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
+pass HF_HOME "/opt/hf"
+pass HF_HUB_OFFLINE "1"
+pass PYTHONNOUSERSITE "1"
+pass PYTHONUNBUFFERED "1"
+pass PYTHONPATH "/opt/chunkreg-dev"
+
+bind="$TMPDIR"
+IFS=, read -r -a bind_dirs <<< "$BINDS"
+for d in "${bind_dirs[@]}"; do
+    [ -n "$d" ] || continue
+    [ -e "$d" ] || { echo "FATAL: BINDS entry $d does not exist" >&2; exit 1; }
+    bind="$bind,$d"
+    real="$(readlink -f "$d")"
+    [ "$real" = "$d" ] || bind="$bind,$real"
+done
+[ -d "$CHUNKREG_SRC/chunkreg" ] || { echo "FATAL: $CHUNKREG_SRC has no chunkreg/ package" >&2; exit 1; }
+bind="$bind,$CHUNKREG_SRC:/opt/chunkreg-dev:ro"
+echo "using chunkreg source from $CHUNKREG_SRC"
+
+box() { "$RUNTIME" exec --nv --cleanenv --bind "$bind" "$SIF" "$@"; }
+
+box python - <<'EOF'
+import sys, torch, chunkreg
+print(f"chunkreg {chunkreg.__version__} from {chunkreg.__file__}")
+if not torch.cuda.is_available():
+    sys.exit("FATAL: torch sees no GPU inside the container")
+n = torch.cuda.device_count()
+print(f"torch {torch.__version__}, {n} GPU(s): {torch.cuda.get_device_name(0)}, "
+      f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.0f} GB")
+for i in range(n):
+    torch.zeros(1, device=f"cuda:{i}")
+import chunkreg.affine_view  # the code this run depends on is present
+EOF
+
+common=()
+[ -n "$STOP_AT" ] && common+=(--stop-at "$STOP_AT")
+
+# setup = conventions selftest + calibration (one real padded chunk: the memory
+# check) + the resolved pyramid and plan. On the first core that fits, run.
+try_cores="256 192"
+[ -n "$CORE" ] && try_cores="$CORE"
+CONFIG=""
+for core in $try_cores; do
+    cfg="$RUNS/c$core/config.json"
+    [ -f "$cfg" ] || { echo "no config for core $core at $cfg; skipping" >&2; continue; }
+    echo
+    echo "==== chunkreg setup (core $core)  $(date -Is)"
+    # shellcheck disable=SC2086
+    if box chunkreg setup "$cfg" ${common[@]+"${common[@]}"} $SETUP_ARGS; then
+        CONFIG="$cfg"
+        break
+    fi
+    echo "setup failed for core $core (out of memory on one padded chunk, most likely); trying the next" >&2
+done
+[ -n "$CONFIG" ] || { echo "FATAL: no core fits this GPU" >&2; exit 1; }
+
+echo
+echo "==== chunkreg run  $CONFIG  $(date -Is)"
+# shellcheck disable=SC2086
+box chunkreg run "$CONFIG" ${common[@]+"${common[@]}"} $RUN_ARGS
+echo
+echo "==== chunkreg status  $(date -Is)"
+box chunkreg status "$CONFIG"
+
+# Optional: BigBrain warped onto S-21-46's lattice at the finest level run,
+# through the final field, from the native scan in one interpolation. At 20 um
+# this is 411 G voxels through one GPU -- hours -- so it is off by default.
+if [ "${APPLY:-0}" = "1" ]; then
+    run_root="$(dirname "$CONFIG")"
+    echo
+    echo "==== chunkreg apply  $(date -Is)"
+    box chunkreg apply "$run_root/subjects/moving.zarr" "$run_root/fields/moving.zarr" \
+        "$run_root/BigBrain2015_on_S-21-46.ome.zarr" --profile a16
+fi
+echo "done $(date -Is)"

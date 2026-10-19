@@ -220,6 +220,40 @@ have. `grid` also takes `"finest"`, `"coarsest"`, a spacing in millimetres, or
 a whole grid block as a mapping. In a config file the same setting is
 `"grid": {"reference": "s01"}`, and it works for any run, not just a pair.
 
+## A moving scan in its own frame: `warm_start`
+
+Resampling a 7000³ scan onto the fixed volume's lattice before a run writes
+hundreds of gigabytes for a copy that is read once per pass. When a pairwise
+affine between the two scans is already known, the moving scan can stay where
+it is:
+
+```json
+{"id": "moving", "source": "/data/BigBrain2015_coronal_20um.ome.zarr",
+ "warm_start": {"affine_um": "pair/T_pair_zyx_um.json",
+                "background": [250, 0],
+                "field": "init_field_1280um.zarr"}}
+```
+
+`affine_um` maps the moving scan's physical micrometres to the fixed scan's
+(the direction a pairwise affine is normally estimated in), as a 4×4 or 3×4
+matrix or the path of a JSON file holding one. The subject's store then holds
+only metadata: every pyramid level is sampled on demand through the affine
+from the scan's own OME pyramid (`chunkreg.affine_view`), trilinearly, zero
+outside the scan, after `background` has set voxels at or above a threshold
+to a value (BigBrain's white background to 0). Nothing downstream knows: the
+store has the run grid's shape at every level. It needs `grid.reference` (or
+`template_subject`) to name the fixed subject, whose own sampling is the run
+grid, and it takes no part in choosing that grid. An OME-Zarr source whose own
+pyramid matches the run's is read in place at every level rather than
+rebuilt. `field` seeds the coarsest level from a chunkreg field store made
+earlier in the same world frame (its vectors are millimetres, so only its
+lattice is resampled); a field from another frame is refused.
+
+Windowed anatomix features (`features.anatomix_window`) are computed on a
+tiling anchored to the run grid, not to each chunk, so a voxel's features are
+the same in every chunk that holds it; `levels.stop.plateau` ends a
+fixed-template level once its residual stops falling.
+
 ## Two subjects of a cohort
 
 When both volumes are already subjects of a config, register one onto the other

@@ -50,6 +50,9 @@ class PCAFeatures:
     def setup(self, device: str | None = None) -> None:
         self._inner.setup(device)
 
+    def aligned_box(self, origin, shape):
+        return self._inner.aligned_box(origin, shape)
+
     @property
     def fitted(self) -> bool:
         return self._basis is not None

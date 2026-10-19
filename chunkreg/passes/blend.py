@@ -210,11 +210,17 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
     own = manifest.chunk(chunk_id)
     grid = manifest.grid
     spacing = grid.spacing_mm
-    isum, wsum = ensure_accumulators(cfg, manifest)
+    # The accumulators feed the update pass, which estimates the template. A
+    # template held fixed is never estimated, so for it the warped subject
+    # would be read and a float32 copy of it written every pass for nothing:
+    # at 20 um that was a second read of the moving volume and 1.6 TB of
+    # writes per pass.
+    accumulate = cfg.template_subject is None
+    isum, wsum = ensure_accumulators(cfg, manifest) if accumulate else (None, None)
 
     core_origin = tuple(own.core_origin)
     core_shape = tuple(own.core_shape)
-    acc_i = _xp.zeros(core_shape)
+    acc_i = _xp.zeros(core_shape) if accumulate else None
     lat_origin, lat_shape = None, None
     acc_w = None
     stats = []
@@ -225,18 +231,19 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
         field = Field.open(cfg.field_path(manifest.level, subject), cfg.backend)
         field.write_dense(core_origin, u)
 
-        vol = Volume.open(cfg.subject_path(subject), cfg.backend)
-        warped = warped_subject_block(
-            vol, manifest.level, core_origin, core_shape, u, spacing, normalise=True
-        )
-        acc_i += warped
+        if accumulate:
+            vol = Volume.open(cfg.subject_path(subject), cfg.backend)
+            warped = warped_subject_block(
+                vol, manifest.level, core_origin, core_shape, u, spacing, normalise=True
+            )
+            acc_i += warped
 
-        lat = _pool(u, cfg.profile.lattice_factor)
-        if acc_w is None:
-            acc_w = _xp.zeros_like(lat)
-            lat_origin = tuple(int(o) // cfg.profile.lattice_factor for o in core_origin)
-            lat_shape = lat.shape[1:]
-        acc_w += lat
+            lat = _pool(u, cfg.profile.lattice_factor)
+            if acc_w is None:
+                acc_w = _xp.zeros_like(lat)
+                lat_origin = tuple(int(o) // cfg.profile.lattice_factor for o in core_origin)
+                lat_shape = lat.shape[1:]
+            acc_w += lat
 
         stats.append(
             {
@@ -246,9 +253,10 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
             }
         )
 
-    write_block(isum, core_origin, acc_i, lead=0)
-    if acc_w is not None:
-        write_block(wsum, lat_origin, acc_w, lead=1)
+    if accumulate:
+        write_block(isum, core_origin, acc_i, lead=0)
+        if acc_w is not None:
+            write_block(wsum, lat_origin, acc_w, lead=1)
 
     return {
         "chunk_id": chunk_id,

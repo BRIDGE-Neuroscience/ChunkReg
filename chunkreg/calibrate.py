@@ -151,19 +151,28 @@ def calibrate(
     # reference keeps a small probe so calibration stays quick there.
     on_gpu = xp.on_gpu()
     probe_side = profile.padded if on_gpu else min(48, profile.padded)
+    # Features are extracted over the box the extractor asks for around a
+    # padded chunk (wider, for grid-anchored windows) and cropped back, as the
+    # register pass does, so the timed chunk costs what a real one costs.
+    from .features.base import aligned_box
+
+    f_origin, f_shape = aligned_box(extractor, (0, 0, 0), (probe_side,) * 3)
+    crop = (slice(None),) + tuple(
+        slice(-fo, -fo + probe_side) for fo in f_origin
+    )
     rng = np.random.default_rng(1)
     if xp.uses_torch():
         import torch
 
         from . import fields as _fields
 
-        v = _fields.smooth(xp.put(rng.random((probe_side,) * 3)), 2.0)
+        v = _fields.smooth(xp.put(rng.random(tuple(f_shape))), 2.0)
         shifted = torch.roll(v, shifts=2, dims=0)
     else:
         from scipy import ndimage
 
         v = ndimage.gaussian_filter(
-            rng.random((probe_side,) * 3).astype(np.float32), 2.0
+            rng.random(tuple(f_shape)).astype(np.float32), 2.0
         )
         shifted = np.roll(v, 2, axis=0)
     # One iteration count per scale, whatever the profile's pyramid depth. A
@@ -178,7 +187,13 @@ def calibrate(
     run_stages = list(stages) if stages else [stage]
 
     def one_chunk():
-        eng.register(extractor(v, 0.05), extractor(shifted, 0.05), 0.05, run_stages)
+        f = extractor(v, 0.05)[crop]
+        m = extractor(shifted, 0.05)[crop]
+        if xp.is_tensor(f):
+            f, m = f.contiguous(), m.contiguous()
+        else:
+            f, m = np.ascontiguousarray(f), np.ascontiguousarray(m)
+        eng.register(f, m, 0.05, run_stages)
         if on_gpu:
             torch.cuda.synchronize()
 

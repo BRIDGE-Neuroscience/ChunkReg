@@ -55,6 +55,18 @@ class CombinedFeatures:
         for p in self.parts:
             p.setup(device)
 
+    def aligned_box(self, origin, shape):
+        """The union of what the parts want, so every part sees enough."""
+        from .base import aligned_box
+
+        lo = np.asarray(origin, dtype=np.int64)
+        hi = lo + np.asarray(shape, dtype=np.int64)
+        for p in self.parts:
+            o, s = aligned_box(p, origin, shape)
+            lo = np.minimum(lo, o)
+            hi = np.maximum(hi, np.asarray(o) + np.asarray(s))
+        return tuple(int(v) for v in lo), tuple(int(v) for v in hi - lo)
+
     def __call__(self, patch, spacing_mm: float, mask=None):
         # As in anatomix, a mask gates the learned channels and leaves MIND-SSC
         # alone: its responses are ratios, and zeroing them is not "no signal".
@@ -137,6 +149,11 @@ class ChannelSample:
 
     def setup(self, device: str | None = None) -> None:
         self.inner.setup(device)
+
+    def aligned_box(self, origin, shape):
+        from .base import aligned_box
+
+        return aligned_box(self.inner, origin, shape)
 
     def __call__(self, patch, spacing_mm: float, mask=None):
         f = self.inner(patch, spacing_mm, mask)

@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-__all__ = ["FeatureExtractor", "normalise_channels"]
+__all__ = ["FeatureExtractor", "normalise_channels", "aligned_box"]
 
 
 @runtime_checkable
@@ -27,6 +27,21 @@ class FeatureExtractor(Protocol):
         mask: np.ndarray | None = None,
     ) -> np.ndarray:
         """Map a normalised ``(Z, Y, X)`` patch to ``(C, Z, Y, X)`` channels."""
+
+
+def aligned_box(extractor, origin, shape) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """The box an extractor wants to see for chunk-independent features over a box.
+
+    An extractor whose features at a voxel depend on how the patch around it
+    is tiled (anatomix in sliding windows) widens the box so the tiling can be
+    anchored to the grid rather than to the patch; see
+    :meth:`chunkreg.features.anatomix.AnatomixFeatures.aligned_box`. Any other
+    extractor is a function of position already and returns the box unchanged.
+    """
+    fn = getattr(extractor, "aligned_box", None)
+    if fn is None:
+        return tuple(int(o) for o in origin), tuple(int(s) for s in shape)
+    return fn(origin, shape)
 
 
 def normalise_channels(x: np.ndarray, method: str = "l2") -> np.ndarray:

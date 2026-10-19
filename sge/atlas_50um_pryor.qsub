@@ -93,15 +93,17 @@ pass() { export "APPTAINERENV_$1=$2" "SINGULARITYENV_$1=$2"; }
 # The GPUs Grid Engine gave this job, as the GPU prolog set them. Unset inside
 # a job means the prolog allocated none ("Not enough GPUs available ...,
 # rescheduling job") and the job started anyway. Every card on the node is then
-# visible, other people's included, so stop instead of using them. Outside Grid
-# Engine, unset means every GPU the container sees is used.
+# visible, other people's included, so stop instead of using them. Exit status
+# 99 tells Grid Engine to put the job back in the queue, which is what the
+# prolog meant to do. Outside Grid Engine, unset means every GPU the container
+# sees is used.
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     pass CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
 elif [ -n "${JOB_ID:-}" ]; then
-    echo "FATAL: Grid Engine started this job without allocating it any GPUs" >&2
+    echo "Grid Engine started this job without allocating it any GPUs" >&2
     echo "  (CUDA_VISIBLE_DEVICES is unset; see the GPU prolog lines above)." >&2
-    echo "  Nothing has run. Submit the job again." >&2
-    exit 1
+    echo "  Nothing has run. Exiting 99 so Grid Engine requeues the job." >&2
+    exit 99
 fi
 pass TMPDIR                "$TMPDIR"
 pass XDG_CACHE_HOME        "$CACHE"

@@ -265,6 +265,32 @@ class LevelPolicy:
     """Level 0 is a single chunk, so no halo bounds it. This bounds it by the
     aperture instead: a displacement approaching the size of the volume cannot
     be a real correspondence, whatever the similarity says."""
+    require_subvoxel: bool = False
+    """With a template held fixed, stop a level only when its residual is
+    sub-voxel (or at the cap), not as soon as it would fit the next level's
+    halo. For a weak similarity signal at the coarse levels, where the point is
+    to converge there before handing a stable field down."""
+    plateau_passes: int | None = None
+    """With a template held fixed, stop a level once its residual percentile
+    has fallen by less than ``plateau_rel`` (relative) over this many passes.
+    For a cross-modal pair whose residual never goes sub-voxel: Dice stops
+    improving long before the stopping rule would otherwise fire, and the
+    level would run to its cap. ``None`` disables it."""
+    plateau_rel: float = 0.05
+    plateau_after: int | None = None
+    """The pass from which the plateau test may fire. ``None`` means after the
+    level's ``anneal`` schedule has run its course (or from the first pass
+    without one): while the smoothing is still changing, the residual moves
+    for reasons that have nothing to do with convergence."""
+    anneal: dict[int, dict[str, Any]] = field(default_factory=dict)
+    """Per-level smoothing schedule over the passes of that level, keyed by
+    level index: ``{"smooth_grad_sigma": [start, end], "smooth_warp_sigma":
+    [start, end], "passes": N}``. Pass ``k`` uses ``start * (end / start) **
+    min(k / (N - 1), 1)`` -- geometric from heavy to light over the first N
+    passes, then held -- on every deformable stage of the level, after
+    ``level_params``. Heavy smoothing first keeps the early passes, where a weak
+    similarity is least reliable, from warping to extremes; the later passes
+    refine with less."""
 
     level_stages: dict[int, tuple[StageSpec, ...]] = field(default_factory=dict)
     """Per-level replacement of the whole stage list, keyed by level index.
@@ -354,6 +380,21 @@ class LevelPolicy:
         except ConfigError as exc:
             raise ConfigError(f"level {k}: {exc}") from None
 
+    def stages_for_pass(self, level: int, iteration: int) -> tuple[StageSpec, ...]:
+        """:meth:`stages` with this level's ``anneal`` schedule applied for pass ``iteration``."""
+        stages = self.stages(level)
+        sched = self.anneal.get(int(level))
+        if not sched:
+            return stages
+        n = int(sched.get("passes", 1))
+        t = 1.0 if n <= 1 else min(max(int(iteration), 0) / (n - 1), 1.0)
+        patch = {}
+        for key in ("smooth_grad_sigma", "smooth_warp_sigma"):
+            if key in sched:
+                start, end = (float(x) for x in sched[key])
+                patch[key] = start * (end / start) ** t
+        return tuple(replace(s, **patch) if s.is_deformable else s for s in stages)
+
     def tuned_levels(self) -> tuple[int, ...]:
         """Levels named by a per-level override, in order."""
         return tuple(sorted(set(self.level_stages) | set(self.level_params)))
@@ -421,6 +462,22 @@ class SubjectSpec:
     """This scan's voxel size as ``(z, y, x)`` millimetres, for a source that
     does not state one or states it wrongly. Overrides the top-level
     ``spacing_mm`` for this subject."""
+    warm_start: dict | None = None
+    """Start this subject from a known alignment instead of from scratch.
+
+    ``affine_um``: a 4x4 (or 3x4) matrix, or the path of a JSON file holding
+    one, mapping this scan's physical micrometres to the fixed scan's physical
+    micrometres (the pairwise affine as it is usually estimated, moving to
+    fixed). The scan is then *not* resampled onto the run grid: its store reads
+    the scan in place through the affine at every level
+    (:mod:`chunkreg.affine_view`), which is what makes a 20 um run of a
+    7000-cubed scan start in seconds. Needs ``grid.reference`` (or
+    ``template_subject``) to name the fixed subject, whose own sampling is the
+    run grid. ``background``: ``[threshold, value]``, source voxels at or above
+    the threshold become ``value`` before interpolation (BigBrain's white
+    background: ``[250, 0]``). ``field``: a chunkreg field store to seed the
+    coarsest level from, in the run grid's world frame; its vectors are
+    millimetres, so only its lattice is resampled."""
 
 
 @dataclass(frozen=True)
@@ -770,6 +827,26 @@ class RunConfig:
         if len(set(ids)) != len(ids):
             dupes = sorted({i for i in ids if ids.count(i) > 1})
             raise ConfigError(f"duplicate subject ids: {dupes}")
+        fixed_id = self.grid.reference or self.template_subject
+        for s in self.subjects:
+            ws = s.warm_start or {}
+            if "affine_um" not in ws:
+                continue
+            if s.source is None:
+                raise ConfigError(
+                    f"subject {s.id!r} has a warm_start affine but no 'source'; the "
+                    f"affine says where to read the scan, so the scan has to be named"
+                )
+            if fixed_id is None or fixed_id == s.id:
+                raise ConfigError(
+                    f"subject {s.id!r} has a warm_start affine, which maps it onto the "
+                    f"fixed subject's frame, but no other subject is named by "
+                    f"grid.reference or template_subject"
+                )
+            if (self.subjects[[x.id for x in self.subjects].index(fixed_id)].warm_start or {}).get("affine_um"):
+                raise ConfigError(
+                    f"the fixed subject {fixed_id!r} cannot itself have a warm_start affine"
+                )
 
         mem = p.mem_gb(self.bytes_per_voxel_channel)
         if mem > 0.8 * self.gpu_mem_gb:
@@ -920,6 +997,7 @@ class RunConfig:
                         "spacing_mm",
                         None if sub.spacing_mm is None else list(sub.spacing_mm),
                     ),
+                    ("warm_start", None if sub.warm_start is None else dict(sub.warm_start)),
                 )
                 if v is not None
             }
@@ -1026,6 +1104,13 @@ class RunConfig:
             )
             if getattr(self.levels, attr) != getattr(default, attr)
         }
+        if self.levels.require_subvoxel:
+            stop["require_subvoxel"] = True
+        if self.levels.plateau_passes is not None:
+            plateau = {"passes": int(self.levels.plateau_passes), "rel": self.levels.plateau_rel}
+            if self.levels.plateau_after is not None:
+                plateau["after"] = int(self.levels.plateau_after)
+            stop["plateau"] = plateau
         if stop:
             out["stop"] = stop
 
@@ -1051,6 +1136,8 @@ class RunConfig:
             out["level_params"] = {
                 str(k): dict(v) for k, v in sorted(self.levels.level_params.items())
             }
+        if self.levels.anneal:
+            out["anneal"] = {str(k): dict(v) for k, v in sorted(self.levels.anneal.items())}
 
         if self.levels.run is not None:
             out["run"] = (
@@ -1071,11 +1158,17 @@ def _features_config_block(profile: Profile) -> dict:
     ``sample_channels`` is stated even when it is null, because leaving the key
     out asks for the default rather than for "no sampling".
     """
+    from .features import anatomix_window
+
     spec, _, sample = str(profile.features).partition("@")
-    return {
+    out = {
         "mind": "mindssc" in spec.split("+"),
         "sample_channels": int(sample) if sample else None,
     }
+    windows = [w for w in (anatomix_window(p) for p in spec.split("+")) if w is not None]
+    if windows:
+        out["anatomix_window"] = windows[0]
+    return out
 
 
 def _level_ref_json(ref: int | float):
@@ -1263,14 +1356,33 @@ def _with_features(profile: Profile, block) -> Profile:
     count for anatomix profiles whenever MIND makes the total larger, so
     adding MIND leaves device memory and per-pass cost where the profile put
     them.
+
+    ``anatomix_window`` runs anatomix in sliding windows of that many voxels
+    (a multiple of 32, at least 64) instead of over a whole chunk at once, so
+    each channel sees a few centimetres of context rather than the whole brain.
+    Between different subjects at coarse levels that is what makes the channels
+    agree locally (BigBrain vs HiP-CT at 640 um: local agreement 0.30 with
+    64-voxel windows vs 0.12 whole-volume). ``null`` or absent keeps one pass.
     """
-    from .features import describe
+    from .features import anatomix_window, describe
 
     feat = dict(block or {})
-    _check_keys(feat, {"mind", "sample_channels"}, "the 'features' block")
+    _check_keys(feat, {"mind", "sample_channels", "anatomix_window"}, "the 'features' block")
     spec, _, _ = str(profile.features).partition("@")
     parts = [p for p in spec.split("+") if p]
-    has_anatomix = any(p == "anatomix" for p in parts)
+    is_anatomix = lambda p: p == "anatomix" or anatomix_window(p) is not None
+    has_anatomix = any(is_anatomix(p) for p in parts)
+    if "anatomix_window" in feat:
+        win = feat["anatomix_window"]
+        if win is not None:
+            win = int(win)
+            if win < 64 or win % 32:
+                raise ConfigError(
+                    f"features.anatomix_window must be a multiple of 32 and at least 64, got {win}"
+                )
+        if not has_anatomix and win is not None:
+            raise ConfigError("features.anatomix_window is set, but this profile has no anatomix channels")
+        parts = [("anatomix" if win is None else f"anatomix:w{win}") if is_anatomix(p) else p for p in parts]
     mind = bool(feat.get("mind", has_anatomix))
     if mind and "mindssc" not in parts:
         parts.append("mindssc")
@@ -1311,6 +1423,40 @@ def save_config(cfg: "RunConfig", path: str | Path) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(cfg.to_config_dict(), indent=2), encoding="utf-8")
+    return out
+
+
+def _warm_start(obj, sid: str) -> dict | None:
+    """Normalise a subject's ``warm_start`` block; the matrix stays a path or a list."""
+    if obj is None:
+        return None
+    if not isinstance(obj, dict):
+        raise ConfigError(f"subject {sid!r}: warm_start must be a mapping")
+    _check_keys(obj, {"affine_um", "background", "field"}, f"subject {sid!r} warm_start")
+    out: dict[str, Any] = {}
+    aff = obj.get("affine_um")
+    if aff is not None:
+        if isinstance(aff, str):
+            out["affine_um"] = aff
+        else:
+            rows = [[float(v) for v in row] for row in aff]
+            if len(rows) not in (3, 4) or any(len(r) != 4 for r in rows):
+                raise ConfigError(
+                    f"subject {sid!r}: warm_start.affine_um must be a 4x4 or 3x4 matrix "
+                    f"or the path of a JSON file holding one"
+                )
+            if len(rows) == 3:
+                rows.append([0.0, 0.0, 0.0, 1.0])
+            out["affine_um"] = rows
+    bg = obj.get("background")
+    if bg is not None:
+        if not (isinstance(bg, (list, tuple)) and len(bg) == 2):
+            raise ConfigError(f"subject {sid!r}: warm_start.background must be [threshold, value]")
+        out["background"] = [float(bg[0]), float(bg[1])]
+    if obj.get("field") is not None:
+        out["field"] = str(obj["field"])
+    if not out:
+        raise ConfigError(f"subject {sid!r}: warm_start names neither affine_um nor field")
     return out
 
 
@@ -1372,7 +1518,8 @@ def load_config(source: str | Path | dict) -> RunConfig:
                 f"each subject must be a mapping with an 'id', got {entry!r}"
             )
         _check_keys(
-            entry, {"id", "path", "source", "spacing_mm"}, f"subject {entry.get('id')!r}"
+            entry, {"id", "path", "source", "spacing_mm", "warm_start"},
+            f"subject {entry.get('id')!r}",
         )
         sid = str(entry["id"])
         src = entry.get("source")
@@ -1382,6 +1529,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
                 path=str(entry.get("path") or f"subjects/{sid}.zarr"),
                 source=None if src is None else str(src),
                 spacing_mm=_voxel(entry.get("spacing_mm"), f"subject {sid!r} spacing_mm"),
+                warm_start=_warm_start(entry.get("warm_start"), sid),
             )
         )
     subjects = tuple(subjects)
@@ -1393,15 +1541,48 @@ def load_config(source: str | Path | dict) -> RunConfig:
         {
             "caps", "level0_stages", "seeded_stages", "level_stages",
             "level_params", "shape_update_step", "sharpen_laplacian_levels",
-            "min_tissue_fraction", "level0_max_disp_frac", "run", "stop_at",
+            "min_tissue_fraction", "level0_max_disp_frac", "run", "stop_at", "anneal",
         },
         "the 'levels' block",
     )
     _check_keys(
         stop,
-        {"residual_frac", "ubar_vox", "residual_vox", "percentile"},
+        {"residual_frac", "ubar_vox", "residual_vox", "percentile", "require_subvoxel", "plateau"},
         "'levels.stop'",
     )
+    plateau = stop.get("plateau")
+    plateau_kw: dict[str, Any] = {}
+    if plateau is not None:
+        if not isinstance(plateau, dict):
+            raise ConfigError("levels.stop.plateau must be a mapping {passes, rel, after}")
+        _check_keys(plateau, {"passes", "rel", "after"}, "'levels.stop.plateau'")
+        if "passes" not in plateau or int(plateau["passes"]) < 1:
+            raise ConfigError("levels.stop.plateau needs 'passes' >= 1")
+        plateau_kw["plateau_passes"] = int(plateau["passes"])
+        rel = float(plateau.get("rel", LevelPolicy.plateau_rel))
+        if not 0.0 <= rel < 1.0:
+            raise ConfigError(f"levels.stop.plateau.rel must be in [0, 1), got {rel}")
+        plateau_kw["plateau_rel"] = rel
+        if plateau.get("after") is not None:
+            if int(plateau["after"]) < 0:
+                raise ConfigError("levels.stop.plateau.after must be >= 0")
+            plateau_kw["plateau_after"] = int(plateau["after"])
+    anneal = {}
+    for k, v in (lv.get("anneal") or {}).items():
+        level = _level_key(k, "levels.anneal")
+        if not isinstance(v, dict):
+            raise ConfigError(f"levels.anneal[{level}] must be a mapping, got {v!r}")
+        _check_keys(v, {"smooth_grad_sigma", "smooth_warp_sigma", "passes"}, f"levels.anneal[{level}]")
+        entry = {"passes": int(v.get("passes", 1))}
+        if entry["passes"] < 1:
+            raise ConfigError(f"levels.anneal[{level}].passes must be at least 1")
+        for key in ("smooth_grad_sigma", "smooth_warp_sigma"):
+            if key in v:
+                pair = [float(x) for x in v[key]]
+                if len(pair) != 2 or min(pair) <= 0:
+                    raise ConfigError(f"levels.anneal[{level}].{key} must be [start, end], both positive")
+                entry[key] = pair
+        anneal[level] = entry
 
     level_stages = {
         _level_key(k, "levels.level_stages"): _stages(v, ())
@@ -1437,6 +1618,9 @@ def load_config(source: str | Path | dict) -> RunConfig:
         level0_max_disp_frac=float(
             lv.get("level0_max_disp_frac", LevelPolicy.level0_max_disp_frac)
         ),
+        require_subvoxel=bool(stop.get("require_subvoxel", LevelPolicy.require_subvoxel)),
+        **plateau_kw,
+        anneal=anneal,
         level_stages=level_stages,
         level_params=level_params,
         run=_run_spec(lv.get("run")),

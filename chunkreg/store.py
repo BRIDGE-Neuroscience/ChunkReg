@@ -54,6 +54,8 @@ __all__ = [
     "ingest_array",
     "ingest_source",
     "link_source",
+    "link_pyramid",
+    "link_affine_source",
     "check_volume",
 ]
 
@@ -245,6 +247,8 @@ class Volume:
         provenance: dict | None = None,
         n_levels: int | None = None,
         linked_native: str | None = None,
+        linked: dict | None = None,
+        affine: dict | None = None,
     ) -> "Volume":
         """Create a multiscale store.
 
@@ -253,7 +257,12 @@ class Volume:
         pyramid of its own.
 
         ``linked_native`` names a zarr to read the full-resolution level from
-        in place. That level is then not created here, and is never written.
+        in place. ``linked`` does the same for any level, ``{level: path}``: a
+        scan that already carries a pyramid matching the run's is read where
+        it lies at every level. ``affine`` is the metadata of
+        :mod:`chunkreg.affine_view`: every level is then sampled through an
+        affine from a scan in its own frame, and no level is stored here.
+        Linked levels are never written.
         """
         b = _backend.get_backend(backend)
         if overwrite:
@@ -281,8 +290,17 @@ class Volume:
             "linked": {},
         }
         top = len(grids) - 1
+        links = {int(k): str(v) for k, v in (linked or {}).items()}
         if linked_native is not None:
-            meta["linked"] = {str(top): str(linked_native)}
+            links[top] = str(linked_native)
+        for k in links:
+            if not 0 <= k <= top:
+                raise ValueError(f"linked level {k} is not one of 0..{top}")
+        meta["linked"] = {str(k): v for k, v in sorted(links.items())}
+        if affine is not None:
+            if links:
+                raise ValueError("a volume is either linked or read through an affine, not both")
+            meta["affine"] = dict(affine)
         vol = cls(path, meta, b)
         for k, g in enumerate(grids):
             if vol.is_linked(k):
@@ -353,11 +371,26 @@ class Volume:
         return self.path / str(self.n_levels - 1 - k)
 
     def is_linked(self, level: int) -> bool:
-        """Is this level read in place from the scan instead of stored here?"""
+        """Is this level read in place from the scan instead of stored here?
+
+        True for a level linked by path and for every level of a volume read
+        through an affine: neither is stored here, and neither is written.
+        """
+        if self.meta.get("affine"):
+            return True
         return str(int(level)) in (self.meta.get("linked") or {})
 
     def linked_source(self, level: int) -> str | None:
+        affine = self.meta.get("affine")
+        if affine:
+            return str(affine.get("source"))
         return (self.meta.get("linked") or {}).get(str(int(level)))
+
+    @property
+    def affine_spec(self) -> dict | None:
+        """The affine-read metadata, for a volume sampled from a scan in its own frame."""
+        spec = self.meta.get("affine")
+        return dict(spec) if spec else None
 
     # -- geometry ----------------------------------------------------------- #
     @property
@@ -421,9 +454,15 @@ class Volume:
                         f"level {k} of {self.path} is read in place from "
                         f"{self.linked_source(k)} and is never written"
                     )
-                from .io_formats import open_zarr_in_place
+                spec = self.meta.get("affine")
+                if spec:
+                    from .affine_view import AffineArray
 
-                self._cache[key] = open_zarr_in_place(self.linked_source(k))
+                    self._cache[key] = AffineArray(spec, self.grid(k))
+                else:
+                    from .io_formats import open_zarr_in_place
+
+                    self._cache[key] = open_zarr_in_place(self.linked_source(k))
             else:
                 self._cache[key] = self._backend.open(self.level_path(k), mode=mode)
         return self._cache[key]
@@ -520,6 +559,8 @@ class Volume:
         an eighth of the one before it.
         """
         for k in range(self.n_levels - 2, -1, -1):
+            if self.is_linked(k):
+                continue  # read in place; nothing to fill
             src = self.array(k + 1)
             dst = self.array(k, "r+")
             dshape = dst.shape
@@ -607,7 +648,8 @@ class Field:
             "lattice_factor": int(f),
             "subject": subject,
             "layout": "ome-zarr",
-            "components": "x, y, z displacement in millimetres",
+            "components": "z, y, x displacement in millimetres (array axis order)",
+            "component_order": ["z", "y", "x"],
         }
         ome = {
             "version": "0.5",
@@ -1077,6 +1119,148 @@ def link_source(
         linked_native=str(source_path),
     )
     vol.build_pyramid()
+    vol.compute_normalisation(level=0, percentiles=percentiles)
+    return vol
+
+
+def _is_half_mean_of(coarse, fine, block: int = 32) -> tuple[bool, float]:
+    """Is ``coarse`` the 2x2x2 mean of ``fine`` (edge-replicated), to rounding?
+
+    Checked on one block of up to ``block`` coarse voxels at the centre, where
+    a scan has tissue; a subsampled pyramid fails by tens of grey levels, a
+    mean pyramid written with another rounding rule passes within one.
+    """
+    cshape = np.asarray(coarse.shape[-3:], dtype=np.int64)
+    size = np.minimum(block, cshape)
+    c0 = (cshape - size) // 2
+    key = tuple(slice(int(a), int(a + n)) for a, n in zip(c0, size))
+    got = np.asarray(coarse[key], dtype=np.float32)
+    fine_block = read_padded(
+        fine, tuple(int(2 * a) for a in c0), tuple(int(2 * n) for n in size), mode="edge"
+    )
+    pooled = fine_block.reshape(size[0], 2, size[1], 2, size[2], 2).mean(axis=(1, 3, 5))
+    dev = float(np.abs(pooled - got).max())
+    if np.issubdtype(np.dtype(coarse.dtype), np.integer):
+        tol = 1.5  # one grey level of rounding, either way
+    else:
+        span = float(np.ptp(got)) or 1.0
+        tol = 1e-3 * span
+    return dev <= tol, dev
+
+
+def link_pyramid(
+    source_root,
+    path,
+    spacing_mm: float,
+    profile: Profile,
+    origin_mm: Sequence[float] = (0.0, 0.0, 0.0),
+    backend=None,
+    overwrite: bool = False,
+    percentiles=(0.5, 99.5),
+    provenance: dict | None = None,
+    native_dataset: str | None = None,
+    check: bool = True,
+) -> Volume:
+    """Use an OME-Zarr pyramid in place at every level whose shape matches.
+
+    For a scan that already carries the dyadic mean pyramid the run would
+    build (S-21-46's 20 um store does), building it again writes an eighth of
+    the scan for nothing. Every pyramid level whose shape equals the run's is
+    linked; any the scan lacks is created here and filled from the level above.
+    The scan's own pyramid has to be a plain mean of 2x2x2 blocks with the
+    coarse voxel centred on them (``GridSpec.coarsened``), which is what every
+    OME-Zarr writer in use here produces.
+    """
+    from .affine_view import ome_datasets
+
+    datasets = ome_datasets(source_root)
+    if native_dataset is None:
+        finest = min(datasets, key=lambda d: max(d["scale_um"]))
+    else:
+        # The run grid is a coarser dataset of the scan (a test at 160 um of a
+        # 20 um store, say); finer datasets are simply never read.
+        finest = next((d for d in datasets if d["path"] == str(native_dataset)), None)
+        if finest is None:
+            raise ValueError(f"{source_root} has no dataset {native_dataset!r}")
+    shape = tuple(int(n) for n in finest["shape"])
+    native = GridSpec(shape, spacing_mm, tuple(origin_mm))
+    grids = pyramid(native, profile)
+    by_shape = {tuple(d["shape"]): d for d in datasets}
+    linked = {}
+    for k, g in enumerate(grids):
+        ds = by_shape.get(tuple(g.shape))
+        if ds is not None:
+            linked[k] = str(Path(source_root) / ds["path"])
+    top = len(grids) - 1
+    if top not in linked:
+        raise ValueError(f"no dataset of {source_root} has the full-resolution shape {shape}")
+    # A shape match is necessary, not sufficient: a pyramid made by taking
+    # every other voxel has the same shapes as a mean pyramid and would hand
+    # the coarse levels aliased images. Each candidate is checked against a
+    # pooled block of the source's next finer level and built here instead if
+    # it is not that mean (to rounding).
+    rejected = {}
+    if check:
+        from .io_formats import open_zarr_in_place
+
+        for k in sorted((k for k in linked if k < top), reverse=True):
+            if k + 1 not in linked:
+                rejected[k] = "the level below it is not in the source"
+                continue
+            ok, dev = _is_half_mean_of(
+                open_zarr_in_place(linked[k]), open_zarr_in_place(linked[k + 1])
+            )
+            if not ok:
+                rejected[k] = f"differs from a 2x2x2 mean of the level below by up to {dev:.3g}"
+        for k in rejected:
+            del linked[k]
+    import zarr
+
+    dtype = zarr.open_array(linked[top], mode="r").dtype
+    if provenance is not None and rejected:
+        provenance = {**provenance, "pyramid_levels_not_linked": rejected}
+    vol = Volume.create(
+        path,
+        native,
+        profile,
+        dtype=str(_output_dtype("auto", dtype)),
+        backend=backend,
+        overwrite=overwrite,
+        provenance=provenance,
+        linked=linked,
+    )
+    vol.build_pyramid()
+    vol.compute_normalisation(level=0, percentiles=percentiles)
+    return vol
+
+
+def link_affine_source(
+    spec: dict,
+    path,
+    native: GridSpec,
+    profile: Profile,
+    backend=None,
+    overwrite: bool = False,
+    percentiles=(0.5, 99.5),
+    provenance: dict | None = None,
+) -> Volume:
+    """A volume on the run grid that samples a scan through an affine.
+
+    ``spec`` is :func:`chunkreg.affine_view.build_spec`. No voxel is written:
+    every level is an :class:`chunkreg.affine_view.AffineArray` over the scan's
+    own pyramid. The intensity window is measured on the coarsest level as for
+    any other subject.
+    """
+    vol = Volume.create(
+        path,
+        native,
+        profile,
+        dtype=str(np.dtype(spec.get("dtype", "uint8"))),
+        backend=backend,
+        overwrite=overwrite,
+        provenance=provenance,
+        affine=spec,
+    )
     vol.compute_normalisation(level=0, percentiles=percentiles)
     return vol
 
