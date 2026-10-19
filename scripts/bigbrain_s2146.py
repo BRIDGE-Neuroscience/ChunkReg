@@ -50,60 +50,62 @@ from chunkreg.config import get_profile, load_config, save_config
 from chunkreg.grid import GridSpec, pyramid, tile
 from chunkreg.store import Volume, link_affine_source, link_pyramid
 
-PROFILE_OVERRIDES = {"halo": 68, "r_f": 32, "sigma_g": 3.0, "sigma_w": 2.0}
+PROFILE_OVERRIDES = {"r_f": 32, "sigma_g": 3.0, "sigma_w": 2.5}  # + core, halo, inner_chunk from the flags
 FEATURES = {"mind": False, "sample_channels": None, "anatomix_window": 64}
 PERCENTILES = (0.0, 99.99)
 BACKGROUND = (250.0, 0.0)  # BigBrain: white and its 255 fill become zero
 
-COARSEST = {
-    "kind": "greedy", "scales": [8, 4, 2, 1], "iterations": [240, 160, 100, 60],
-    "loss": "cc", "cc_kernel": 7, "lr": 1.0, "smooth_grad_sigma": 1.0, "smooth_warp_sigma": 0.5,
-}
-COARSEST_ANNEAL = {"passes": 25, "smooth_grad_sigma": [3.0, 1.5], "smooth_warp_sigma": [2.0, 1.0]}
-SECOND_ANNEAL = {"passes": 12, "smooth_grad_sigma": [2.5, 1.5], "smooth_warp_sigma": [2.0, 1.0]}
-
-
-def _seeded(iters, sigma_g=1.5, sigma_w=1.0, lr=1.0):
+def _stage(scales, iters, lr, sigma):
     return {
-        "kind": "greedy", "scales": [2, 1], "iterations": list(iters), "loss": "cc",
-        "cc_kernel": 7, "lr": lr, "smooth_grad_sigma": sigma_g, "smooth_warp_sigma": sigma_w,
+        "kind": "greedy", "scales": list(scales), "iterations": list(iters), "loss": "cc",
+        "cc_kernel": 7, "lr": float(lr), "smooth_grad_sigma": float(sigma[0]),
+        "smooth_warp_sigma": float(sigma[1]),
     }
 
 
 def level_plan(spacings_um, args):
-    """Caps and stages per level, chosen by the level's spacing, coarse first.
+    """Caps and stages per level, chosen by the level's spacing.
 
-    The coarsest level is one chunk and runs the deep in-chunk pyramid with
-    annealed smoothing; the next level is annealed too (it is still a handful
-    of chunks). Everything finer refines a seed, and from 80 um down the
-    iteration counts and caps are what fits a night: the plan is one or two
-    passes at 40 um and one at 20 um.
+    Regularisation falls with resolution and freedom rises with it. The two
+    coarse levels (the single chunk and the next one) carry the global shape
+    and are held stiff -- heavy smoothing, half the learning rate, few passes
+    -- so that they do not over-warp structure they cannot see; the first run
+    of this pair fitted the coarse levels hard (lr 1, smoothing down to
+    1.5/1.0, 29 + 18 passes) and the finer levels inherited a field with the
+    Jacobian pinned at 0.5x/2x over much of the brain. From 160 um the
+    smoothing eases and the learning rate rises to 1 by 80 um, where the
+    detail that should move lives, and the halo (see ``--halo``) gives each
+    pass room to move it.
+
+    ``spacings_um[l]`` is level l's spacing (OME numbering: 0 = full
+    resolution, K = coarsest); caps are listed in that order too.
     """
-    # ``spacings_um[l]`` is level l's spacing (OME numbering: 0 = full
-    # resolution, K = coarsest); caps are listed in that order too.
     caps, stages, anneal = [], {}, {}
     coarsest = len(spacings_um) - 1
+    sc, sm, sf = args.sigma_coarse, args.sigma_mid, args.sigma_fine
     for k, um in enumerate(spacings_um):
         if k == coarsest:
             caps.append(args.cap_coarsest)
-            stages[k] = [COARSEST]
-            anneal[k] = COARSEST_ANNEAL
+            stages[k] = [_stage((8, 4, 2, 1), args.iters_coarsest, args.lr_coarse, sc)]
         elif k == coarsest - 1:
             caps.append(args.cap_second)
-            stages[k] = [_seeded((200, 100), 1.0, 0.5)]
-            anneal[k] = SECOND_ANNEAL
+            stages[k] = [_stage((2, 1), (100, 50), args.lr_coarse, sc)]
+            anneal[k] = {"passes": 6, "smooth_grad_sigma": [sc[0], sm[0]], "smooth_warp_sigma": [sc[1], sm[1]]}
+        elif um > 200:
+            caps.append(3)
+            stages[k] = [_stage((2, 1), (100, 60), args.lr_coarse, sm)]
         elif um > 100:
-            caps.append(4)
-            stages[k] = [_seeded((100, 60), args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
+            caps.append(3)
+            stages[k] = [_stage((2, 1), (100, 60), 0.5 * (args.lr_coarse + args.lr_fine), [0.5 * (a + b) for a, b in zip(sm, sf)])]
         elif um > 50:
             caps.append(args.cap_80um)
-            stages[k] = [_seeded(args.iters_80um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
+            stages[k] = [_stage((2, 1), args.iters_80um, args.lr_fine, sf)]
         elif um > 25:
             caps.append(args.cap_40um)
-            stages[k] = [_seeded(args.iters_40um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
+            stages[k] = [_stage((2, 1), args.iters_40um, args.lr_fine, sf)]
         else:
             caps.append(args.cap_20um)
-            stages[k] = [_seeded(args.iters_20um, args.sigma_fine[0], args.sigma_fine[1], args.lr_fine)]
+            stages[k] = [_stage((2, 1), args.iters_20um, args.lr_fine, sf)]
     return caps, stages, anneal
 
 
@@ -127,7 +129,7 @@ def read_pair(path: Path) -> np.ndarray:
 def prepare_one(root: Path, core: int, args, grid: GridSpec, fixed_ds: dict,
                 world_to_src: np.ndarray, say=print) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    profile = get_profile("a16", core=core, **PROFILE_OVERRIDES)
+    profile = get_profile("a16", core=core, halo=args.halo, inner_chunk=args.inner_chunk, **PROFILE_OVERRIDES)
     grids = pyramid(grid, profile)
     say(f"[{root.name}] core {core}: {len(grids)} levels (0 = full resolution), "
         + ", ".join(f"L{k} {g.spacing_mm * 1000:g} um {'x'.join(map(str, g.shape))}" for k, g in enumerate(grids)))
@@ -176,7 +178,7 @@ def prepare_one(root: Path, core: int, args, grid: GridSpec, fixed_ds: dict,
         "subjects": [{"id": "fixed", "path": "subjects/fixed.zarr", "spacing_mm": [grid.spacing_mm] * 3},
                      {"id": "moving", "path": "subjects/moving.zarr", "spacing_mm": [grid.spacing_mm] * 3}],
         "profile": "a16",
-        "profile_overrides": {"core": core, **PROFILE_OVERRIDES},
+        "profile_overrides": {"core": core, "halo": args.halo, "inner_chunk": args.inner_chunk, **PROFILE_OVERRIDES},
         "features": FEATURES,
         "template_subject": "fixed",
         "device": "cuda",
@@ -192,6 +194,7 @@ def prepare_one(root: Path, core: int, args, grid: GridSpec, fixed_ds: dict,
             "stop": {"require_subvoxel": True, "plateau": {"passes": 3, "rel": 0.05}},
             "caps": caps,
             "min_tissue_fraction": 0.02,
+            "coarsest_max_disp_frac": args.coarsest_max_disp_frac,
             "level_stages": {str(k): v for k, v in stages.items()},
             "anneal": {str(k): v for k, v in anneal.items()},
         },
@@ -290,7 +293,7 @@ def cmd_memcheck(args) -> int:
         }
         cfg = load_config(raw)
         dev = xp.configure("cuda")
-        stage = _seeded(args.iters_20um)
+        stage = _stage((2, 1), args.iters_20um, args.lr_fine, args.sigma_fine)
         from chunkreg.config import StageSpec
 
         cal = calibrate(cfg, stages=[StageSpec(**stage)])
@@ -362,17 +365,22 @@ def main(argv=None) -> int:
         p.add_argument("--iters-80um", type=lambda s: [int(v) for v in s.split(",")], default=[80, 40])
         p.add_argument("--iters-40um", type=lambda s: [int(v) for v in s.split(",")], default=[60, 30])
         p.add_argument("--iters-20um", type=lambda s: [int(v) for v in s.split(",")], default=[40, 20])
-        # anneal passes (25, 12) + the plateau window (3) + a few
-        p.add_argument("--cap-coarsest", type=int, default=32)
-        p.add_argument("--cap-second", type=int, default=18)
+        trip = lambda s: [float(v) for v in s.split(",")]
+        p.add_argument("--halo", type=int, default=84, help="halo in voxels (84 with core 160 keeps the padded chunk at 328)")
+        p.add_argument("--inner-chunk", type=int, default=32, help="inner zarr chunk; must divide the core")
+        p.add_argument("--coarsest-max-disp-frac", type=float, default=0.12,
+                       help="clamp of the single-chunk level as a fraction of the field of view (default 0.12)")
+        p.add_argument("--iters-coarsest", type=trip, default=[120, 80, 50, 30])
+        p.add_argument("--cap-coarsest", type=int, default=8)
+        p.add_argument("--cap-second", type=int, default=8)
         p.add_argument("--cap-80um", type=int, default=2)
-        p.add_argument("--cap-40um", type=int, default=1)
+        p.add_argument("--cap-40um", type=int, default=2)
         p.add_argument("--cap-20um", type=int, default=1)
-        p.add_argument("--lr-fine", type=float, default=1.0,
-                       help="FireANTs learning rate at every level below the annealed two (default 1.0; "
-                            "0.5 if many chunks give up on folds)")
-        p.add_argument("--sigma-fine", type=lambda s: [float(v) for v in s.split(",")], default=[1.5, 1.0],
-                       help="smooth_grad_sigma,smooth_warp_sigma at those levels (default 1.5,1.0)")
+        p.add_argument("--lr-coarse", type=float, default=0.5, help="learning rate at 1280-320 um")
+        p.add_argument("--lr-fine", type=float, default=1.0, help="learning rate at 80 um and finer (160 um takes the mean)")
+        p.add_argument("--sigma-coarse", type=trip, default=[3.0, 2.5], help="smooth_grad,smooth_warp at 1280 um and the start of 640 um")
+        p.add_argument("--sigma-mid", type=trip, default=[2.5, 2.0], help="... at the end of 640 um and at 320 um")
+        p.add_argument("--sigma-fine", type=trip, default=[1.5, 1.0], help="... at 80 um and finer (160 um takes the mean)")
         p.add_argument("--gpu-mem-gb", type=float, default=80.0)
 
     p = sub.add_parser("prepare", help="subject stores, grid record and config per core")
@@ -381,7 +389,7 @@ def main(argv=None) -> int:
     p.add_argument("--moving", required=True, help="BigBrain OME-Zarr root")
     p.add_argument("--pair", required=True, help="T_pair_zyx_um.json")
     p.add_argument("--fixed-dataset", default=None, help="run on this dataset of the fixed store (default: finest)")
-    p.add_argument("--core", type=int, nargs="+", default=[256, 192])
+    p.add_argument("--core", type=int, nargs="+", default=[160])
     p.add_argument("--trust-pyramid", action="store_true",
                    help="link the fixed scan's coarser levels without checking they are 2x means")
     p.add_argument("--scratch", default=None,

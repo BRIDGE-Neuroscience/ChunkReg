@@ -77,6 +77,10 @@ pass HF_HUB_OFFLINE "1"
 pass PYTHONNOUSERSITE "1"
 pass PYTHONUNBUFFERED "1"
 pass PYTHONPATH "/opt/chunkreg-dev"
+# Templates are linked at every level, never copied: the copy runs in the
+# driver on a GPU, and the H100s here are in exclusive-process mode with every
+# card held by a worker (a driver-side copy died with "device busy").
+pass CHUNKREG_TEMPLATE_LINK_MIN_VOXELS "0"
 
 bind="$TMPDIR"
 IFS=, read -r -a bind_dirs <<< "$BINDS"
@@ -111,7 +115,7 @@ common=()
 
 # setup = conventions selftest + calibration (one real padded chunk: the memory
 # check) + the resolved pyramid and plan. On the first core that fits, run.
-try_cores="256 192"
+try_cores="160 192"
 [ -n "$CORE" ] && try_cores="$CORE"
 CONFIG=""
 for core in $try_cores; do
