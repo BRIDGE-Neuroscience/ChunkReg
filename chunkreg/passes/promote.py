@@ -175,7 +175,7 @@ def _carry_fields(
         out[subject] = Field.create(
             cfg.final_field_path(subject) if final else cfg.field_path(dst_level, subject),
             grid,
-            cfg.profile,
+            cfg.profile_at(dst_level),
             backend=cfg.backend,
             overwrite=True,
             subject=subject,
@@ -433,7 +433,7 @@ def seed_coarsest(
             field = Field.create(
                 cfg.field_path(level, subject),
                 grid,
-                cfg.profile,
+                cfg.profile_at(level),
                 backend=cfg.backend,
                 overwrite=True,
                 subject=subject,
@@ -456,7 +456,7 @@ def seed_coarsest(
         field = Field.create(
             cfg.field_path(level, subject),
             grid,
-            cfg.profile,
+            cfg.profile_at(level),
             backend=cfg.backend,
             overwrite=True,
             subject=subject,

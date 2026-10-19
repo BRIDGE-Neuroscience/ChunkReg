@@ -349,6 +349,15 @@ class LevelPolicy:
     :data:`TUNABLE_STAGE_FIELDS` may be set, and the patch reaches every
     non-moments stage of that level."""
 
+    lattice_factor: dict[int, int] = field(default_factory=dict)
+    """Per-level displacement lattice factor, keyed by level number, over the
+    profile's. A level's field is stored on a lattice this many times coarser
+    than the level; ``1`` stores every voxel. The coarse levels are small and
+    set the global shape, so storing their fields at full resolution costs
+    nothing and measured 0.4 Dice points at 1280 um on a cross-modal pair; the
+    fine levels keep the profile's factor, which is what lets a 20 um field fit
+    on disk. Must divide the chunk core and halo."""
+
     run: tuple[int | float, ...] | str | None = None
     """Which levels to run. ``None`` or ``"all"`` runs every level.
 
@@ -691,6 +700,13 @@ class RunConfig:
             why += " -- over budget, expect out-of-memory failures"
         return n, why
 
+    def profile_at(self, level: int) -> Profile:
+        """The profile a level runs with: the run's, with that level's lattice factor."""
+        f = self.levels.lattice_factor.get(int(level))
+        if f is None or int(f) == self.profile.lattice_factor:
+            return self.profile
+        return replace(self.profile, lattice_factor=int(f))
+
     def engine_for(self, device: str) -> str:
         """The engine to use once the device is known."""
         if self.engine != "auto":
@@ -929,6 +945,15 @@ class RunConfig:
         for level in sorted(self.levels.level_params):
             if level < 0:
                 raise ConfigError(f"level_params has a negative level {level}")
+        for level, f in sorted(self.levels.lattice_factor.items()):
+            if level < 0:
+                raise ConfigError(f"lattice_factor has a negative level {level}")
+            if int(f) < 1:
+                raise ConfigError(f"lattice_factor[{level}] must be at least 1, got {f}")
+            try:
+                replace(p, lattice_factor=int(f))
+            except ValueError as exc:
+                raise ConfigError(f"lattice_factor[{level}]: {exc}") from None
 
         if not self.subjects:
             raise ConfigError("a run needs at least one subject")
@@ -1366,6 +1391,10 @@ class RunConfig:
             }
         if self.levels.anneal:
             out["anneal"] = {str(k): dict(v) for k, v in sorted(self.levels.anneal.items())}
+        if self.levels.lattice_factor:
+            out["lattice_factor"] = {
+                str(k): int(v) for k, v in sorted(self.levels.lattice_factor.items())
+            }
 
         if self.levels.run is not None:
             out["run"] = (
@@ -1778,6 +1807,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
             "caps", "coarsest_stages", "seeded_stages", "level_stages",
             "level_params", "shape_update_step", "sharpen_laplacian_levels",
             "min_tissue_fraction", "coarsest_max_disp_frac", "run", "stop_at", "anneal",
+            "lattice_factor",
         },
         "the 'levels' block",
     )
@@ -1803,6 +1833,13 @@ def load_config(source: str | Path | dict) -> RunConfig:
             if int(plateau["after"]) < 0:
                 raise ConfigError("levels.stop.plateau.after must be >= 0")
             plateau_kw["plateau_after"] = int(plateau["after"])
+    lattice_factor = {}
+    for k, v in (lv.get("lattice_factor") or {}).items():
+        level = _level_key(k, "levels.lattice_factor")
+        try:
+            lattice_factor[level] = int(v)
+        except (TypeError, ValueError):
+            raise ConfigError(f"levels.lattice_factor[{level}] must be an integer, got {v!r}") from None
     anneal = {}
     for k, v in (lv.get("anneal") or {}).items():
         level = _level_key(k, "levels.anneal")
@@ -1858,6 +1895,7 @@ def load_config(source: str | Path | dict) -> RunConfig:
         require_subvoxel=bool(stop.get("require_subvoxel", LevelPolicy.require_subvoxel)),
         **plateau_kw,
         anneal=anneal,
+        lattice_factor=lattice_factor,
         level_stages=level_stages,
         level_params=level_params,
         run=_run_spec(lv.get("run")),

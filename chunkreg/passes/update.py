@@ -46,7 +46,7 @@ def ensure_recentre(cfg: RunConfig, manifest: Manifest) -> Field:
         return Field.open(path, cfg.backend)
     try:
         return Field.create(
-            path, manifest.grid, cfg.profile, backend=cfg.backend, subject=None
+            path, manifest.grid, cfg.profile_at(manifest.level), backend=cfg.backend, subject=None
         )
     except FileExistsError:
         return Field.open(path, cfg.backend)
@@ -69,7 +69,7 @@ def run_update_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[s
     core_shape = tuple(own.core_shape)
 
     mean_warp = _mean_warp_block(
-        wsum, core_origin, core_shape, cfg.profile.lattice_factor, grid, n, eps
+        wsum, core_origin, core_shape, cfg.profile_at(manifest.level).lattice_factor, grid, n, eps
     )
 
     # Reading the average with a margin sized from the recentring step keeps

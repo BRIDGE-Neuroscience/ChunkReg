@@ -37,6 +37,7 @@ nav:
       - Command line: cli.md
       - Python API: api.md
   - Design notes: PLAN.md
+  - Cohort notes (50 µm, N=10): cohort-50um-notes.md
 
 # Working notes and the requirements file are not pages.
 exclude_docs: |

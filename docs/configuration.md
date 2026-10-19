@@ -76,6 +76,7 @@ clamp of 16 voxels with a deeper in-chunk pyramid (`configs/profiles.yaml`).
 | `level_stages` | none | `{"<ℓ>": [stages]}`: replace a level's whole stage list. |
 | `level_params` | none | `{"<ℓ>": {...}}`: tune a level's stages. Settable: `scales`, `iterations`, `lr`, `translation_lr`, `smooth_grad_sigma`, `smooth_warp_sigma`, `cc_kernel`, `loss`, `tolerance`. |
 | `anneal` | none | `{"<ℓ>": {"passes": N, "smooth_grad_sigma": [a, b], "smooth_warp_sigma": [a, b]}}`: smoothing falls geometrically from `a` to `b` over N passes, then holds. |
+| `lattice_factor` | profile's (2) | `{"<ℓ>": f}`: store level ℓ's field on a lattice `f` times coarser than the level (`1` = every voxel). Worth it at the small coarse levels; must divide the core and halo. |
 | `shape_update_step` | 0.25 | Fraction of the mean displacement removed from the template each pass. |
 | `sharpen_laplacian_levels` | `null` | Levels whose template is sharpened. `null` is the two coarsest. |
 | `min_tissue_fraction` | 0.02 | A chunk with less foreground emits its seed unchanged. |

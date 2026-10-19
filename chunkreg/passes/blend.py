@@ -81,7 +81,7 @@ def ensure_accumulators(cfg: RunConfig, manifest: Manifest) -> tuple[Any, Any]:
     """
     b = _backend.get_backend(cfg.backend)
     grid = manifest.grid
-    p = cfg.profile
+    p = cfg.profile_at(manifest.level)
     lat_shape = p.lattice_shape(grid.shape)
     isum_path = cfg.accumulator_path(manifest.level, manifest.iteration, "isum")
     wsum_path = cfg.accumulator_path(manifest.level, manifest.iteration, "wsum")
@@ -145,7 +145,7 @@ def blend_core(
         # Only the overlap with this core is ever read, decompressed, upsampled
         # or weighted. The lattice read covers just that overlap, and the
         # upsample takes the box relative to what was read.
-        f = cfg.profile.lattice_factor
+        f = cache[task_id].factor  # the lattice the residual was stored on
         llo = [b.start // f for b in src]
         lhi = [-(-b.stop // f) for b in src]
         lat = cache[task_id].read_box(index, llo, lhi)
@@ -172,7 +172,7 @@ def blend_core(
         )
     out = _xp.to_float32(num / den)
 
-    sigma = cfg.profile.lattice_factor  # one lattice voxel, in level voxels
+    sigma = cfg.profile_at(manifest.level).lattice_factor  # one lattice voxel, in level voxels
     if sigma > 0:
         out = _fields.smooth(out, sigma * 0.5, mode="nearest")
     return out
@@ -238,10 +238,11 @@ def run_blend_task(cfg: RunConfig, manifest: Manifest, chunk_id: int) -> dict[st
             )
             acc_i += warped
 
-            lat = _pool(u, cfg.profile.lattice_factor)
+            factor = cfg.profile_at(manifest.level).lattice_factor
+            lat = _pool(u, factor)
             if acc_w is None:
                 acc_w = _xp.zeros_like(lat)
-                lat_origin = tuple(int(o) // cfg.profile.lattice_factor for o in core_origin)
+                lat_origin = tuple(int(o) // factor for o in core_origin)
                 lat_shape = lat.shape[1:]
             acc_w += lat
 

@@ -41,10 +41,10 @@ def test_residual_map_is_dropped_above_a_lattice_size(tmp_path):
     small = GridSpec((64, 64, 64), 1.0)
     huge = GridSpec((4096, 4096, 4096), 1.0)
     cfg = load_config(_raw(tmp_path))
-    assert wants_residual_map(cfg, small) and wants_residual_map(cfg, huge)
+    assert wants_residual_map(cfg, 0, small) and wants_residual_map(cfg, 0, huge)
     cfg = load_config(_raw(tmp_path, retention={"residual_map_max_voxels": 2**30}))
-    assert wants_residual_map(cfg, small)
-    assert not wants_residual_map(cfg, huge)  # 2048^3 lattice voxels > 2^30
+    assert wants_residual_map(cfg, 0, small)
+    assert not wants_residual_map(cfg, 0, huge)  # 2048^3 lattice voxels > 2^30
     assert load_config(cfg.to_config_dict()).retention.residual_map_max_voxels == 2**30
 
 

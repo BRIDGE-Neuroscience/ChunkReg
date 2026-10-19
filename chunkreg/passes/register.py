@@ -263,10 +263,11 @@ def run_register_task(
     template = Volume.open(cfg.template_path(manifest.level), cfg.backend)
     subjects: dict[str, Volume] = {}
 
+    factor = cfg.profile_at(manifest.level).lattice_factor
     array = TaskArray.create(
         path,
         plan.entries,
-        cfg.profile,
+        cfg.profile_at(manifest.level),
         backend=cfg.backend,
         level=manifest.level,
         iteration=manifest.iteration,
@@ -289,8 +290,8 @@ def run_register_task(
             extractor,
             fixed_cache=fixed_cache,
         )
-        lat_origin, lat_shape = entry.lattice(cfg.profile.lattice_factor)
-        array.write(i, _to_lattice(rec.pop("field"), lat_shape, cfg.profile.lattice_factor))
+        lat_origin, lat_shape = entry.lattice(factor)
+        array.write(i, _to_lattice(rec.pop("field"), lat_shape, factor))
         # The residual's magnitude over the core goes to the level's QC map.
         # Popped so a device tensor never reaches the JSON record.
         _qc.write_residual_core(cfg, manifest, entry, rec.pop("residual"), rec.get("reason"))

@@ -62,11 +62,11 @@ def slices_path(cfg: RunConfig, level: int, iteration: int) -> Path:
 # --------------------------------------------------------------------------- #
 # The residual map
 # --------------------------------------------------------------------------- #
-def _lattice_grid(cfg: RunConfig, grid: GridSpec) -> GridSpec:
-    return grid.coarsened(cfg.profile.lattice_factor)
+def _lattice_grid(cfg: RunConfig, level: int, grid: GridSpec) -> GridSpec:
+    return grid.coarsened(cfg.profile_at(level).lattice_factor)
 
 
-def wants_residual_map(cfg: RunConfig, grid: GridSpec) -> bool:
+def wants_residual_map(cfg: RunConfig, level: int, grid: GridSpec) -> bool:
     """Is a residual map kept at this level?
 
     ``retention.residual_map_max_voxels`` caps the map's lattice size: at
@@ -76,7 +76,7 @@ def wants_residual_map(cfg: RunConfig, grid: GridSpec) -> bool:
     says "no map written this pass" rather than showing a stale one.
     """
     cap = cfg.retention.residual_map_max_voxels
-    return cap is None or _lattice_grid(cfg, grid).n_voxels <= int(cap)
+    return cap is None or _lattice_grid(cfg, level, grid).n_voxels <= int(cap)
 
 
 def ensure_residual_stores(cfg: RunConfig, manifest: Manifest) -> None:
@@ -86,9 +86,9 @@ def ensure_residual_stores(cfg: RunConfig, manifest: Manifest) -> None:
     state, so the pipeline makes them before dispatching and a task that
     finds one missing tolerates losing the race.
     """
-    if not wants_residual_map(cfg, manifest.grid):
+    if not wants_residual_map(cfg, manifest.level, manifest.grid):
         return
-    lattice = _lattice_grid(cfg, manifest.grid)
+    lattice = _lattice_grid(cfg, manifest.level, manifest.grid)
     for subject in manifest.subjects:
         path = residual_path(cfg, manifest.level, subject)
         if Volume.exists(path, cfg.backend):
@@ -97,7 +97,7 @@ def ensure_residual_stores(cfg: RunConfig, manifest: Manifest) -> None:
             Volume.create(
                 path,
                 lattice,
-                cfg.profile,
+                cfg.profile_at(manifest.level),
                 dtype="float32",
                 backend=cfg.backend,
                 overwrite=False,
@@ -122,10 +122,10 @@ def write_residual_core(
     for a chunk that emitted its seed; ``reason`` then says why, and decides
     between zero (nothing to register) and NaN (nothing acceptable found).
     """
-    if not wants_residual_map(cfg, manifest.grid):
+    if not wants_residual_map(cfg, manifest.level, manifest.grid):
         return
     chunk = manifest.chunk(entry.chunk_id)
-    f = int(cfg.profile.lattice_factor)
+    f = int(cfg.profile_at(manifest.level).lattice_factor)
     lat_origin = tuple(int(o) // f for o in chunk.core_origin)
     lat_shape = tuple(-(-int(s) // f) for s in chunk.core_shape)
 
