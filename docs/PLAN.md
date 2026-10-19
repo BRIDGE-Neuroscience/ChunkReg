@@ -86,7 +86,7 @@ SLURM array.
 All volumes live on a common isotropic, axis-aligned grid
 `G = (shape, spacing, origin)`, arrays ordered `(Z, Y, X)` to match zarr, TIFF,
 FireANTs `.array` and MONAI. A transform is a displacement field `u` in
-millimetres, stored as `(3, Z, Y, X)` float16 with component order `(x, y, z)`
+millimetres, stored as `(3, Z, Y, X)` float16 with component order `(z, y, x)` (array axis order)
 (the order of a `grid_sample` grid's last axis). `φ(x) = x + u(x)` maps
 **template (fixed) coordinates to subject (moving) coordinates**;
 `(M ∘ φ)(x) = M(x + u(x))`. Composition on one grid:
