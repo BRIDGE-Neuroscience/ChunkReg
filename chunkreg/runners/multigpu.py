@@ -191,6 +191,7 @@ class MultiGPURunner:
     ) -> None:
         self.cfg = cfg
         self.gpus = list(gpus) if gpus is not None else visible_gpus()
+        self.n_workers = len(self.gpus)
         if not self.gpus:
             raise RuntimeError("no GPUs are visible to this process")
         self.engine = engine or (cfg.engine_for(device) if cfg is not None else "fireants")

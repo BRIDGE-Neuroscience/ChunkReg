@@ -178,8 +178,16 @@ def build_manifest(
     grid: GridSpec,
     subjects: Sequence[str] | None = None,
     coarsest: int | None = None,
+    min_tasks: int = 1,
 ) -> Manifest:
     """Enumerate the work for one template pass at one level.
+
+    ``min_tasks`` is how many workers the runner has: a pass is parallel over
+    tasks, so a level with fewer tasks than workers leaves workers idle (eight
+    chunks at sixteen entries per task is one task, and one GPU of eight did
+    the whole level). Tasks are cut down until there are at least that many,
+    keeping every subject of a chunk in one task so the template's features
+    are still extracted once per chunk.
 
     ``coarsest`` is ``K``, the coarsest level of the run's pyramid. Left
     out, it is recovered from the level's own grid, whose pyramid is the rest
@@ -191,6 +199,13 @@ def build_manifest(
     chunks = tile(grid, p)
     subs = tuple(subjects) if subjects is not None else cfg.registered_ids
     per_task = max(1, cfg.slurm.register.chunks_per_task)
+    n_sub = max(1, len(subs))
+    n_entries = len(chunks) * n_sub
+    if int(min_tasks) > 1 and n_entries:
+        wanted = -(-n_entries // int(min_tasks))
+        if n_sub > 1:
+            wanted = max(n_sub, (wanted // n_sub) * n_sub)
+        per_task = max(1, min(per_task, wanted))
 
     entries = [
         TaskEntry(

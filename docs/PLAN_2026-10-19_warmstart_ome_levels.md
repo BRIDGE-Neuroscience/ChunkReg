@@ -89,6 +89,11 @@ per voxel-channel, receptive field 32. Fixed = the masked `S-21-46_brain_20um.om
 (all six levels linked); moving = BigBrain pulled from the public bucket with `scripts/fetch_public_gcs_zarr.sh`
 (265 objects verified). The code on the cluster is main at 093b4c9 (pre-renumbering); the run root is numbered the
 old way and must finish under that code.
+At 640 um passes 2-3, 6 of 8 chunks exhausted the fold ladder and emitted their seed: the fold fraction was
+judged over the padded box, halo included, where the registration is least constrained and the blend's weight is
+zero. Changed (in main and as a one-line patch of the cluster copy, backup `register.py.bak_padded_folds`) to judge
+the core only. The level had already closed at pass 4 under the old criterion (8 of 8 gave up), so the
+job was resubmitted as 7558158 with `--from-level 1`, redoing 640 um and finer under the new one.
 
 **Not done tonight, still wanted:** section 2 (finished on branch `ome-level-order`, worktree `scalable-reg-ome`,
 uncommitted, 520 tests passing -- review and merge after the run), section 3 (the 0.6 reader; `affine_view.

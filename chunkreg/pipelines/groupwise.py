@@ -296,7 +296,8 @@ def build_template(
                     config_path, coarsest,
                 )
             history = [p.d99_mm for p in report.passes] + [pr.d99_mm]
-            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap, history)
+            steps = [p.step_mm for p in report.passes] + [pr.step_mm]
+            stopped, reason = _should_stop(cfg, pr, threshold, grid, iteration, cap, history, steps)
             pr.stopped, pr.reason = stopped, reason
             report.passes.append(pr)
             say(
@@ -362,7 +363,10 @@ def _run_pass(
 ) -> tuple[PassReport, Manifest]:
     """Register, blend and update once at one level."""
     t0 = time.perf_counter()
-    manifest = build_manifest(cfg, level, iteration, grid, coarsest=coarsest)
+    manifest = build_manifest(
+        cfg, level, iteration, grid, coarsest=coarsest,
+        min_tasks=int(getattr(runner, "n_workers", 1) or 1),
+    )
     manifest.save(cfg.level_dir(level) / f"manifest_it{iteration}.json")
     # A scheduler runner cannot receive a closure, so it ships the task's
     # address instead and needs to know which pass it is on. The manifest has
@@ -681,9 +685,11 @@ def _collect(level, iteration, reg, bl, up, seconds, q: float, eps: float,
 
 
 def _plateaued(cfg: RunConfig, level: int, iteration: int, history: Sequence[float]) -> bool:
-    """Has the residual stopped falling, by ``levels.stop.plateau``?
+    """Has a per-pass quantity stopped falling, by ``levels.stop.plateau``?
 
-    ``history`` is the level's d99 per pass so far, this pass last. The test
+    ``history`` is that quantity per pass so far, this pass last: the residual
+    d99 for a held template, the template's recentring step for one being
+    estimated. The test
     waits until the anneal schedule (if any) has run, then compares this pass
     with the one ``passes`` earlier: no fall of at least ``rel`` means a
     plateau. A rise counts as a plateau too -- the residual is a histogram
@@ -704,6 +710,7 @@ def _plateaued(cfg: RunConfig, level: int, iteration: int, history: Sequence[flo
 def _should_stop(
     cfg: RunConfig, pr: PassReport, threshold: float, grid: GridSpec, iteration, cap,
     history: Sequence[float] = (),
+    steps: Sequence[float] = (),
 ) -> tuple[bool, str]:
     """Has this level finished?
 
@@ -744,6 +751,10 @@ def _should_stop(
                 return True, "template converged"
         elif fits_next_halo and converged_template:
             return True, "residual fits the next halo"
+        # The step is the template's own convergence signal: once it has
+        # stopped shrinking, further passes move the template by noise.
+        if _plateaued(cfg, pr.level, iteration, steps):
+            return True, f"template step plateaued over {cfg.levels.plateau_passes} passes"
     if iteration + 1 >= cap:
         return True, "cap reached"
     return False, ""

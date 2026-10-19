@@ -26,8 +26,8 @@ against the pyramid `chunkreg setup` prints: the notes assume six levels
 
 ## Code changes that would help, not done tonight
 
-- **Plateau stop for an estimated template.** `levels.stop.plateau` currently applies only to a held template (it reads `d99`). For the cohort the equivalent is the recentring step: stop when `step_mm` has not fallen by `rel` over N passes after the anneal. Twenty lines in `groupwise._should_stop`.
-- **Generic `estimate`.** `scripts/bigbrain_s2146.py estimate` counts tissue chunks per level from a subject called `fixed`; the same count from the first subject's coarsest level would cost the cohort nothing and gives hours per level from calibration's seconds per chunk.
+- ~~Plateau stop for an estimated template~~ — done: `levels.stop.plateau` now reads the recentring step for an estimated template, so `{"passes": 3, "rel": 0.05}` ends a cohort level once the template has stopped moving; add it to the v2 config once the caps have been seen to bind.
+- ~~Generic `estimate`~~ — done: `scripts/bigbrain_s2146.py estimate` counts tissue chunks from the template subject or the first subject; `--seconds-per-chunk` from `calibration.json` gives hours per level.
 - **Two workers per GPU at 8 channels.** 103 B × 8 channels × 368³ voxels ≈ 41 GB per task, so two workers need 82 GB: just over an 80 GB card. `sample_channels: 6` would fit two per card and nearly double throughput at the cost of 2 of 8 channels per pass — a trial, not a default.
 - **`retention.keep_history_levels`** is parsed and never read. Either implement (delete coarse-level fields and templates once a finer level has been seeded) or drop the key.
 

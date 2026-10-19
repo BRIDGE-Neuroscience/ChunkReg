@@ -228,7 +228,7 @@ def cmd_prepare(args) -> int:
 # --------------------------------------------------------------------------- #
 def chunk_counts(cfg, say=print):
     """Chunks per level, and how many of them hold tissue, from the coarsest level."""
-    fixed = Volume.open(cfg.subject_path("fixed"), cfg.backend)
+    fixed = Volume.open(cfg.subject_path(cfg.template_subject or cfg.subject_ids[0]), cfg.backend)
     K = fixed.coarsest
     coarse = np.asarray(fixed.array(K)[:]) > 0
     grids = fixed.grids()

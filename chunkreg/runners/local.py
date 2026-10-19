@@ -49,6 +49,10 @@ class LocalRunner:
 
     name = "local"
 
+    @property
+    def n_workers(self) -> int:
+        return int(self.workers)
+
     def __init__(self, workers: int = 1, use_processes: bool = False) -> None:
         if workers < 1:
             raise ValueError(f"workers must be at least 1, got {workers}")

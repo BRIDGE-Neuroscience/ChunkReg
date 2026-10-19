@@ -91,3 +91,20 @@ def test_anatomix_window_spec_and_round_trip(tmp_path):
 def test_anatomix_window_must_be_a_multiple_of_32_from_64(tmp_path, win):
     with pytest.raises(ConfigError):
         load_config(_raw(tmp_path, features={"mind": False, "anatomix_window": win}))
+
+
+def test_plateau_reads_the_template_step_for_an_estimated_template(tmp_path):
+    from chunkreg.grid import GridSpec
+    from chunkreg.pipelines.groupwise import PassReport, _should_stop
+
+    raw = _raw(tmp_path, levels={"stop": {"plateau": {"passes": 2, "rel": 0.1}}, "caps": [9]})
+    raw.pop("template_subject")
+    cfg = load_config(raw)
+    grid = GridSpec((16, 16, 16), 1.0)
+    rep = lambda it, step: PassReport(level=0, iteration=it, d99_mm=5.0, ubar_mm=step, step_mm=step,
+                                      fold_frac=0.0, retries=0, skipped=0, seconds=1.0)
+    # still above a voxel, so the template has not converged, but the step stopped shrinking
+    stopped, why = _should_stop(cfg, rep(2, 3.0), 0.0, grid, 2, 9, [5, 5, 5], [3.2, 3.0, 3.0])
+    assert stopped and "step plateaued" in why
+    stopped, _ = _should_stop(cfg, rep(2, 1.5), 0.0, grid, 2, 9, [5, 5, 5], [3.0, 2.0, 1.5])
+    assert not stopped

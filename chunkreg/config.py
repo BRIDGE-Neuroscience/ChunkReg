@@ -308,11 +308,12 @@ class LevelPolicy:
     halo. For a weak similarity signal at the coarse levels, where the point is
     to converge there before handing a stable field down."""
     plateau_passes: int | None = None
-    """With a template held fixed, stop a level once its residual percentile
-    has fallen by less than ``plateau_rel`` (relative) over this many passes.
-    For a cross-modal pair whose residual never goes sub-voxel: Dice stops
-    improving long before the stopping rule would otherwise fire, and the
-    level would run to its cap. ``None`` disables it."""
+    """Stop a level once its convergence signal has fallen by less than
+    ``plateau_rel`` (relative) over this many passes: the residual percentile
+    with a template held fixed, the template's recentring step with one being
+    estimated. For a cross-modal pair whose residual never goes sub-voxel,
+    Dice stops improving long before the other rules fire and the level would
+    run to its cap. ``None`` disables it."""
     plateau_rel: float = 0.05
     plateau_after: int | None = None
     """The pass from which the plateau test may fire. ``None`` means after the

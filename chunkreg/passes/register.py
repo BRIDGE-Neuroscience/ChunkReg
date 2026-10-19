@@ -33,7 +33,7 @@ from ..engines import get_engine
 from ..features import get_extractor
 from ..features.base import aligned_box
 from ..store import Field, TaskArray, TaskEntry, Volume
-from ._common import tissue_fraction, warped_subject_block
+from ._common import core_view, tissue_fraction, warped_subject_block
 from .manifest import Manifest
 
 __all__ = ["run_register_task", "register_chunk"]
@@ -95,6 +95,7 @@ def register_chunk(
     spacing = manifest.grid.spacing_mm
     shape = tuple(entry.pad_shape)
     origin = tuple(int(o) for o in entry.pad_origin)
+    chunk = manifest.chunk(entry.chunk_id)
     stages = list(
         cfg.levels.stages_for_pass(level, manifest.iteration, coarsest=manifest.coarsest)
     )
@@ -191,7 +192,11 @@ def register_chunk(
         result = engine.register(fixed, moving, spacing, run_stages)
         residual = _fields.clamp(result.disp_mm, limit)
         total = _fields.compose(residual, seed, spacing)
-        folds = _fields.fold_fraction(total, spacing)
+        # Judged over the core, not the padded box: the halo is where the
+        # registration is least constrained and where the blend's window
+        # falls to zero, and a fold there condemned chunks whose cores were
+        # sound (6 of 8 at one level). The blend reports the field's folds.
+        folds = _fields.fold_fraction(core_view(total, chunk, lead=1), spacing)
         if folds <= cfg.retry.fold_frac:
             break
         retries += 1

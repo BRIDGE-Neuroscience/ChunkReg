@@ -98,7 +98,7 @@ plus `gradient_checkpointing` (default on). Defaults: `scales [2,1]`,
 | `residual_vox` | 0.5 | Held template: stop when `d99` is under this many voxels. |
 | `percentile` | 99.0 | Which percentile of the residual is `d99`. |
 | `require_subvoxel` | false | Held template: do not stop merely because the residual fits the next halo. |
-| `plateau` | none | Held template: `{"passes": N, "rel": 0.05, "after": null}`. Stop when `d99` fell by less than `rel` over `N` passes, counted after the `anneal` schedule (or from pass `after`). |
+| `plateau` | none | `{"passes": N, "rel": 0.05, "after": null}`. Stop when the level's convergence signal (`d99` for a held template, the recentring step for an estimated one) fell by less than `rel` over `N` passes, counted after the `anneal` schedule (or from pass `after`). |
 
 ## `ingest`
 
